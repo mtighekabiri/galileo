@@ -176,6 +176,22 @@ draw. That case is detected (`region_is_folded`) and the insert is left off the
 frame, the same way a self-intersecting bowtie quad is rejected. The outline
 turns red when this happens.
 
+## Several placements at once
+
+A concourse or mall shot usually has more than one screen worth filling, and an
+A/B test wants different creatives in them. The **Placements** panel holds as
+many as you need. Each carries its own marked area, its own tracking, its own
+creative and its own tracker, so one losing its surface cannot disturb the
+others — and the digital-screen setting is per placement, since a single shot
+can hold a printed poster alongside a digital screen.
+
+Tick a placement to include it in the render; untick to leave it out without
+losing its tracking. Editing always applies to the selected one, drawn with
+solid handles; the rest stay visible as dashed outlines.
+
+The AOI export writes **one CSV per placement**, named after it, because an
+eye-tracking analysis has to tell the adverts apart.
+
 ## Blending the creative into the shot
 
 A creative pasted in with correct geometry still reads as fake, because it is
