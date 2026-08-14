@@ -746,18 +746,25 @@ FEATURE_PARAMS = dict(
 class TrackResult:
     """Outcome of a single tracking step."""
 
-    __slots__ = ("ok", "quad", "n_features", "n_inliers", "reason")
+    __slots__ = ("ok", "quad", "n_features", "n_inliers", "reason",
+                 "following_camera")
 
-    def __init__(self, ok, quad=None, n_features=0, n_inliers=0, reason=""):
+    def __init__(self, ok, quad=None, n_features=0, n_inliers=0, reason="",
+                 following_camera=False):
         self.ok = ok
         self.quad = quad
         self.n_features = n_features
         self.n_inliers = n_inliers
         self.reason = reason
+        #: True when the region is out of shot and this step came from the
+        #: camera's own motion rather than from the region's texture.
+        self.following_camera = following_camera
 
     def __repr__(self):
         return (f"TrackResult(ok={self.ok}, n_features={self.n_features}, "
-                f"n_inliers={self.n_inliers}, reason={self.reason!r})")
+                f"n_inliers={self.n_inliers}, "
+                f"following_camera={self.following_camera}, "
+                f"reason={self.reason!r})")
 
 
 class PlanarTracker:
@@ -797,6 +804,11 @@ class PlanarTracker:
                  max_step_fraction: float = 0.25,
                  feature_source: str = INTERIOR,
                  surround_scale: float = 1.9,
+                 anchor_interval: int = 8,
+                 anchor_min_inliers: int = 12,
+                 anchor_min_ratio: float = 0.60,
+                 anchor_max_correction: float = 6.0,
+                 offscreen_below: float = 0.30,
                  feature_params: dict = None,
                  lk_params: dict = None):
         """
@@ -813,9 +825,32 @@ class PlanarTracker:
             feature_source: :attr:`INTERIOR`, :attr:`SURROUND` or :attr:`BOTH`.
             surround_scale: how far the surround band reaches out, as a
                 multiple of the region's size about its centre.
+            anchor_interval: how often, in frames, to re-fit against the anchor
+                frame to clear accumulated drift. 0 disables it.
+            anchor_min_inliers: fewest inliers for a correction to be trusted.
+            anchor_min_ratio: fewest, as a fraction of the anchor's features,
+                that must still match. This is what tells a drift fix from a
+                bad one: measured across a pan and a 62-degree swing, every
+                correction that improved accuracy scored 0.81 or above, and the
+                single one that made things worse scored 0.59. The default sits
+                just above that, which also keeps the corrections a
+                digital-screen shot depends on; anchor_max_correction is a
+                second, independent guard, since the harmful correction also
+                moved the shape further (1.6 px) than any helpful one (1.2 px).
+            anchor_max_correction: reject a correction that moves a corner
+                further than this, in pixels -- it is a drift fix, not a
+                relocation, and a big jump means the anchor no longer matches.
+            offscreen_below: how much of the region must still be in shot for
+                its own texture to drive the tracking. Under this fraction the
+                camera's motion is followed instead. 0 disables that.
         """
         self.feature_source = feature_source
         self.surround_scale = surround_scale
+        self.anchor_interval = anchor_interval
+        self.anchor_min_inliers = anchor_min_inliers
+        self.anchor_min_ratio = anchor_min_ratio
+        self.anchor_max_correction = anchor_max_correction
+        self.offscreen_below = offscreen_below
         self.fb_threshold = fb_threshold
         self.ransac_threshold = ransac_threshold
         self.min_features = min_features
@@ -838,7 +873,28 @@ class PlanarTracker:
         self.frame_shape = self.prev_gray.shape[:2]
         self._diagonal = float(np.hypot(*self.frame_shape))
         self.features = None
+        # Set once the region has left the shot and the camera is being
+        # followed in its place; see :meth:`track`.
+        self.following_camera = False
+        self.camera_frames = 0
+        # Recent centroids, for how fast the region was moving across the
+        # frame just before it left it, and what is left of that motion once
+        # the camera's own is taken out.
+        self._centroids = []
+        self._offscreen_drift = None
         self._seed_features()
+
+        # Keep the anchor frame and the features found on it, so the current
+        # position can periodically be re-derived from it rather than from an
+        # ever-lengthening chain of frame-to-frame steps.
+        self.anchor_gray = self.prev_gray.copy()
+        self.anchor_features = (self.features.copy()
+                                if self.features is not None and len(self.features)
+                                else None)
+        self._since_anchor = 0
+        self.anchor_corrections = 0
+        self.anchor_ratio = 0.0
+        self.anchor_shift = 0.0
 
     @staticmethod
     def _gray(frame):
@@ -854,9 +910,55 @@ class PlanarTracker:
         centre = self.quad.mean(axis=0)
         return ((self.quad - centre) * factor + centre).astype(np.float32)
 
+    #: How many recent frames to average the region's speed over. Long enough
+    #: to shrug off per-frame noise, short enough to still describe what it was
+    #: doing at the moment it left rather than earlier in the shot.
+    VELOCITY_FRAMES = 6
+
+    #: Below this, in pixels per frame, a region is taken to be fixed to the
+    #: scene rather than moving through it. What is left over for a billboard
+    #: after the camera is accounted for is measurement noise, well under a
+    #: pixel, and carrying that for a long stretch off screen walks the shape
+    #: away from where it belongs -- measured at 29px across fifty frames.
+    #: Anything genuinely moving on its own runs to many pixels a frame, so the
+    #: two are never close.
+    OFFSCREEN_DRIFT_FLOOR = 2.0
+
+    def _region_velocity(self) -> np.ndarray:
+        """How far the region moved across the frame per frame, lately."""
+        if len(self._centroids) < 2:
+            return np.zeros(2, np.float32)
+        span = self._centroids[-1] - self._centroids[0]
+        return (span / (len(self._centroids) - 1)).astype(np.float32)
+
+    def visible_fraction(self) -> float:
+        """How much of the region is inside the frame, from 0 to 1."""
+        h, w = self.frame_shape
+        area = quad_area(self.quad)
+        if area <= 0:
+            return 0.0
+        frame_rect = np.float32([[0, 0], [w, 0], [w, h], [0, h]])
+        try:
+            overlap, _ = cv2.intersectConvexConvex(
+                self.quad.astype(np.float32), frame_rect)
+        except cv2.error:
+            return 0.0
+        return float(np.clip(overlap / area, 0.0, 1.0))
+
     def _feature_mask(self) -> np.ndarray:
         """Where to look for features, according to ``feature_source``."""
         h, w = self.prev_gray.shape[:2]
+
+        if self.following_camera:
+            # Anything that moves with the camera will do, except the region
+            # itself: a screen or billboard is usually the strongest texture in
+            # shot, so left in it takes most of the detector's budget, and then
+            # every one of those points leaves the frame together a moment
+            # later. RANSAC throws out whatever else is moving on its own --
+            # traffic, pedestrians, other screens.
+            mask = np.full((h, w), 255, np.uint8)
+            cv2.fillPoly(mask, [self._scaled_quad(1.15).astype(np.int32)], 0)
+            return mask
 
         if self.feature_source in (self.INTERIOR, self.BOTH):
             mask = quad_to_mask(self.quad, w, h)
@@ -895,30 +997,50 @@ class PlanarTracker:
         """
         gray = self._gray(frame)
 
+        # Once the surface has left the shot there is nothing of it left to
+        # measure, and following the region alone simply stops: the quad
+        # freezes against the edge of frame and the insert bunches up there
+        # instead of carrying on out of shot. During a pan the rest of the
+        # scene is still moving with the camera, so that is followed instead,
+        # which keeps the region moving at the right rate, turns it round when
+        # the camera does, and leaves it in the right place to be picked up
+        # again when it comes back into view.
+        following = (self.offscreen_below > 0
+                     and self.visible_fraction() < self.offscreen_below)
+        if following != self.following_camera:
+            self.following_camera = following
+            self._offscreen_drift = None    # re-measured on the first step
+            self._seed_features()
+        if following:
+            self.camera_frames += 1
+
         if self.features is None or len(self.features) < self.min_features:
             self._seed_features()
         if len(self.features) < self.min_features:
-            return TrackResult(False, reason="no trackable features in region")
+            return TrackResult(False, following_camera=following,
+                               reason="no trackable features in region")
 
         p0 = self.features.reshape(-1, 1, 2).astype(np.float32)
 
         p1, st_fwd, _ = cv2.calcOpticalFlowPyrLK(self.prev_gray, gray, p0, None,
                                                  **self.lk_params)
         if p1 is None:
-            return TrackResult(False, reason="optical flow returned nothing")
+            return TrackResult(False, following_camera=following,
+                               reason="optical flow returned nothing")
 
         # Track back again: a point that does not return to where it started
         # was not really tracked, whatever its reported error.
         p0r, st_bwd, _ = cv2.calcOpticalFlowPyrLK(gray, self.prev_gray, p1, None,
                                                   **self.lk_params)
         if p0r is None:
-            return TrackResult(False, reason="reverse optical flow returned nothing")
+            return TrackResult(False, following_camera=following,
+                               reason="reverse optical flow returned nothing")
 
         fb_error = np.linalg.norm((p0 - p0r).reshape(-1, 2), axis=1)
         good = (st_fwd.ravel() == 1) & (st_bwd.ravel() == 1) & (fb_error < self.fb_threshold)
         n_good = int(good.sum())
         if n_good < 3:
-            return TrackResult(False, n_features=n_good,
+            return TrackResult(False, n_features=n_good, following_camera=following,
                                reason=f"only {n_good} points survived the flow check")
 
         src = p0.reshape(-1, 2)[good]
@@ -926,11 +1048,13 @@ class PlanarTracker:
 
         matrix, inlier_mask = self._fit_transform(src, dst)
         if matrix is None:
-            return TrackResult(False, n_features=n_good, reason="could not fit a transform")
+            return TrackResult(False, n_features=n_good, following_camera=following,
+                               reason="could not fit a transform")
 
         n_inliers = int(inlier_mask.sum()) if inlier_mask is not None else n_good
         if n_inliers < 3:
             return TrackResult(False, n_features=n_good, n_inliers=n_inliers,
+                               following_camera=following,
                                reason="too few inliers")
 
         cumulative = matrix @ self.cumulative_h
@@ -938,22 +1062,142 @@ class PlanarTracker:
             self.anchor_quad.reshape(-1, 1, 2), cumulative.astype(np.float64)
         ).reshape(4, 2).astype(np.float32)
 
+        if following:
+            # The camera's motion is not always the whole story. An advert on
+            # the side of a bus is leaving the shot under its own steam, and
+            # following the camera alone would park it where it was last seen
+            # while the bus drives off. Whatever the region was doing over and
+            # above the camera before it left is carried on at the same rate --
+            # the only honest guess about something that cannot be seen.
+            if self._offscreen_drift is None:
+                camera_step = new_quad.mean(axis=0) - self.quad.mean(axis=0)
+                drift = self._region_velocity() - camera_step
+                if np.linalg.norm(drift) < self.OFFSCREEN_DRIFT_FLOOR:
+                    drift = np.zeros(2, np.float32)
+                self._offscreen_drift = drift
+            shift = np.eye(3, dtype=np.float64)
+            shift[0, 2], shift[1, 2] = self._offscreen_drift
+            cumulative = shift @ cumulative
+            new_quad = cv2.perspectiveTransform(
+                self.anchor_quad.reshape(-1, 1, 2), cumulative
+            ).reshape(4, 2).astype(np.float32)
+
         rejection = self._reject_reason(new_quad)
         if rejection:
             return TrackResult(False, n_features=n_good, n_inliers=n_inliers,
-                               reason=rejection)
+                               following_camera=following, reason=rejection)
 
         # Commit.
         self.cumulative_h = cumulative
         self.quad = new_quad
         self.prev_gray = gray
+        if not following:
+            # Only positions measured from the region itself are worth
+            # averaging: once the camera is being followed the centroid moves
+            # by construction, and feeding that back would compound its own
+            # guess.
+            self._centroids.append(new_quad.mean(axis=0))
+            del self._centroids[:-self.VELOCITY_FRAMES]
         kept = dst[inlier_mask.ravel().astype(bool)] if inlier_mask is not None else dst
         self.features = kept.reshape(-1, 1, 2).astype(np.float32)
         if len(self.features) < self.reseed_below:
             self._seed_features()
 
-        return TrackResult(True, quad=new_quad.copy(), n_features=n_good,
-                           n_inliers=n_inliers)
+        self._since_anchor += 1
+        # The anchor is a view of the region, so there is nothing for it to
+        # match against while the region is out of shot. Its guards would
+        # refuse the result anyway; skipping saves the work and removes any
+        # chance of a fluke match relocating the shape while it is off screen.
+        if (self.anchor_interval and not following
+                and self._since_anchor >= self.anchor_interval):
+            self._since_anchor = 0
+            self._correct_against_anchor(gray)
+
+        return TrackResult(True, quad=self.quad.copy(), n_features=n_good,
+                           n_inliers=n_inliers, following_camera=following)
+
+    def _correct_against_anchor(self, gray) -> bool:
+        """Re-derive the position from the anchor frame, clearing drift.
+
+        Composing a homography per frame means every step's small error is
+        carried forward for the rest of the clip, so the shape slides steadily
+        off the surface during a long camera move -- measured at about 0.019 px
+        per frame, roughly 0.28% of the distance travelled, which is several
+        pixels across a long pan and exactly the "it tracks but it is offset"
+        complaint.
+
+        Matching the anchor frame straight to the current one removes the chain
+        entirely: the error stops depending on how long tracking has been
+        running. The current estimate seeds the search, so the large
+        displacement between anchor and now is not a problem, and the result is
+        only accepted if it is well supported and close to where incremental
+        tracking already thinks the surface is -- this corrects drift, it does
+        not relocate the shape.
+        """
+        if self.anchor_features is None or len(self.anchor_features) < 4:
+            return False
+
+        source = self.anchor_features.reshape(-1, 1, 2).astype(np.float32)
+        guess = cv2.perspectiveTransform(
+            source, self.cumulative_h.astype(np.float64)).astype(np.float32)
+
+        moved, status, _ = cv2.calcOpticalFlowPyrLK(
+            self.anchor_gray, gray, source, guess.copy(),
+            flags=cv2.OPTFLOW_USE_INITIAL_FLOW, **self.lk_params)
+        if moved is None:
+            return False
+
+        # The return trip needs a starting guess as well. Without one it has to
+        # find points that may be most of a frame away, which plain LK cannot
+        # do, so every point failed the consistency check and no correction
+        # was ever accepted after the first few frames.
+        back, status_back, _ = cv2.calcOpticalFlowPyrLK(
+            gray, self.anchor_gray, moved, source.copy(),
+            flags=cv2.OPTFLOW_USE_INITIAL_FLOW, **self.lk_params)
+        if back is None:
+            return False
+
+        error = np.linalg.norm((source - back).reshape(-1, 2), axis=1)
+        good = ((status.ravel() == 1) & (status_back.ravel() == 1)
+                & (error < self.fb_threshold * 2.0))
+        if int(good.sum()) < self.anchor_min_inliers:
+            return False
+
+        matrix, mask = cv2.findHomography(
+            source.reshape(-1, 2)[good], moved.reshape(-1, 2)[good],
+            cv2.RANSAC, self.ransac_threshold)
+        if matrix is None or mask is None:
+            return False
+
+        # How much of the anchor still matches. This falls as the viewpoint
+        # diverges from the anchor, which is precisely when a correction stops
+        # being more accurate than the incremental chain.
+        self.anchor_ratio = float(mask.sum()) / max(1, len(source))
+        if int(mask.sum()) < self.anchor_min_inliers:
+            return False
+        if self.anchor_ratio < self.anchor_min_ratio:
+            logger.debug("anchor correction rejected: only %.0f%% of the anchor "
+                         "still matches", self.anchor_ratio * 100)
+            return False
+
+        corrected = cv2.perspectiveTransform(
+            self.anchor_quad.reshape(-1, 1, 2), matrix.astype(np.float64)
+        ).reshape(4, 2).astype(np.float32)
+
+        if not np.all(np.isfinite(corrected)) or not is_simple_quad(corrected):
+            return False
+        shift = float(np.linalg.norm(corrected - self.quad, axis=1).max())
+        self.anchor_shift = shift
+        if shift > self.anchor_max_correction:
+            # Too far to be drift. The anchor's appearance has probably gone,
+            # so keep the incremental estimate rather than jumping.
+            logger.debug("anchor correction rejected: %.1fpx shift", shift)
+            return False
+
+        self.cumulative_h = matrix.astype(np.float64)
+        self.quad = corrected
+        self.anchor_corrections += 1
+        return True
 
     def map_from_anchor(self, points) -> np.ndarray:
         """Carry points defined on the anchor frame into the current frame.

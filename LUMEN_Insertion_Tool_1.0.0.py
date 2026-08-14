@@ -8,6 +8,7 @@ import json
 
 import lumen_core as core
 import lumen_blend as blend
+import lumen_morph as morphlib
 
 from PyQt5.QtCore import (
     QObject, QThread, pyqtSignal, Qt, QSize, QUrl, QEvent, QTimer, QPoint, QRect,
@@ -298,6 +299,174 @@ class BlendDialog(QDialog):
             setattr(self.settings, key, value)
         self.on_change()
         self.reject()
+
+
+class MorphDialog(QDialog):
+    """Bend and tilt the creative, with a thumbnail that follows the sliders.
+
+    Every control updates both the thumbnail here and the video preview behind,
+    because the only way to judge whether a bend looks like the surface it is
+    meant to sit on is to see it against that surface.
+    """
+
+    CONTROLS = [
+        ("yaw", "Turn", -45, 45, "Turn the right edge away from the viewer."),
+        ("pitch", "Tip", -45, 45, "Tip the top edge away from the viewer."),
+        ("roll", "Rotate", -30, 30, "Rotate within the surface."),
+        ("bow_h", "Bow across", -100, 100,
+         "Curve about the vertical axis, as on a convex panel.\n"
+         "Positive bulges the middle towards the viewer."),
+        ("bow_v", "Bow down", -100, 100, "Curve about the horizontal axis."),
+        ("shading", "Curve shading", 0, 100,
+         "How much a bowed surface darkens as it turns away.\n"
+         "This is what makes a bow read as a curve rather than as a\n"
+         "squashed flat sheet. Drop it to 0 to leave the creative's\n"
+         "own colours untouched."),
+        ("perspective", "Perspective", 0, 100,
+         "How strongly a turn foreshortens.\nLow is nearly a flat squash; "
+         "high exaggerates depth."),
+    ]
+    # Stored 0..1, shown 0..100.
+    SCALED = {"bow_h", "bow_v", "perspective", "shading"}
+
+    def __init__(self, morph, creative, on_change, parent=None):
+        super().__init__(parent)
+        self.morph = morph
+        self.creative = creative
+        self.on_change = on_change
+        self.original = morph.to_dict()
+
+        self.setWindowTitle("Shape the Creative")
+        self.setMinimumWidth(520)
+        self.setStyleSheet("""
+            QDialog { background-color: #2A2A2A; }
+            QLabel { color: #E8E8E8; font-size: 13px; }
+            QCheckBox { color: #E8E8E8; font-size: 13px; }
+            QSlider::groove:horizontal { background: #444; height: 5px;
+                                         border-radius: 2px; }
+            QSlider::handle:horizontal { background: #DDD; width: 14px;
+                                         margin: -5px 0; border-radius: 7px; }
+            QSlider::sub-page:horizontal { background: #6A8FD8;
+                                           border-radius: 2px; }
+            QPushButton { background-color: #3C3C3C; color: white; border: none;
+                          border-radius: 6px; padding: 7px 16px; }
+            QPushButton:hover { background-color: #505050; }
+        """)
+
+        layout = QVBoxLayout(self)
+        layout.setSpacing(9)
+
+        self.enabled_box = QCheckBox("Shape this creative")
+        self.enabled_box.setChecked(morph.enabled)
+        self.enabled_box.toggled.connect(self._on_enabled)
+        layout.addWidget(self.enabled_box)
+
+        self.thumbnail = QLabel()
+        self.thumbnail.setFixedHeight(150)
+        self.thumbnail.setAlignment(Qt.AlignCenter)
+        self.thumbnail.setStyleSheet("background-color: #141414; border-radius: 6px;")
+        layout.addWidget(self.thumbnail)
+
+        self.sliders = {}
+        self.value_labels = {}
+        for name, title, low, high, hint in self.CONTROLS:
+            row = QHBoxLayout()
+            label = QLabel(title)
+            label.setFixedWidth(96)
+            label.setToolTip(hint)
+            slider = QSlider(Qt.Horizontal)
+            slider.setRange(low, high)
+            slider.setValue(self._to_slider(name))
+            slider.setToolTip(hint)
+            slider.valueChanged.connect(
+                lambda value, key=name: self._on_slider(key, value))
+            value_label = QLabel("")
+            value_label.setFixedWidth(44)
+            value_label.setStyleSheet("color: #9A9A9A; font-size: 12px;")
+
+            row.addWidget(label)
+            row.addWidget(slider, 1)
+            row.addWidget(value_label)
+            layout.addLayout(row)
+            self.sliders[name] = slider
+            self.value_labels[name] = value_label
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel |
+                                   QDialogButtonBox.RestoreDefaults)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self._revert_and_reject)
+        buttons.button(QDialogButtonBox.RestoreDefaults).setText("Flat")
+        buttons.button(QDialogButtonBox.RestoreDefaults).clicked.connect(self._flatten)
+        layout.addWidget(buttons, alignment=Qt.AlignRight)
+
+        self._sync_enabled()
+        self._refresh()
+
+    def _to_slider(self, name):
+        value = getattr(self.morph, name)
+        return int(round(value * 100)) if name in self.SCALED else int(round(value))
+
+    def _on_enabled(self, checked):
+        self.morph.enabled = checked
+        self._sync_enabled()
+        self._refresh()
+
+    def _sync_enabled(self):
+        for slider in self.sliders.values():
+            slider.setEnabled(self.morph.enabled)
+
+    def _on_slider(self, key, value):
+        setattr(self.morph, key, value / 100.0 if key in self.SCALED else float(value))
+        self._refresh()
+
+    def _flatten(self):
+        fresh = morphlib.Morph()
+        for name, _, _, _, _ in self.CONTROLS:
+            self.sliders[name].setValue(
+                int(round(getattr(fresh, name) * 100)) if name in self.SCALED
+                else int(round(getattr(fresh, name))))
+        self.enabled_box.setChecked(True)
+
+    def _revert_and_reject(self):
+        for key, value in self.original.items():
+            setattr(self.morph, key, value)
+        self.on_change()
+        self.reject()
+
+    def _refresh(self):
+        for name, _, _, _, _ in self.CONTROLS:
+            value = getattr(self.morph, name)
+            self.value_labels[name].setText(
+                f"{value:.2f}" if name in self.SCALED else f"{value:.0f}°")
+        self._draw_thumbnail()
+        self.on_change()
+
+    def _draw_thumbnail(self):
+        if self.creative is None:
+            return
+        shaped = morphlib.apply_morph(self.creative, self.morph)
+        shaped = core.to_bgra(shaped)
+
+        height = 150
+        scale = height / shaped.shape[0]
+        width = max(1, int(shaped.shape[1] * scale))
+        small = cv2.resize(shaped, (width, height), interpolation=cv2.INTER_AREA)
+
+        # Checkerboard behind, so the transparent surround a tilt creates is
+        # visible as transparency rather than reading as black artwork.
+        board = np.zeros((height, width, 3), np.uint8)
+        board[:] = 40
+        step = 12
+        for y in range(0, height, step):
+            for x in range(0, width, step):
+                if ((x // step) + (y // step)) % 2 == 0:
+                    board[y:y + step, x:x + step] = 60
+
+        alpha = small[:, :, 3:4].astype(np.float32) / 255.0
+        blended = (board * (1 - alpha) + small[:, :, :3] * alpha).astype(np.uint8)
+        rgb = cv2.cvtColor(blended, cv2.COLOR_BGR2RGB)
+        image = QImage(rgb.data, width, height, 3 * width, QImage.Format_RGB888)
+        self.thumbnail.setPixmap(QPixmap.fromImage(image.copy()))
 
 
 class QSwitch(QWidget):
@@ -713,6 +882,11 @@ class Placement:
         self.colourise_enabled = False
         self.colourise_factor = 0
         self.blend = blend.BlendSettings()
+        # Bend and tilt applied to the creative itself, before it is warped
+        # into the tracked area. Kept off the quad on purpose: the tracking
+        # describes where the surface is and must not be nudged to fake the
+        # look of the artwork on it.
+        self.morph = morphlib.Morph()
 
         # Tracking state, rebuilt whenever the shape is edited.
         self.feature_source = core.PlanarTracker.INTERIOR
@@ -752,6 +926,7 @@ class Placement:
             "contrast": self.contrast,
             "colourise": self.colourise_enabled,
             "blend": self.blend.to_dict(),
+            "morph": self.morph.to_dict(),
             "feature_source": self.feature_source,
         }
 
@@ -773,6 +948,7 @@ class Placement:
         placement.contrast = data.get("contrast", 1.0)
         placement.colourise_enabled = bool(data.get("colourise", False))
         placement.blend = blend.BlendSettings.from_dict(data.get("blend"))
+        placement.morph = morphlib.Morph.from_dict(data.get("morph"))
         placement.feature_source = data.get("feature_source",
                                             core.PlanarTracker.INTERIOR)
         return placement
@@ -875,6 +1051,7 @@ class TrackingOverlay(QWidget):
     colourise_enabled = _active_property("colourise_enabled")
     colourise_factor = _active_property("colourise_factor")
     blend = _active_property("blend")
+    morph = _active_property("morph")
     _previous_quad = _active_property("_previous_quad")
 
     def mousePressEvent(self, event):
@@ -1214,8 +1391,9 @@ class TrackingOverlay(QWidget):
         """One placement's creative, adapted to the frame it is going into."""
         if placement.overlay_bgra is None:
             return None
+        styled = morphlib.apply_morph(placement.overlay_bgra, placement.morph)
         styled = core.apply_brightness_contrast(
-            placement.overlay_bgra, placement.brightness, placement.contrast)
+            styled, placement.brightness, placement.contrast)
         if placement.colourise_enabled and base_frame is not None:
             styled = core.apply_colourise(styled, base_frame, quad)
         if base_frame is not None and placement.blend.enabled:
@@ -1242,8 +1420,9 @@ class TrackingOverlay(QWidget):
         """
         if self.overlay_bgra is None:
             return None
+        styled = morphlib.apply_morph(self.overlay_bgra, self.morph)
         styled = core.apply_brightness_contrast(
-            self.overlay_bgra, self.brightness, self.contrast)
+            styled, self.brightness, self.contrast)
         if self.colourise_enabled and base_frame is not None and quad is not None:
             styled = core.apply_colourise(styled, base_frame, quad)
         if base_frame is not None and quad is not None and self.blend.enabled:
@@ -1957,6 +2136,11 @@ class CentralPanel(QWidget):
         self.main_layout.addWidget(self.status_bar)
         self.setLayout(self.main_layout)
 
+        self.slider.valueChanged.connect(self.on_slider_scrub)
+        self.slider.sliderPressed.connect(self.on_slider_pressed)
+        self.slider.sliderReleased.connect(self.on_slider_released)
+        self.slider.valueChanged.connect(self.on_slider_value_changed)
+
         # Timers
         self.timer = QTimer()
         self.timer.timeout.connect(self.read_frame)
@@ -2213,7 +2397,15 @@ class CentralPanel(QWidget):
         current_frame_index = int(self.cap.get(cv2.CAP_PROP_POS_FRAMES)) - 1
         self.current_frame_index = current_frame_index
         if not self.slider.isSliderDown():
+            # Moving the slider to follow playback must not be mistaken for the
+            # user scrubbing. Without this, setValue fired valueChanged, which
+            # seeked back to this same frame and called read_frame again: every
+            # frame was decoded and tracked twice, and the Kalman filters got
+            # two predict steps for one frame of real motion, so the shape ran
+            # steadily ahead of the surface during a camera move.
+            self.slider.blockSignals(True)
             self.slider.setValue(current_frame_index)
+            self.slider.blockSignals(False)
 
         overlay = self.tracking_overlay
 
@@ -2573,11 +2765,11 @@ class CentralPanel(QWidget):
             total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
             self.slider.setEnabled(True)
             self.slider.setRange(0, total_frames - 1)
+            # Connections are made once, in __init__. Making them here meant
+            # loading a second video doubled every one of them.
+            self.slider.blockSignals(True)
             self.slider.setValue(0)
-            self.slider.valueChanged.connect(self.on_slider_scrub)
-            self.slider.sliderPressed.connect(self.on_slider_pressed)
-            self.slider.sliderReleased.connect(self.on_slider_released)
-            self.slider.valueChanged.connect(self.on_slider_value_changed)
+            self.slider.blockSignals(False)
         else:
             logging.error(f"Could not open video: {file_path}")
             return
@@ -2858,6 +3050,32 @@ class MatchChoiceDialog(QDialog):
                 if box.isChecked()]
 
 
+class _LegacyPlacement:
+    """Presents a single-insertion RenderSettings as if it were a Placement.
+
+    PlacementSnapshot.__init__ is the one place that decides what a render
+    needs from a placement. Building the older single-insertion snapshot field
+    by field meant every addition had to be remembered twice, and a forgotten
+    one surfaced as an AttributeError with the render thread already running.
+    Going through the same constructor makes that impossible.
+    """
+
+    def __init__(self, settings):
+        self.name = "Placement 1"
+        self.tracking_history = settings.history or {}
+        self.curvature = settings.curvature
+        self.curved_enabled = settings.curved
+        self.overlay_bgra = settings.overlay_bgra
+        self.inserted_overlay_is_video = bool(settings.overlay_video_path)
+        self.overlay_video_path = settings.overlay_video_path
+        self.inserted_overlay_start_frame = settings.overlay_start_frame
+        self.brightness = settings.brightness
+        self.contrast = settings.contrast
+        self.colourise_enabled = settings.colourise
+        self.blend = settings.blend
+        self.morph = settings.morph
+
+
 class PlacementSnapshot:
     """One placement, detached from the GUI for the render thread."""
 
@@ -2878,6 +3096,7 @@ class PlacementSnapshot:
         self.contrast = placement.contrast
         self.colourise = placement.colourise_enabled
         self.blend = blend.BlendSettings.from_dict(placement.blend.to_dict())
+        self.morph = morphlib.Morph.from_dict(placement.morph.to_dict())
         self.scale = scale
         # Per-placement decode state, filled in by the worker.
         self.capture = None
@@ -2902,7 +3121,7 @@ class RenderSettings:
                  overlay_bgra=None, overlay_video_path=None,
                  overlay_start_frame=0, brightness=0, contrast=1.0,
                  colourise=False, include_audio=True, occlusion=False,
-                 blend_settings=None, placements=None):
+                 blend_settings=None, placements=None, morph=None):
         self.base_video_path = base_video_path
         self.out_path = out_path
         self.start_frame = int(start_frame)
@@ -2923,6 +3142,7 @@ class RenderSettings:
         # threads, so the worker builds its own.
         self.occlusion = occlusion
         self.blend = blend_settings or blend.BlendSettings.off()
+        self.morph = morph or morphlib.Morph()
         # Every insertion to draw. The single-placement fields above are kept
         # so existing callers and tests go on working.
         self.placements = placements or []
@@ -2948,26 +3168,8 @@ class RenderWorker(QObject):
         snapshots = list(settings.placements)
         if not snapshots:
             # A settings object built the old way, carrying a single insertion.
-            legacy = PlacementSnapshot.__new__(PlacementSnapshot)
-            legacy.name = "Placement 1"
-            legacy.history = settings.history
-            legacy.curvature = settings.curvature
-            legacy.curved = settings.curved
-            legacy.creative = settings.overlay_bgra
-            legacy.video_path = settings.overlay_video_path
-            legacy.start_frame = settings.overlay_start_frame
-            legacy.brightness = settings.brightness
-            legacy.contrast = settings.contrast
-            legacy.colourise = settings.colourise
-            legacy.blend = settings.blend
-            legacy.scale = settings.scale_factor
-            legacy.capture = None
-            legacy.cursor = -1
-            legacy.frame = None
-            legacy.exhausted = False
-            legacy.previous_quad = None
-            legacy.dense = {}
-            snapshots = [legacy]
+            snapshots = [PlacementSnapshot(_LegacyPlacement(settings),
+                                           settings.scale_factor)]
 
         usable = []
         for placement in snapshots:
@@ -3021,8 +3223,9 @@ class RenderWorker(QObject):
         if not core.is_valid_region(region):
             return base_frame
 
+        styled = morphlib.apply_morph(creative, placement.morph)
         styled = core.apply_brightness_contrast(
-            creative, placement.brightness, placement.contrast)
+            styled, placement.brightness, placement.contrast)
         if placement.colourise:
             styled = core.apply_colourise(styled, base_frame, region.corners)
 
@@ -3947,6 +4150,27 @@ class MainWindow(QMainWindow):
         panel.refresh_display()
         self.mark_dirty()
 
+    def open_morph_dialog(self):
+        """Bend and tilt the creative itself, with a live preview.
+
+        The shape belongs to the artwork, not to the tracked area: the quad
+        says where the surface is and stays as the tracker measured it, while
+        this changes how the creative sits on that surface.
+        """
+        panel = self.central_panel
+        overlay = panel.tracking_overlay
+        if overlay.overlay_bgra is None:
+            QMessageBox.warning(
+                self, "Shape",
+                "Insert a creative first -- there is nothing to shape yet.")
+            return
+
+        dialog = MorphDialog(overlay.morph, overlay.overlay_bgra,
+                             panel.refresh_display, parent=self)
+        dialog.exec_()
+        panel.refresh_display()
+        self.mark_dirty()
+
     def toggle_curved_edges(self, enabled: bool):
         """Switch curved edges on or off for the insertion area."""
         overlay = self.central_panel.tracking_overlay
@@ -4278,25 +4502,45 @@ class MainWindow(QMainWindow):
         select_btn.setFixedSize(60, 25)
         select_btn.setCursor(QCursor(Qt.PointingHandCursor))
 
-        # Name the creative, not its file type. Labelling by extension meant an
-        # A/B/C test set showed as three identical cards reading "PNG".
-        name = os.path.basename(file_path)
-        ext_label = QLabel(name)
-        ext_label.setStyleSheet("color: white; font-size: 11px;")
-        ext_label.setFixedHeight(25)
-        ext_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
-        ext_label.setToolTip(file_path)
-        metrics = ext_label.fontMetrics()
-        ext_label.setText(metrics.elidedText(name, Qt.ElideMiddle, 118))
+        # Shaping belongs to the artwork rather than to the tracked area, so it
+        # sits on the creative's own card. It only does anything once this
+        # creative is the one in the video, hence the disabled start.
+        shape_btn = QPushButton("Shape")
+        shape_btn.setObjectName("shapeBtn")
+        shape_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #4A6FA5; color: white; font-size: 12px;
+                border: none; border-radius: 5px; padding: 5px;
+            }
+            QPushButton:hover { background-color: #5C86C4; }
+            QPushButton:disabled { background-color: #3A3A3A; color: #6E6E6E; }
+        """)
+        shape_btn.setFixedSize(55, 25)
+        shape_btn.setCursor(QCursor(Qt.PointingHandCursor))
+        shape_btn.setEnabled(False)
+        shape_btn.setToolTip("Insert this creative to bend or tilt it.")
 
-        # Add the buttons and label to the horizontal layout.
+        # Add the buttons to the horizontal layout.
         button_layout.addWidget(remove_btn)
         button_layout.addWidget(select_btn)
-        button_layout.addWidget(ext_label)
+        button_layout.addWidget(shape_btn)
         button_layout.addStretch()
 
         # Add the entire horizontal button layout to the main vertical layout.
         overlay_layout.addLayout(button_layout)
+
+        # Name the creative, not its file type. Labelling by extension meant an
+        # A/B/C test set showed as three identical cards reading "PNG". It gets
+        # its own row: three buttons leave a filename no useful width.
+        name = os.path.basename(file_path)
+        ext_label = QLabel(name)
+        ext_label.setStyleSheet("color: white; font-size: 11px;")
+        ext_label.setFixedHeight(18)
+        ext_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        ext_label.setToolTip(file_path)
+        metrics = ext_label.fontMetrics()
+        ext_label.setText(metrics.elidedText(name, Qt.ElideMiddle, 190))
+        overlay_layout.addWidget(ext_label)
         # --- END OF RESTORED LAYOUT SECTION ---
 
         # Depending on file extension, load as image or video.
@@ -4382,6 +4626,8 @@ class MainWindow(QMainWindow):
             overlay_widget.inserted = False
             select_btn.setText("Insert")
             select_btn.setStyleSheet("QPushButton { background-color: green; color: white; font-size: 14px; border: none; border-radius: 5px; padding: 5px; } QPushButton:hover { background-color: darkgreen; }")
+            shape_btn.setEnabled(False)
+            shape_btn.setToolTip("Insert this creative to bend or tilt it.")
             overlay_widget.setStyleSheet("background-color: #2A2A2A; border-radius: 10px; padding: 5px;")
             self.central_panel.tracking_overlay.remove_inserted_overlay()
             if self.inserted_overlay_widget == overlay_widget:
@@ -4398,6 +4644,10 @@ class MainWindow(QMainWindow):
                 if old_select_btn:
                     old_select_btn.setText("Insert")
                     old_select_btn.setStyleSheet("QPushButton { background-color: green; color: white; font-size: 14px; border: none; border-radius: 5px; padding: 5px; } QPushButton:hover { background-color: darkgreen; }")
+                old_shape_btn = old_widget.findChild(QPushButton, "shapeBtn")
+                if old_shape_btn:
+                    old_shape_btn.setEnabled(False)
+                    old_shape_btn.setToolTip("Insert this creative to bend or tilt it.")
                 self.central_panel.tracking_overlay.remove_inserted_overlay()
                 self.inserted_overlay_widget = None
             
@@ -4406,6 +4656,9 @@ class MainWindow(QMainWindow):
                 select_btn.setText("Inserted")
                 select_btn.setStyleSheet("QPushButton { background-color: limegreen; color: white; font-size: 14px; border: none; border-radius: 5px; padding: 5px; } QPushButton:hover { background-color: green; }")
                 overlay_widget.setStyleSheet("background-color: #00A000; border-radius: 10px; padding: 5px;")
+                shape_btn.setEnabled(True)
+                shape_btn.setToolTip("Bend and tilt this creative before it is "
+                                     "tracked into place.")
                 self.inserted_overlay_widget = overlay_widget
                 current_frame_index = self.central_panel.get_current_frame_index()
                 
@@ -4425,6 +4678,7 @@ class MainWindow(QMainWindow):
                 uninsert_overlay()
 
         select_btn.clicked.connect(toggle_insert)
+        shape_btn.clicked.connect(self.open_morph_dialog)
 
     def make_video_click_handler(self, player, original_event):
         def handler(event):

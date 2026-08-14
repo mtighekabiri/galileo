@@ -140,6 +140,35 @@ smooths the result and coasts the shape through brief occlusions.
 Results accumulate in `tracking_history`, a `{frame_index: [4 corners]}` map
 that drives both the preview and the render.
 
+### When the surface leaves the shot
+
+Pan past a screen and it eventually goes out of frame. Following only the
+screen's own texture stops the moment the screen does: the area parks against
+the edge of frame and the insert bunches up against it, rather than carrying
+on out of shot. Smoothing alone does not save it either — a constant-velocity
+prediction cannot turn round, so it keeps sailing the old way while the camera
+comes back, and by the time the screen returns it is hundreds of pixels out.
+
+Once less than 30% of the area is still in frame, the tracker follows **the
+camera** instead, detecting features across the whole frame *except* the area
+itself. That exception matters: a screen or billboard is usually the strongest
+texture in shot, so left in it takes most of the detector's budget and then
+every one of those points leaves the frame together a moment later.
+
+Whatever the area was doing over and above the camera before it left is
+carried on at the same rate, so an advert on the side of a bus keeps moving
+after the bus has gone while a fixed billboard does not. For a fixed surface
+that leftover is only measurement noise, and carrying it for fifty frames
+walks the shape off the panel by some 29px, so below a floor of 2px per frame
+it is taken to be nothing.
+
+Measured on a clip that pans a panel out of frame, holds it off, and pans back
+onto it, the area stays within **1.7px** throughout and is back on the panel to
+**0.5px** when it returns — against 898px for the same clip without this.
+`TrackResult.following_camera` says when a step came from the camera rather
+than from the surface, and these steps count as measurements rather than
+failures, so the smoothing takes them instead of falling back on prediction.
+
 ## Finding a target from an image
 
 `ReferenceMatcher` locates a target from a picture of it: SIFT (or ORB)
@@ -244,6 +273,61 @@ live.
 > by 27, nearly all of that from lighting rather than hue. Raise it only when
 > belonging in the frame matters more than the exact hue.
 
+## Shaping the creative
+
+A creative goes into the tracked area as a flat rectangle. That is right for a
+poster pasted flat on a board, but plenty of real placements are not: a banner
+sagging on a fence, a print bowed across a curved panel, an advert on a screen
+angled a few degrees away from the one the tracking found.
+
+**Shape**, on the creative's own card in the library, bends and tilts the
+artwork *in its own canvas*, before it is warped into the area. Keeping it
+separate matters — the tracked area describes where the surface is, and should
+not be nudged about to fake the look of the artwork on it. Tracking data stays
+honest, and the same shape can be carried to a different placement or clip.
+
+* **Turn**, **Tip** and **Rotate** move it in space. The tilt is projected
+  through a pinhole camera, so the foreshortening is real perspective rather
+  than a squash — the near edge grows as the far edge shrinks. **Perspective**
+  sets how strongly: low is nearly a flat squash, high exaggerates depth.
+* **Bow across** and **Bow down** wrap it on a cylinder. Positive bulges the
+  middle towards the viewer.
+* **Curve shading** darkens the surface as it turns away, by the cosine of the
+  angle it has turned through.
+
+> **Shading is what makes a bow read as a curve.** Moving the texture about is
+> a weak cue on its own — a compressed edge looks much like a squashed flat
+> sheet, and without shading a bowed creative is very nearly indistinguishable
+> from a flat one. It is therefore on by default. Drop it to 0 if the
+> creative's own colours are what the test is measuring.
+
+> **The two bow directions look more alike than you might expect.** Both
+> curvatures turn their ends away by the same angle, so both crowd the artwork
+> towards its edges; what separates them is only which part is nearer the
+> camera and so magnified. That is the geometry, not a limitation — a convex
+> panel and a hollow one really do read similarly head-on.
+
+### A curved screen needs both controls
+
+The two halves of a curved screen are set separately, because they are
+separate things:
+
+| What you are describing | Control |
+|---|---|
+| The screen's **outline** — its edges bow on the footage | **Curved edges** on the tracked area |
+| The **artwork** on it — texture crowding towards the edges, light falling away | **Shape → Bow** on the creative |
+
+Bow alone leaves a rectangular silhouette, which is right for a curved panel
+seen straight on but not for one seen from above or to the side. Use curved
+edges to bend the outline to the screen in the footage, and bow to make the
+artwork sit on that curve. Together they read as a barrel-fronted panel;
+either alone falls short of it.
+
+Shaping is applied before brightness, contrast and blending, so what is
+matched to the shot is the shape that will actually be laid down. Whatever a
+tilt pushes outside the canvas becomes transparent rather than black, so the
+footage shows through exactly as it does around a creative's own transparency.
+
 ## Audio and output quality
 
 Renders are encoded with **ffmpeg (x264, CRF 17)** when it is available, with
@@ -306,7 +390,9 @@ corner error, and that the current tracker beats the four-corner approach it
 replaced — rather than merely that the code runs. `tests/test_app_smoke.py`
 drives the actual Qt widgets through loading, tracking and a full render, and
 `tests/test_digital_screens.py` pins down both the animated-screen failure and
-its fix.
+its fix. `tests/test_offscreen.py` slides a window over a wide scene so the
+camera's motion and the surface's position are both known exactly, and asserts
+the area neither stalls at the edge of frame nor runs away while out of it.
 
 Occlusion tests that need the model file skip cleanly when it has not been
 fetched; the compositing side is tested with hand-made masks either way.
