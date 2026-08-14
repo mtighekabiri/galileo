@@ -661,70 +661,160 @@ class IconWidget(QFrame):
                 }}
             """)
 
+class MagnifierPoint:
+    """One handle worth magnifying, and what to call it."""
+
+    CORNER = "corner"
+    HANDLE = "handle"
+
+    __slots__ = ("x", "y", "label", "kind", "title")
+
+    def __init__(self, x, y, label="", kind=CORNER, title=None):
+        """
+        Args:
+            label: a couple of characters, for a tile in a crowded grid.
+            title: the full name, shown when this handle has the widget to
+                itself and there is room to spell it out.
+        """
+        self.x = float(x)
+        self.y = float(y)
+        self.label = label
+        self.kind = kind
+        self.title = title or label
+
+    @classmethod
+    def coerce(cls, item, index):
+        """Accept a bare ``(x, y)`` as well as a full point."""
+        if isinstance(item, cls):
+            return item
+        x, y = item
+        return cls(x, y, str(index + 1), cls.CORNER, f"Corner {index + 1}")
+
+
 class MagnifierWidget(QWidget):
+    """A zoomed view of the handles, for placing them exactly.
+
+    Marking the area is the one part of the job where single pixels decide the
+    outcome. The tracker seeds its features from whatever is enclosed, so a
+    corner left a little inside the screen throws away the bezel detail that
+    tracks best, and one left a little outside picks up the wall behind and
+    drags the insert off during a pan. Neither is visible at video scale.
+
+    So this shows *true pixels*, not a smoothed enlargement: past 6x it stops
+    interpolating and draws the source grid, because the question being asked
+    is "which pixel is the edge on", and a blurred answer is no answer. It also
+    draws the region's own outline through each view, which is what makes the
+    curve handles judgeable -- a Bezier handle is placed correctly when the
+    curve it produces sits on the screen's edge, and that cannot be told from
+    the handle's own position.
+    """
+
+    #: Above this magnification, interpolating between source pixels hides the
+    #: very boundaries the user is trying to place a corner on.
+    CRISP_ABOVE = 6.0
+    #: Above this, source pixels are big enough on screen to rule off.
+    GRID_ABOVE = 12.0
+
+    MIN_ZOOM, MAX_ZOOM = 2.0, 32.0
+
     def __init__(self, parent=None):
         super(MagnifierWidget, self).__init__(parent)
-        self.setStyleSheet("background-color: black; border: 2px solid black;")
+        self.setStyleSheet("background-color: #121212; border: 2px solid #121212;")
         self.setMinimumSize(150, 150)
 
         # The base frame (np.ndarray, BGR format)
         self.base_frame = None
-        
-        # List of up to 4 points in the base frame’s coordinate space.
-        self.overlay_points = []
-        
-        # Zoom factor (higher => more magnification => smaller source ROI).
-        self.zoom_factor = 4.0
-        
-        # Extra buffer in pixels added around the source ROI.
+
+        #: :class:`MagnifierPoint` list, in the base frame's coordinate space.
+        self.points = []
+        #: The region, so its outline can be drawn through each view.
+        self.region = None
+
+        self.zoom_factor = 8.0
+        # Kept for callers that still pass it; the view is centred exactly on
+        # the point now, so there is no ROI to pad.
         self.buffer = 10
-        
-        # Index of the “active” point (0..3). -1 => none selected => crosshair is red.
+
+        #: Which point is selected, or -1. Selected points get a green mark.
         self.selected_index = -1
+        #: Which point to show alone, filling the widget, or None for all of
+        #: them. Set while a handle is being dragged.
+        self.focus_index = None
 
         # For manual resizing
         self.resizing = False
         self.last_mouse_pos = None
-        self.resize_handle_size = 20  # size of the “corner handle”
+        self.resize_handle_size = 20  # size of the "corner handle"
         # Set here as well as on the first manual resize: update_magnifier_dimensions
         # reads it as soon as a second corner exists, which is long before the
         # user has had any reason to drag the magnifier.
         self.user_resized = False
-        
+
         self.setMouseTracking(True)
+
+    # -- data --------------------------------------------------------------
+
+    @property
+    def overlay_points(self):
+        """The plain coordinates, for callers written against the old shape."""
+        return [(p.x, p.y) for p in self.points]
 
     def sizeHint(self):
         # By default, just return current size
         return QSize(self.width(), self.height())
 
     def setData(
-        self, 
-        base_frame: np.ndarray, 
-        overlay_points: list, 
-        zoom_factor: float = None, 
-        buffer: int = None, 
-        selected_index: int = None
+        self,
+        base_frame: np.ndarray,
+        overlay_points: list,
+        zoom_factor: float = None,
+        buffer: int = None,
+        selected_index: int = None,
+        region=None,
+        focus_index=-1,
     ):
         """
         Update the magnifier data and refresh.
 
         :param base_frame:     np.ndarray BGR image
-        :param overlay_points: up to 4 (x, y) points in base_frame coords
+        :param overlay_points: :class:`MagnifierPoint` list, or bare ``(x, y)``
         :param zoom_factor:    optional new zoom factor
-        :param buffer:         optional new pixel buffer
-        :param selected_index: which corner is active (0..3), or -1 for none
+        :param buffer:         accepted and ignored; kept for older callers
+        :param selected_index: which handle is selected, or -1 for none
+        :param region:         a ``core.Region`` whose outline to draw
+        :param focus_index:    show this handle alone; None for all of them.
+                               Left at -1 to mean "unchanged".
         """
         self.base_frame = base_frame
-        self.overlay_points = overlay_points
+        self.points = [MagnifierPoint.coerce(p, i)
+                       for i, p in enumerate(overlay_points or [])]
+        self.region = region
 
         if zoom_factor is not None:
-            self.zoom_factor = zoom_factor
+            self.zoom_factor = float(np.clip(zoom_factor, self.MIN_ZOOM,
+                                             self.MAX_ZOOM))
         if buffer is not None:
             self.buffer = buffer
         if selected_index is not None:
             self.selected_index = selected_index
+        if focus_index != -1:
+            self.focus_index = focus_index
 
         self.update()
+
+    # -- interaction -------------------------------------------------------
+
+    def wheelEvent(self, event):
+        """Zoom in and out. A fixed magnification cannot suit both finding a
+        handle and placing it."""
+        steps = event.angleDelta().y() / 120.0
+        if steps:
+            self.zoom_factor = float(np.clip(self.zoom_factor * (1.25 ** steps),
+                                             self.MIN_ZOOM, self.MAX_ZOOM))
+            self.update()
+            event.accept()
+            return
+        super(MagnifierWidget, self).wheelEvent(event)
 
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
@@ -732,7 +822,7 @@ class MagnifierWidget(QWidget):
                 event.y() >= self.height() - self.resize_handle_size):
                 self.resizing = True
                 self.last_mouse_pos = event.globalPos()
-                self.user_resized = True   # This flag disables auto‑resizing
+                self.user_resized = True   # This flag disables auto-resizing
                 event.accept()
                 return
         super(MagnifierWidget, self).mousePressEvent(event)
@@ -763,88 +853,273 @@ class MagnifierWidget(QWidget):
             return
         super(MagnifierWidget, self).mouseReleaseEvent(event)
 
+    # -- layout ------------------------------------------------------------
+
+    def tiles(self):
+        """``(rect, point_index)`` for each view to draw.
+
+        One handle being dragged gets the whole widget: that is the moment
+        precision is wanted, and four thumbnails serve it worse than one clear
+        view. Otherwise every handle gets a tile.
+        """
+        count = len(self.points)
+        if not count:
+            return []
+
+        focus = self.focus_index
+        if focus is not None and 0 <= focus < count:
+            return [(self.rect().adjusted(2, 2, -2, -2), focus)]
+
+        columns, rows = self.grid_shape()
+        width, height = self.width(), self.height()
+        order = self._tile_order()
+        out = []
+        for slot in range(count):
+            column, row = slot % columns, slot // columns
+            x0 = width * column // columns
+            x1 = width * (column + 1) // columns
+            y0 = height * row // rows
+            y1 = height * (row + 1) // rows
+            out.append((QRect(x0, y0, x1 - x0, y1 - y0), order[slot]))
+        return out
+
+    def grid_shape(self):
+        """``(columns, rows)`` for the overview."""
+        count = len(self.points)
+        if count <= 1:
+            return 1, 1
+        if count == 4 and all(p.kind == MagnifierPoint.CORNER for p in self.points):
+            # The familiar arrangement, and worth keeping: each corner appears
+            # in the part of the box where it actually sits on the video, so
+            # the eye goes to the right tile without reading the labels.
+            return 2, 2
+        if any(p.kind == MagnifierPoint.HANDLE for p in self.points):
+            # Curving is on: a row per edge, holding that edge's corner and its
+            # two bend handles, so a row is one edge of the area.
+            return 3, int(np.ceil(count / 3.0))
+        columns = int(np.ceil(np.sqrt(count)))
+        return columns, int(np.ceil(count / float(columns)))
+
+    def _tile_order(self):
+        """Which point each tile shows, for the spatial 2x2 case.
+
+        Corners are clicked round the shape -- top-left, top-right,
+        bottom-right, bottom-left -- while a grid runs left to right, top to
+        bottom. Swapping the last two puts each corner in its own part of the
+        box.
+        """
+        if self.grid_shape() == (2, 2) and len(self.points) == 4:
+            return [0, 1, 3, 2]
+        return list(range(len(self.points)))
+
+    def tile_mapping(self, rect, point):
+        """``(scale, offset_x, offset_y)`` taking frame coordinates to widget
+        ones inside this tile, so that ``widget = frame * scale + offset``.
+
+        The one definition of where the picture goes. The magnified image, the
+        outline drawn over it and the crosshair all derive from this, which is
+        what guarantees they agree: the handle lands exactly at the centre of
+        its tile for every handle, including ones outside the frame entirely.
+        """
+        zoom = self.zoom_factor
+        return (zoom,
+                rect.x() + rect.width() / 2.0 - point.x * zoom,
+                rect.y() + rect.height() / 2.0 - point.y * zoom)
+
+    def source_at(self, rect, point, x, y):
+        """Which pixel of the frame lies under a position in this tile."""
+        scale, offset_x, offset_y = self.tile_mapping(rect, point)
+        return ((x - offset_x) / scale, (y - offset_y) / scale)
+
+    # -- painting ----------------------------------------------------------
+
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
+        painter.fillRect(self.rect(), QColor(18, 18, 18))
 
-        w = self.width()
-        h = self.height()
-
-        # Fill the background and draw a black border:
-        painter.fillRect(self.rect(), Qt.black)
-        painter.setPen(QPen(Qt.black, 2))
-        painter.drawRect(0, 0, w - 1, h - 1)
-
-        # Draw dividing lines for 4 quadrants
-        mid_x = w // 2
-        mid_y = h // 2
-
-        painter.setPen(QPen(Qt.white, 1))
-        painter.drawLine(mid_x, 0, mid_x, h)
-        painter.drawLine(0, mid_y, w, mid_y)
-
-        # If no base_frame, done
-        if self.base_frame is None:
+        if self.base_frame is None or not self.points:
+            painter.setPen(QPen(QColor(130, 130, 130)))
+            painter.drawText(self.rect(), Qt.AlignCenter,
+                             "Mark an area to magnify it")
             painter.end()
             return
 
-        frame_h, frame_w = self.base_frame.shape[:2]
+        for rect, index in self.tiles():
+            self._draw_tile(painter, rect, self.points[index], index)
 
-        # Quadrants: (We “swap” corners 2 and 3)
-        #  index 0 => top-left
-        #  index 1 => top-right
-        #  index 2 => bottom-right
-        #  index 3 => bottom-left
-        quadrants = [
-            (QRect(0, 0, mid_x, mid_y)),               # quadrant for point0
-            (QRect(mid_x, 0, w - mid_x, mid_y)),       # quadrant for point1
-            (QRect(mid_x, mid_y, w - mid_x, h - mid_y)),  # quadrant for point2
-            (QRect(0, mid_y, mid_x, h - mid_y))           # quadrant for point3
-        ]
-
-        # For each point, show a magnified region in the correct quadrant
-        for i, (px, py) in enumerate(self.overlay_points):
-            if i >= 4:
-                break
-
-            dest_rect = quadrants[i]
-            # figure out the smaller dimension of quadrant => used as ROI size
-            dest_size = min(dest_rect.width(), dest_rect.height())
-            src_size = int(dest_size / self.zoom_factor) + self.buffer
-
-            # center the ROI around (px, py)
-            src_x = int(px - src_size/2)
-            src_y = int(py - src_size/2)
-
-            # clamp ROI inside base_frame
-            src_x = max(0, min(src_x, frame_w - src_size))
-            src_y = max(0, min(src_y, frame_h - src_size))
-
-            roi = self.base_frame[src_y : src_y + src_size, src_x : src_x + src_size].copy()
-
-            # resize ROI to fill quadrant
-            resized_roi = cv2.resize(roi, (dest_rect.width(), dest_rect.height()),
-                                     interpolation=cv2.INTER_LINEAR)
-
-            # convert BGR->RGB->QImage
-            resized_rgb = cv2.cvtColor(resized_roi, cv2.COLOR_BGR2RGB)
-            bytes_per_line = dest_rect.width() * 3
-            qimg = QImage(resized_rgb.data, dest_rect.width(), dest_rect.height(),
-                          bytes_per_line, QImage.Format_RGB888)
-
-            # draw it in quadrant
-            painter.drawImage(dest_rect, qimg)
-
-            # crosshair color = green if i == selected_index, else red
-            cross_color = QColor(0, 255, 0) if (i == self.selected_index) else QColor(255, 0, 0)
-            painter.setPen(QPen(cross_color, 2))
-
-            cx = dest_rect.x() + dest_rect.width() // 2
-            cy = dest_rect.y() + dest_rect.height() // 2
-            painter.drawLine(QPoint(cx - 5, cy), QPoint(cx + 5, cy))
-            painter.drawLine(QPoint(cx, cy - 5), QPoint(cx, cy + 5))
-
+        # The whole-widget border last, so no tile paints over it.
+        painter.setBrush(Qt.NoBrush)
+        painter.setPen(QPen(QColor(60, 60, 60), 1))
+        painter.drawRect(0, 0, self.width() - 1, self.height() - 1)
+        self._draw_zoom_badge(painter)
         painter.end()
+
+    def _draw_tile(self, painter, rect, point, index):
+        if rect.width() < 8 or rect.height() < 8:
+            return
+        painter.save()
+        painter.setClipRect(rect)
+
+        zoom = self.zoom_factor
+        # The view is centred exactly on the handle and never slid back inside
+        # the frame. Clamping it used to leave the crosshair drawn at the
+        # middle of the tile while the picture behind it had been shifted, so
+        # near the edge of frame the magnifier pointed at the wrong pixel --
+        # precisely where placement is most fiddly. Anything past the edge is
+        # simply shown as off-frame. The offsets are tile-local here, hence
+        # subtracting the tile's own origin from the shared mapping.
+        _, offset_x, offset_y = self.tile_mapping(rect, point)
+        matrix = np.float32([[zoom, 0, offset_x - rect.x()],
+                             [0, zoom, offset_y - rect.y()]])
+        crisp = zoom >= self.CRISP_ABOVE
+        patch = cv2.warpAffine(
+            self.base_frame, matrix, (rect.width(), rect.height()),
+            flags=cv2.INTER_NEAREST if crisp else cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_CONSTANT, borderValue=(26, 20, 20))
+        rgb = cv2.cvtColor(patch, cv2.COLOR_BGR2RGB)
+        image = QImage(rgb.data, rect.width(), rect.height(),
+                       3 * rect.width(), QImage.Format_RGB888)
+        painter.drawImage(rect.topLeft(), image.copy())
+
+        if zoom >= self.GRID_ABOVE:
+            self._draw_pixel_grid(painter, rect, point, zoom)
+        self._draw_geometry(painter, rect, point, zoom)
+        self._draw_crosshair(painter, rect, point, index)
+        self._draw_label(painter, rect, point, index)
+
+        # An outline, not a fill: drawRect uses whatever brush is current, and
+        # the label's translucent black was still set, so this quietly washed
+        # every tile over at a third of its brightness.
+        painter.setBrush(Qt.NoBrush)
+        painter.setPen(QPen(QColor(70, 70, 70), 1))
+        painter.drawRect(rect.adjusted(0, 0, -1, -1))
+        painter.restore()
+
+    def _draw_pixel_grid(self, painter, rect, point, zoom):
+        """Rule off the source pixels, so an edge can be read off exactly."""
+        painter.setPen(QPen(QColor(255, 255, 255, 55), 1))
+        left = point.x - rect.width() / (2.0 * zoom)
+        top = point.y - rect.height() / (2.0 * zoom)
+        first_x = np.ceil(left)
+        first_y = np.ceil(top)
+        for i in range(int(rect.width() / zoom) + 2):
+            x = rect.x() + (first_x + i - left) * zoom
+            if rect.x() <= x <= rect.right():
+                painter.drawLine(int(x), rect.y(), int(x), rect.bottom())
+        for i in range(int(rect.height() / zoom) + 2):
+            y = rect.y() + (first_y + i - top) * zoom
+            if rect.y() <= y <= rect.bottom():
+                painter.drawLine(rect.x(), int(y), rect.right(), int(y))
+
+    def _draw_geometry(self, painter, rect, point, zoom):
+        """The area's outline, and the handle lines, through this view.
+
+        Without it a Bezier handle cannot be judged at all: what matters is
+        where the *curve* ends up, not where the handle sits, and the curve is
+        often nowhere near it.
+        """
+        if self.region is None:
+            return
+
+        scale, offset_x, offset_y = self.tile_mapping(rect, point)
+
+        def to_tile(x, y):
+            return (x * scale + offset_x, y * scale + offset_y)
+
+        try:
+            boundary = core.region_boundary(self.region, samples=48)
+        except Exception:                      # a half-drawn or folded shape
+            return
+
+        painter.setPen(QPen(QColor(0, 230, 0, 200), 2))
+        mapped = [to_tile(x, y) for x, y in boundary]
+        for i in range(len(mapped)):
+            x1, y1 = mapped[i]
+            x2, y2 = mapped[(i + 1) % len(mapped)]
+            painter.drawLine(int(x1), int(y1), int(x2), int(y2))
+
+        if not self.region.curved:
+            return
+        painter.setPen(QPen(QColor(120, 180, 255, 150), 1, Qt.DashLine))
+        corners = self.region.corners
+        controls = self.region.controls
+        for edge in range(4):
+            for slot in range(2):
+                anchor = corners[edge] if slot == 0 else corners[(edge + 1) % 4]
+                ax, ay = to_tile(*anchor)
+                cx, cy = to_tile(*controls[edge, slot])
+                painter.drawLine(int(ax), int(ay), int(cx), int(cy))
+
+    def _draw_crosshair(self, painter, rect, point, index):
+        """The mark is always the true position of the handle.
+
+        Drawn as a gap-centred cross rather than a solid one so the pixel being
+        placed is never hidden by the thing pointing at it.
+        """
+        selected = index == self.selected_index
+        if point.kind == MagnifierPoint.HANDLE:
+            colour = QColor(0, 255, 255) if selected else QColor(120, 180, 255)
+        else:
+            colour = QColor(0, 255, 0) if selected else QColor(255, 60, 60)
+
+        cx = rect.x() + rect.width() // 2
+        cy = rect.y() + rect.height() // 2
+        arm, gap = 12, 4
+
+        # A dark under-stroke keeps it legible over pale footage. The coloured
+        # stroke has to be the thicker part of the pair, or the outline swamps
+        # it and every mark reads as black whatever it is meant to say.
+        for width, shade in ((4, QColor(0, 0, 0, 150)), (2, colour)):
+            painter.setPen(QPen(shade, width))
+            painter.drawLine(cx - arm, cy, cx - gap, cy)
+            painter.drawLine(cx + gap, cy, cx + arm, cy)
+            painter.drawLine(cx, cy - arm, cx, cy - gap)
+            painter.drawLine(cx, cy + gap, cx, cy + arm)
+
+        painter.setBrush(Qt.NoBrush)
+        for width, shade in ((3, QColor(0, 0, 0, 130)), (1, colour)):
+            painter.setPen(QPen(shade, width))
+            if point.kind == MagnifierPoint.HANDLE:
+                painter.drawRect(cx - 4, cy - 4, 8, 8)
+            else:
+                painter.drawEllipse(cx - 4, cy - 4, 8, 8)
+
+    def _draw_label(self, painter, rect, point, index):
+        """Name the handle on a solid tab.
+
+        Drawn on a tab rather than straight onto the picture because the
+        picture is arbitrary footage: plain text was unreadable half the time
+        and truncated by the tile the rest of it.
+        """
+        focused = self.focus_index is not None
+        text = point.title if focused else point.label
+        if not text or rect.height() < 30:
+            return
+
+        metrics = painter.fontMetrics()
+        text = metrics.elidedText(text, Qt.ElideRight, rect.width() - 12)
+        tab = QRect(rect.x() + 3, rect.y() + 3,
+                    metrics.width(text) + 10, metrics.height() + 2)
+        selected = index == self.selected_index
+
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QBrush(QColor(0, 0, 0, 165)))
+        painter.drawRect(tab)
+        painter.setPen(QPen(QColor(255, 255, 255) if selected
+                            else QColor(205, 205, 205)))
+        painter.drawText(tab, Qt.AlignCenter, text)
+
+    def _draw_zoom_badge(self, painter):
+        if self.height() < 40:
+            return
+        text = f"{self.zoom_factor:.0f}x"
+        box = QRect(self.width() - 46, self.height() - 20, 40, 15)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QBrush(QColor(0, 0, 0, 140)))
+        painter.drawRect(box)
+        painter.setPen(QPen(QColor(190, 190, 190)))
+        painter.drawText(box, Qt.AlignCenter, text)
 
 class Placement:
     """One insertion: an area tracked through the clip, and what goes in it.
@@ -2746,16 +3021,63 @@ class CentralPanel(QWidget):
             self.magnifier.setData(None, [], selected_index=-1)
             return
 
-        base_bgr = self.prev_frame.copy()
-        shape_pts = self.tracking_overlay.points[:]
-        selected_idx = self.tracking_overlay.selected_point_index
-
-        # Now we pass selected_index so the correct quadrant is drawn in green
+        overlay = self.tracking_overlay
+        points, selected, focus = self.magnifier_points()
         self.magnifier.setData(
-            base_frame=base_bgr,
-            overlay_points=shape_pts,
-            selected_index=selected_idx
+            base_frame=self.prev_frame.copy(),
+            overlay_points=points,
+            selected_index=selected,
+            region=overlay.current_region() if len(overlay.points) == 4 else None,
+            focus_index=focus,
         )
+
+    def magnifier_points(self):
+        """What the magnifier should show: ``(points, selected, focus)``.
+
+        With curving on there are twelve handles to place, not four, and the
+        eight that bend the edges were the ones that most needed magnifying --
+        they are small, they sit on top of the outline, and a pixel of error in
+        one is plainly visible as a curve that misses the screen. They were the
+        only handles the magnifier never showed.
+        """
+        overlay = self.tracking_overlay
+        corners = overlay.points[:]
+        points = [MagnifierPoint(x, y, str(i + 1), MagnifierPoint.CORNER,
+                                 f"Corner {i + 1}")
+                  for i, (x, y) in enumerate(corners)]
+        selected = overlay.selected_point_index
+        focus = overlay.drag_index if overlay.drag_index != -1 else None
+
+        if not (overlay.curved_enabled and len(corners) == 4):
+            return points, selected, focus
+
+        # A row per edge: its starting corner, then the two handles that bend
+        # it, which is the order the grid reads them in.
+        region = overlay.current_region()
+        edge_names = ("Top", "Right", "Bottom", "Left")
+        rows, dragged = [], overlay.drag_control
+        for edge in range(4):
+            row = [points[edge]]
+            for slot in range(2):
+                cx, cy = region.controls[edge, slot]
+                initial = edge_names[edge][0]
+                row.append(MagnifierPoint(
+                    cx, cy, f"{initial}{slot + 1}", MagnifierPoint.HANDLE,
+                    f"{edge_names[edge]} edge, bend {slot + 1}"))
+            rows.append(row)
+
+        # Corner i moved from position i to position 3i once the bend handles
+        # were interleaved, so every index has to be carried across with it.
+        ordered = [p for row in rows for p in row]
+        if dragged is not None:
+            edge, slot = dragged
+            focus = selected = edge * 3 + slot + 1
+        else:
+            if overlay.drag_index != -1:
+                focus = overlay.drag_index * 3
+            if 0 <= selected < 4:
+                selected = selected * 3
+        return ordered, selected, focus
 
     def load_video(self, file_path):
         if self.cap:
