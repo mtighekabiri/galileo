@@ -1,8 +1,13 @@
 # LUMEN Insertion Tool runtime dependencies.
 #
-# PyQt5 supplies the GUI plus QtMultimedia (used for the overlay preview
-# players). On Linux you may also need the system GStreamer plugins for
-# QMediaPlayer to decode video previews.
+# opencv-python-headless rather than opencv-python: the full build ships its
+# own Qt platform plugin (libqxcb.so) which clashes with PyQt5's on Linux and
+# produces the classic "could not load the Qt platform plugin xcb" failure.
+# This app never calls cv2's GUI functions, so the headless build loses nothing.
+opencv-python-headless>=4.8
 PyQt5>=5.15,<6
-opencv-python>=4.8
 numpy>=1.24
+
+# Optional. Without ffmpeg on PATH a render comes out silent, because OpenCV's
+# VideoWriter cannot write audio; with it, the original audio is copied back on.
+# ffmpeg is a system package, not a pip one: apt install ffmpeg / brew install ffmpeg
