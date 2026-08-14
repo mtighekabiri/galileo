@@ -1,0 +1,27 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Runtime output from the tool
+app_debug.log
+*.log
+
+# Local media / renders — don't commit sample footage or exports
+*.mp4
+*.avi
+*.mkv
+*.mov
+renders/
+output/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store

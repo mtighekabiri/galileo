@@ -1,0 +1,5 @@
+-r requirements.txt
+
+# The suite drives the real Qt widgets offscreen (QT_QPA_PLATFORM=offscreen),
+# so no display is needed to run it.
+pytest>=7.0
