@@ -347,14 +347,19 @@ class TestScreenAndOcclusionToggles:
 class TestAoiExport:
     """The AOI CSV is what the eye-tracking analysis is run against."""
 
-    def _export(self, window, tmp_path, monkeypatch, history):
+    def _export(self, window, tmp_path, monkeypatch, history, render=None):
         overlay = window.central_panel.tracking_overlay
         overlay.tracking_history = history
+        window.last_render = render
         out = str(tmp_path / "aoi.csv")
         monkeypatch.setattr(lumen_app.QFileDialog, "getSaveFileName",
                             staticmethod(lambda *a, **k: (out, "")))
-        monkeypatch.setattr(lumen_app.QMessageBox, "information",
-                            staticmethod(lambda *a, **k: None))
+        for name in ("information", "warning"):
+            monkeypatch.setattr(lumen_app.QMessageBox, name,
+                                staticmethod(lambda *a, **k: None))
+        # Exporting with no render asks for confirmation; answer yes.
+        monkeypatch.setattr(lumen_app.QMessageBox, "question",
+                            staticmethod(lambda *a, **k: lumen_app.QMessageBox.Yes))
         window.save_aoi_geometry()
 
         import csv
@@ -406,6 +411,96 @@ class TestAoiExport:
         # a matched pair would disagree about the frame size.
         assert stim["stim_width"].isdigit()
         assert stim["stim_height"].isdigit()
+
+
+class TestAoiMatchesTheRender:
+    """The CSV must describe the rendered stimulus, not the source footage.
+
+    A render can start partway in and be scaled down. Exporting absolute source
+    times at full resolution produced a file that parsed perfectly and was wrong
+    in three independent ways at once, so every fixation landed in the wrong
+    place with nothing to reveal it.
+    """
+
+    def _export(self, window, tmp_path, monkeypatch, history, render):
+        return TestAoiExport()._export(window, tmp_path, monkeypatch,
+                                       history, render)
+
+    @pytest.fixture
+    def render_info(self, tmp_path):
+        out = tmp_path / "stim.mp4"
+        out.write_bytes(b"x")
+        return {"out_path": str(out), "start_frame": 5, "end_frame": 12,
+                "scale_factor": 0.5, "fps": 25.0, "width": 320, "height": 240}
+
+    def test_times_are_relative_to_the_rendered_file(self, loaded, tmp_path,
+                                                     monkeypatch, render_info):
+        window, path, truth = loaded
+        history = {i: [tuple(map(float, p)) for p in q]
+                   for i, q in enumerate(truth)}
+        _, _, rows = self._export(window, tmp_path, monkeypatch, history,
+                                  render_info)
+        # The render starts at frame 5, so the first AOI row is time zero.
+        assert float(rows[0][0]) == pytest.approx(0.0, abs=1e-6)
+        assert float(rows[-1][1]) == pytest.approx(8 / 25.0, abs=1e-6)
+
+    def test_only_the_rendered_range_is_exported(self, loaded, tmp_path,
+                                                 monkeypatch, render_info):
+        window, path, truth = loaded
+        history = {i: [tuple(map(float, p)) for p in q]
+                   for i, q in enumerate(truth)}
+        _, _, rows = self._export(window, tmp_path, monkeypatch, history,
+                                  render_info)
+        assert len(rows) == 8      # frames 5..12 inclusive
+
+    def test_coordinates_are_in_the_rendered_pixel_space(self, loaded, tmp_path,
+                                                         monkeypatch, render_info):
+        window, path, truth = loaded
+        history = {i: [tuple(map(float, p)) for p in q]
+                   for i, q in enumerate(truth)}
+        _, _, rows = self._export(window, tmp_path, monkeypatch, history,
+                                  render_info)
+        exported = [float(v) for v in rows[0][-1].split(";")]
+        source = np.float32(truth[5]).reshape(-1)
+        assert np.allclose(exported, source * 0.5, atol=1e-3)
+
+    def test_header_reports_the_rendered_size(self, loaded, tmp_path,
+                                              monkeypatch, render_info):
+        window, path, truth = loaded
+        history = {i: [tuple(map(float, p)) for p in q]
+                   for i, q in enumerate(truth)}
+        header, _, _ = self._export(window, tmp_path, monkeypatch, history,
+                                    render_info)
+        stim = {k: v for k, v in (f.split(":", 1) for f in header if ":" in f)}
+        assert stim["stim_width"] == "320"
+        assert stim["stim_height"] == "240"
+
+    def test_declining_the_no_render_prompt_writes_nothing(self, loaded, tmp_path,
+                                                           monkeypatch):
+        window, path, truth = loaded
+        window.last_render = None
+        window.central_panel.tracking_overlay.tracking_history = {
+            0: [tuple(map(float, p)) for p in truth[0]]}
+        out = tmp_path / "declined.csv"
+        monkeypatch.setattr(lumen_app.QFileDialog, "getSaveFileName",
+                            staticmethod(lambda *a, **k: (str(out), "")))
+        monkeypatch.setattr(lumen_app.QMessageBox, "question",
+                            staticmethod(lambda *a, **k: lumen_app.QMessageBox.No))
+        window.save_aoi_geometry()
+        assert not out.exists()
+
+    def test_unrenderable_shapes_are_skipped(self, loaded, tmp_path,
+                                             monkeypatch, render_info):
+        """A folded quad draws no advert, so it must claim no AOI either."""
+        window, path, truth = loaded
+        history = {i: [tuple(map(float, p)) for p in q]
+                   for i, q in enumerate(truth)}
+        # A bowtie at frame 7 has no interior.
+        good = np.float32(truth[7])
+        history[7] = [tuple(good[0]), tuple(good[1]), tuple(good[3]), tuple(good[2])]
+        _, _, rows = self._export(window, tmp_path, monkeypatch, history,
+                                  render_info)
+        assert len(rows) == 7      # one fewer than the 8-frame range
 
 
 class TestProjectRoundTrip:

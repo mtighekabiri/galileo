@@ -16,7 +16,7 @@ from PyQt5.QtWidgets import (
     QGraphicsDropShadowEffect, QPushButton, QLabel, QMainWindow,
     QSpacerItem, QSizePolicy, QSlider, QFileDialog, QMenu, QAction,
     QStyle, QMessageBox, QGridLayout, QCheckBox, QDialog, QDialogButtonBox,
-    QProgressDialog, QScrollArea)
+    QProgressDialog, QScrollArea, QSpinBox, QComboBox, QLineEdit)
 from PyQt5.QtGui import (
     QCursor, QPixmap, QColor, QPainter, QBrush, QPen, QImage, QPolygonF)
 from PyQt5.QtMultimedia import QMediaPlayer, QMediaContent
@@ -2241,6 +2241,126 @@ class CentralPanel(QWidget):
             self.cap.set(cv2.CAP_PROP_POS_FRAMES, value)
             self.read_frame()
 
+class RenderDialog(QDialog):
+    """One dialog for the whole render, showing what is actually tracked.
+
+    This replaces four chained prompts that asked for numbers with no context.
+    The frame range defaulted to the entire clip regardless of how much had
+    been tracked, and since the renderer leaves untracked frames untouched, the
+    usual first-run result was a video in which the advert appeared on a single
+    frame -- reported as "exported successfully".
+    """
+
+    def __init__(self, total_frames, tracked_range, video_size, fps,
+                 suggested_path, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Render Video")
+        self.setMinimumWidth(520)
+        self.setStyleSheet("""
+            QDialog { background-color: #2A2A2A; }
+            QLabel { color: #E8E8E8; font-size: 13px; }
+            QSpinBox, QComboBox, QLineEdit {
+                background-color: #1E1E1E; color: white; border: 1px solid #555;
+                border-radius: 4px; padding: 4px; font-size: 13px;
+            }
+            QPushButton {
+                background-color: #3C3C3C; color: white; border: none;
+                border-radius: 6px; padding: 7px 16px; font-size: 13px;
+            }
+            QPushButton:hover { background-color: #505050; }
+        """)
+
+        self.video_size = video_size
+        self.tracked_range = tracked_range
+        self.fps = fps or 30.0
+
+        layout = QVBoxLayout(self)
+        layout.setSpacing(12)
+
+        first, last = tracked_range
+        summary = QLabel(
+            f"<b>Tracked:</b> frames {first}–{last} "
+            f"of {total_frames}  ({(last - first + 1) / self.fps:.1f}s)")
+        layout.addWidget(summary)
+
+        range_row = QHBoxLayout()
+        range_row.addWidget(QLabel("Frames"))
+        self.start_spin = QSpinBox()
+        self.start_spin.setRange(0, max(0, total_frames - 1))
+        self.start_spin.setValue(first)
+        self.end_spin = QSpinBox()
+        self.end_spin.setRange(0, max(0, total_frames - 1))
+        self.end_spin.setValue(last)
+        range_row.addWidget(self.start_spin)
+        range_row.addWidget(QLabel("to"))
+        range_row.addWidget(self.end_spin)
+        range_row.addStretch(1)
+        layout.addLayout(range_row)
+
+        # Resolution as a plain choice showing real pixel sizes, rather than
+        # asking for a multiplier.
+        scale_row = QHBoxLayout()
+        scale_row.addWidget(QLabel("Resolution"))
+        self.scale_combo = QComboBox()
+        for label, factor in (("Full", 1.0), ("Half", 0.5), ("Quarter", 0.25)):
+            w = int(video_size[0] * factor)
+            h = int(video_size[1] * factor)
+            self.scale_combo.addItem(f"{label}  —  {w}×{h}", factor)
+        scale_row.addWidget(self.scale_combo)
+        scale_row.addStretch(1)
+        layout.addLayout(scale_row)
+
+        path_row = QHBoxLayout()
+        path_row.addWidget(QLabel("Save to"))
+        self.path_edit = QLineEdit(suggested_path)
+        browse = QPushButton("Browse…")
+        browse.clicked.connect(self._browse)
+        path_row.addWidget(self.path_edit, 1)
+        path_row.addWidget(browse)
+        layout.addLayout(path_row)
+
+        self.warning = QLabel("")
+        self.warning.setWordWrap(True)
+        self.warning.setStyleSheet("color: #FFB454; font-size: 12px;")
+        layout.addWidget(self.warning)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.button(QDialogButtonBox.Ok).setText("Render")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons, alignment=Qt.AlignRight)
+
+        for spin in (self.start_spin, self.end_spin):
+            spin.valueChanged.connect(self._update_warning)
+        self._update_warning()
+
+    def _browse(self):
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Rendered Video", self.path_edit.text(), "MP4 Files (*.mp4)")
+        if path:
+            self.path_edit.setText(path)
+
+    def _update_warning(self):
+        """Say plainly when the chosen range reaches past the tracking."""
+        first, last = self.tracked_range
+        start, end = self.start_spin.value(), self.end_spin.value()
+        gaps = []
+        if start < first:
+            gaps.append(f"{start}–{first - 1}")
+        if end > last:
+            gaps.append(f"{last + 1}–{end}")
+        if gaps:
+            self.warning.setText(
+                "⚠  No tracking on frames " + ", ".join(gaps) +
+                ". The creative will not appear on them.")
+        else:
+            self.warning.setText("")
+
+    def values(self):
+        return (self.start_spin.value(), self.end_spin.value(),
+                self.scale_combo.currentData(), self.path_edit.text().strip())
+
+
 class RenderSettings:
     """A self-contained snapshot of everything a render needs.
 
@@ -2301,10 +2421,18 @@ class RenderWorker(QObject):
 
             # Fill the gaps between tracked frames instead of holding the last
             # known position, which used to freeze the insert mid-shot.
+            # Things that went wrong but did not stop the render. These have
+            # to reach the user: each one changes what is in the file, and all
+            # of them used to be reported as an unqualified success.
+            caveats = []
+
             dense = core.interpolate_tracking(
                 settings.history, settings.start_frame, settings.end_frame)
             if not dense:
-                self.finished.emit("Completed (No tracking data to apply)")
+                # No file gets written here, so this is a failure, not a
+                # "Completed" with a note.
+                self.finished.emit(
+                    "Error: no tracking data covers the chosen frame range.")
                 return
 
             out_writer = cv2.VideoWriter(
@@ -2322,6 +2450,8 @@ class RenderWorker(QObject):
                     logging.error("Could not open the overlay video; "
                                   "rendering without it.")
                     overlay_cap = None
+                    caveats.append("the creative video could not be opened, so "
+                                   "no creative was inserted")
 
             # Seek once, then read straight through. Seeking per frame is slow
             # and, on long-GOP codecs, lands on the nearest keyframe rather
@@ -2335,6 +2465,8 @@ class RenderWorker(QObject):
                     segmenter = core.PersonSegmenter()
                 except (FileNotFoundError, IOError) as exc:
                     logging.warning("Rendering without occlusion: %s", exc)
+                    caveats.append("the person model is missing, so people "
+                                   "walking in front were painted over")
 
             overlay_frame = None
             overlay_cursor = -1
@@ -2407,7 +2539,16 @@ class RenderWorker(QObject):
                 self.finished.emit("Canceled")
                 return
 
-            self.finished.emit(self._attach_audio())
+            if frame_counter == 0:
+                self.finished.emit("Error: no frames were written.")
+                return
+
+            status = self._attach_audio()
+            audio_note = status[len("Completed"):].strip(" ()")
+            if audio_note:
+                caveats.append(audio_note)
+            self.finished.emit("Completed" +
+                               (f" ({'; '.join(caveats)})" if caveats else ""))
 
         except Exception as e:
             logging.exception("Render worker failed")
@@ -2525,6 +2666,11 @@ class MainWindow(QMainWindow):
 
         self.inserted_overlay_widget = None
         self.dirty = False
+        # What the last successful render covered, so the AOI export can
+        # describe that file rather than the untouched source video.
+        self.last_render = None
+        self.pending_render = None
+        self.last_output_dir = ""
         self.refresh_title()
 
     # -- unsaved work ------------------------------------------------------
@@ -2664,19 +2810,45 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Render Error", "No overlay has been inserted to render.")
             return
 
-        # Use dialogs to get render settings... (This part is the same as your old code)
-        total_frames = int(self.central_panel.cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        start_frame, ok1 = QInputDialog.getInt(self, "Render Range", "Enter start frame:", 0, 0, total_frames - 1)
-        if not ok1: return
-        end_frame, ok2 = QInputDialog.getInt(self, "Render Range", "Enter end frame:", total_frames - 1, start_frame, total_frames - 1)
-        if not ok2: return
-        scale_factor, ok3 = QInputDialog.getDouble(self, "Render Scale", "Enter scale factor (e.g., 0.5 for half resolution):", 1.0, 0.1, 1.0, 2)
-        if not ok3: return
-        out_path, _ = QFileDialog.getSaveFileName(self, "Save Rendered Video", "", "MP4 Files (*.mp4)")
-        if not out_path: return
+        panel = self.central_panel
+        total_frames = int(panel.cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        keys = sorted(overlay.tracking_history)
+        tracked_range = (keys[0], keys[-1])
+        video_size = (int(panel.cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
+                      int(panel.cap.get(cv2.CAP_PROP_FRAME_HEIGHT)))
+
+        base = os.path.splitext(os.path.basename(panel.current_video_path or "video"))[0]
+        creative = os.path.splitext(os.path.basename(
+            overlay.overlay_source_path or "creative"))[0]
+        directory = self.last_output_dir or os.path.dirname(
+            panel.current_video_path or "")
+        suggested = os.path.join(directory, f"{base}_{creative}.mp4")
+
+        dialog = RenderDialog(total_frames, tracked_range, video_size,
+                              panel.fps, suggested, parent=self)
+        if dialog.exec_() != QDialog.Accepted:
+            return
+        start_frame, end_frame, scale_factor, out_path = dialog.values()
+        if not out_path:
+            QMessageBox.warning(self, "Render Error", "Choose where to save the video.")
+            return
+        if end_frame < start_frame:
+            QMessageBox.warning(self, "Render Error",
+                                "The end frame is before the start frame.")
+            return
+        self.last_output_dir = os.path.dirname(out_path)
 
         settings = self.build_render_settings(start_frame, end_frame,
                                               scale_factor, out_path)
+        # Remember what was rendered so the AOI export can describe *this*
+        # file rather than the untouched source.
+        self.pending_render = {
+            "out_path": out_path, "start_frame": start_frame,
+            "end_frame": end_frame, "scale_factor": scale_factor,
+            "fps": panel.fps,
+            "width": int(video_size[0] * scale_factor),
+            "height": int(video_size[1] * scale_factor),
+        }
 
         # --- Threading Setup ---
         self.render_thread = QThread()
@@ -2740,11 +2912,33 @@ class MainWindow(QMainWindow):
         self.render_thread.wait()
 
         if status.startswith("Completed"):
+            pending = self.pending_render or {}
+            out_path = pending.get("out_path")
+
+            # "Completed" used to be claimed even when no file was written.
+            if out_path and not os.path.exists(out_path):
+                QMessageBox.critical(
+                    self, "Render Failed",
+                    f"No file was written to:\n{out_path}\n\n"
+                    "See the log for details.")
+                self.pending_render = None
+                return
+
+            self.last_render = pending
             detail = status[len("Completed"):].strip(" ()")
-            message = "Video exported successfully."
+            frames = pending.get("end_frame", 0) - pending.get("start_frame", 0) + 1
+            message = (f"Exported {frames} frames to:\n{out_path}\n\n"
+                       f"{pending.get('width')}×{pending.get('height')}")
             if detail:
-                message += f"\n\n{detail[0].upper()}{detail[1:]}."
-            QMessageBox.information(self, "Render Complete", message)
+                # A caveat is a warning, not a success notice: the render may
+                # have gone out with no audio, no creative, or the ad painted
+                # over every pedestrian.
+                QMessageBox.warning(
+                    self, "Render Complete — with a caveat",
+                    f"{message}\n\n⚠  {detail[0].upper()}{detail[1:]}.")
+            else:
+                QMessageBox.information(self, "Render Complete", message)
+            self.pending_render = None
         elif status == "Canceled":
             QMessageBox.warning(self, "Render Canceled", "The rendering process was canceled.")
         else: # Error
@@ -3006,16 +3200,44 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Export Error", "No base video is loaded.")
             return
 
+        # The CSV has to describe the *rendered* stimulus, not the source
+        # footage. The render starts at start_frame, may be scaled down, and
+        # covers only part of the clip; exporting absolute source times and
+        # full-resolution coordinates produced a file that parsed perfectly and
+        # was wrong in three independent ways, so every fixation would be
+        # mapped to the wrong place with no visible symptom.
+        render = self.last_render
+        if render:
+            fps = render["fps"] or 30
+            video_w, video_h = render["width"], render["height"]
+            first_frame, last_frame = render["start_frame"], render["end_frame"]
+            scale = render["scale_factor"]
+            default_name = os.path.splitext(
+                os.path.basename(render["out_path"]))[0] + "_aoi.csv"
+            default_dir = os.path.dirname(render["out_path"])
+        else:
+            reply = QMessageBox.question(
+                self, "No Render Yet",
+                "Nothing has been rendered in this session, so the AOI geometry "
+                "can only describe the full-length, full-resolution source "
+                "video.\n\nIf the stimulus you show participants is a trimmed or "
+                "scaled render, this CSV will not line up with it.\n\n"
+                "Export against the source anyway?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if reply != QMessageBox.Yes:
+                return
+            fps = self.central_panel.fps or 30
+            video_w = int(self.central_panel.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            video_h = int(self.central_panel.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            first_frame, last_frame, scale = None, None, 1.0
+            default_name = "aoi.csv"
+            default_dir = self.last_output_dir or ""
+
         save_path, _ = QFileDialog.getSaveFileName(
-            self, "Save AOI Geometry", "", "CSV Files (*.csv)"
-        )
+            self, "Save AOI Geometry", os.path.join(default_dir, default_name),
+            "CSV Files (*.csv)")
         if not save_path:
             return
-
-        # base video dims
-        video_w = int(self.central_panel.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        video_h = int(self.central_panel.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        fps = self.central_panel.fps or 30
 
         # Row 1 (optional)
         row1 = [
@@ -3055,25 +3277,29 @@ class MainWindow(QMainWindow):
         # time and fixation counts. It would also disagree with the rendered
         # video, which draws the ad on every frame in the range.
         frame_dict = core.interpolate_tracking(
-            self.central_panel.tracking_overlay.tracking_history)
+            self.central_panel.tracking_overlay.tracking_history,
+            first_frame, last_frame)
+
+        origin = first_frame if first_frame is not None else 0
+        skipped = 0
 
         # Sort the frame numbers so CSV rows are in ascending order
         for frame_idx in sorted(frame_dict.keys()):
             corners = frame_dict[frame_idx]
 
-            # For the START/END times:
-            start_time = frame_idx / fps
-            end_time   = (frame_idx + 1) / fps
+            # An unrenderable shape draws no advert, so it must not claim an
+            # area of interest either.
+            if not core.is_valid_quad(corners):
+                skipped += 1
+                continue
 
-            # Build the “points” string if we have 4 corners
-            if len(corners) == 4:
-                x0, y0 = corners[0]
-                x1, y1 = corners[1]
-                x2, y2 = corners[2]
-                x3, y3 = corners[3]
-                points_str = f"{x0:.4f};{y0:.4f};{x1:.4f};{y1:.4f};{x2:.4f};{y2:.4f};{x3:.4f};{y3:.4f}"
-            else:
-                points_str = ""
+            # Times are relative to the start of the rendered file.
+            start_time = (frame_idx - origin) / fps
+            end_time = (frame_idx - origin + 1) / fps
+
+            # Coordinates must be in the rendered file's pixel space.
+            scaled = [(float(x) * scale, float(y) * scale) for x, y in corners]
+            points_str = ";".join(f"{v:.4f}" for point in scaled for v in point)
 
             row_out = [
                 f"{start_time:.3f}",
@@ -3100,7 +3326,26 @@ class MainWindow(QMainWindow):
             writer.writerow(row2)
             writer.writerows(geometry_data)
 
-        QMessageBox.information(self, "Export Complete", f"AOI Geometry saved to {save_path}.")
+        if not geometry_data:
+            QMessageBox.warning(
+                self, "Nothing Exported",
+                "No usable tracking data, so an empty AOI file was written.\n\n"
+                "Track the area across the frames you intend to show before "
+                "exporting.")
+            return
+
+        detail = (f"{len(geometry_data)} frames, "
+                  f"{geometry_data[0][0]}s–{geometry_data[-1][1]}s, "
+                  f"{video_w}×{video_h}")
+        if render:
+            detail += f"\nMatched to: {os.path.basename(render['out_path'])}"
+        else:
+            detail += "\n\n⚠  Describes the full-resolution source video."
+        if skipped:
+            detail += f"\n{skipped} frame(s) skipped: the shape was unrenderable."
+
+        QMessageBox.information(self, "Export Complete",
+                                f"AOI geometry saved to:\n{save_path}\n\n{detail}")
 
 
     def upload_base_video(self):
