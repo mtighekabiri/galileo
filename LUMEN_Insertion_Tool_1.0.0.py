@@ -28,6 +28,17 @@ def app_directory() -> str:
     return os.path.dirname(os.path.abspath(__file__))
 
 
+def resource_directory() -> str:
+    """Where files bundled *into* a packaged build live.
+
+    PyInstaller unpacks bundled data to its own folder (``_internal`` for a
+    one-folder build), which is not the folder holding the executable, so both
+    have to be searched: one for what was shipped, one for what a user dropped
+    in later.
+    """
+    return getattr(sys, "_MEIPASS", app_directory())
+
+
 def user_data_directory() -> str:
     """A per-user, definitely-writable folder for logs and settings.
 
@@ -61,9 +72,21 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s')
 logging.debug("Application start; log at %s", LOG_PATH)
 
-# Let a bundled ffmpeg sitting beside the application be found, so audio works
-# without anything being installed.
-core.register_binary_dir(app_directory())
+# Let a bundled ffmpeg and the segmentation model sitting beside the
+# application be found, so audio and occlusion work without anything installed.
+for _directory in (app_directory(), resource_directory()):
+    core.register_binary_dir(_directory)
+    core.register_model_dir(_directory)
+    core.register_model_dir(os.path.join(_directory, core.MODEL_DIR_NAME))
+
+# Record what optional pieces were found. This is the first thing to look at
+# when someone reports that occlusion is greyed out or a render came out silent.
+logging.debug("Frozen: %s | app dir: %s | resources: %s",
+              bool(getattr(sys, "frozen", False)), app_directory(),
+              resource_directory())
+logging.debug("Occlusion model: %s",
+              core.find_model(core.PersonSegmenter.MODEL_FILENAME) or "NOT FOUND")
+logging.debug("ffmpeg: %s", core.find_binary("ffmpeg") or "NOT FOUND")
 
 def log_uncaught_exceptions(exctype, value, tb):
     import traceback
@@ -1100,8 +1123,26 @@ class TitleBar(QWidget):
         save_menu.addAction(QAction("AOI Geometry", self, triggered=self.parent.save_aoi_geometry))
         save_menu.addAction(QAction("Project", self, triggered=self.parent.save_project))
 
+        options_menu = QMenu("Options", self.menu)
+
+        self.digital_screen_action = QAction(
+            "Digital screen (track surroundings)", self, checkable=True)
+        self.digital_screen_action.setToolTip(
+            "Track the bezel and wall around the screen rather than its "
+            "picture, which moves on its own")
+        self.digital_screen_action.toggled.connect(self.parent.toggle_digital_screen)
+        options_menu.addAction(self.digital_screen_action)
+
+        self.occlusion_action = QAction(
+            "Draw behind people", self, checkable=True)
+        self.occlusion_action.setToolTip(
+            "Let passers-by walk in front of the inserted creative")
+        self.occlusion_action.toggled.connect(self.parent.toggle_occlusion)
+        options_menu.addAction(self.occlusion_action)
+
         self.menu.addMenu(load_menu)
         self.menu.addMenu(save_menu)
+        self.menu.addMenu(options_menu)
         self.menu.addSeparator()
         detect_action = QAction("Find Target from Image...", self,
                                 triggered=self.parent.detect_from_reference)
@@ -1312,6 +1353,13 @@ class CentralPanel(QWidget):
 
         # Feature-based planar tracker, rebuilt whenever the shape is re-drawn.
         self.tracker = None
+        # Where the tracker looks for features. A digital screen needs the
+        # surroundings, since its own picture moves independently of it.
+        self.feature_source = core.PlanarTracker.INTERIOR
+
+        # Person segmentation for occlusion, built on first use.
+        self.segmenter = None
+        self.occlusion_enabled = False
 
         # 1) The container for video + overlay
         self.video_container = QWidget(self)
@@ -1658,7 +1706,9 @@ class CentralPanel(QWidget):
                 region = overlay.current_region()
                 if core.is_valid_region(region):
                     display_frame = core.composite_region(
-                        self.prev_frame, styled, region)
+                        self.prev_frame, styled, region,
+                        occlusion=self.occlusion_mask(self.prev_frame,
+                                                      overlay.points))
 
         frame_rgb = cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB)
         h, w, ch = frame_rgb.shape
@@ -1695,7 +1745,9 @@ class CentralPanel(QWidget):
             if not self.kalman_filters:
                 self.kalman_filters = core.make_filters(overlay.points)
             if self.tracker is None and self.prev_frame is not None:
-                self.tracker = core.PlanarTracker(self.prev_frame, overlay.points)
+                self.tracker = core.PlanarTracker(
+                    self.prev_frame, overlay.points,
+                    feature_source=self.feature_source)
 
             measurement = None
             if self.tracker is not None:
@@ -1735,7 +1787,9 @@ class CentralPanel(QWidget):
             if styled is not None:
                 region = overlay.current_region()
                 if core.is_valid_region(region):
-                    display_frame = core.composite_region(frame, styled, region)
+                    display_frame = core.composite_region(
+                        frame, styled, region,
+                        occlusion=self.occlusion_mask(frame, overlay.points))
 
         frame_rgb = cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB)
         h_frame, w_frame, ch = frame_rgb.shape
@@ -1879,6 +1933,23 @@ class CentralPanel(QWidget):
         if not result.ok:
             return None
         return [(float(x), float(y)) for x, y in result.quad]
+
+    def occlusion_mask(self, frame, quad):
+        """A mask of people in front of the surface, or None if switched off."""
+        if not self.occlusion_enabled or frame is None:
+            return None
+        if self.segmenter is None:
+            try:
+                self.segmenter = core.PersonSegmenter()
+            except (FileNotFoundError, IOError) as exc:
+                logging.warning("Occlusion unavailable: %s", exc)
+                self.occlusion_enabled = False
+                return None
+        try:
+            return self.segmenter.mask(frame, quad)
+        except cv2.error as exc:
+            logging.warning("Segmentation failed on this frame: %s", exc)
+            return None
 
     def reset_tracker(self):
         """Re-anchor tracking to the shape as it now stands.
@@ -2084,7 +2155,7 @@ class RenderSettings:
                  scale_factor, fps, history, curvature, curved,
                  overlay_bgra=None, overlay_video_path=None,
                  overlay_start_frame=0, brightness=0, contrast=1.0,
-                 colourise=False, include_audio=True):
+                 colourise=False, include_audio=True, occlusion=False):
         self.base_video_path = base_video_path
         self.out_path = out_path
         self.start_frame = int(start_frame)
@@ -2101,6 +2172,9 @@ class RenderSettings:
         self.contrast = contrast
         self.colourise = colourise
         self.include_audio = include_audio
+        # A flag, not a segmenter: a cv2.dnn.Net cannot be shared across
+        # threads, so the worker builds its own.
+        self.occlusion = occlusion
 
 
 class RenderWorker(QObject):
@@ -2156,6 +2230,13 @@ class RenderWorker(QObject):
             if settings.start_frame > 0:
                 base_cap.set(cv2.CAP_PROP_POS_FRAMES, settings.start_frame)
 
+            segmenter = None
+            if settings.occlusion:
+                try:
+                    segmenter = core.PersonSegmenter()
+                except (FileNotFoundError, IOError) as exc:
+                    logging.warning("Rendering without occlusion: %s", exc)
+
             overlay_frame = None
             overlay_cursor = -1
             overlay_exhausted = False
@@ -2199,9 +2280,18 @@ class RenderWorker(QObject):
                         if settings.colourise:
                             styled = core.apply_colourise(
                                 styled, base_frame, region.corners)
+                        occlusion = None
+                        if segmenter is not None:
+                            try:
+                                occlusion = segmenter.mask(base_frame,
+                                                           region.corners)
+                            except cv2.error as exc:
+                                logging.warning("Segmentation failed on frame "
+                                                "%d: %s", frame_idx, exc)
                         if core.is_valid_region(region):
                             base_frame = core.composite_region(
-                                base_frame, styled, region, in_place=True)
+                                base_frame, styled, region, in_place=True,
+                                occlusion=occlusion)
 
                 out_writer.write(base_frame)
                 frame_counter += 1
@@ -2488,6 +2578,7 @@ class MainWindow(QMainWindow):
             brightness=overlay.brightness,
             contrast=overlay.contrast,
             colourise=overlay.colourise_enabled,
+            occlusion=panel.occlusion_enabled,
         )
 
     def on_render_finished(self, status):
@@ -2655,6 +2746,49 @@ class MainWindow(QMainWindow):
             f"({detection.n_inliers} matching features, "
             f"{detection.confidence:.0%} confidence).\n\n"
             "Adjust the corners if you need to, then turn tracking on.")
+
+    def toggle_digital_screen(self, enabled: bool):
+        """Choose where the tracker looks for the features it follows.
+
+        A printed billboard's own artwork is fixed to it, so tracking the
+        inside of the region is ideal. A digital screen's picture is not: it
+        changes and slides about independently of the panel, so features found
+        on it follow the advert being played rather than the screen playing it,
+        and the insert wanders off. For those, track the bezel and wall around
+        it instead.
+        """
+        panel = self.central_panel
+        panel.feature_source = (core.PlanarTracker.SURROUND if enabled
+                                else core.PlanarTracker.INTERIOR)
+        panel.reset_tracker()
+        logging.debug("Tracking features from: %s", panel.feature_source)
+
+        if enabled:
+            QMessageBox.information(
+                self, "Digital Screen Mode",
+                "Tracking will follow the bezel and wall around the screen "
+                "rather than the picture on it.\n\n"
+                "Leave room around the area when you mark it -- that "
+                "surrounding detail is what the tracking now depends on.")
+
+    def toggle_occlusion(self, enabled: bool):
+        """Let people walking in front of the surface stay in front of it."""
+        panel = self.central_panel
+
+        if enabled and not core.PersonSegmenter.is_available():
+            QMessageBox.warning(
+                self, "Model Not Found",
+                "The person-segmentation model is missing.\n\n"
+                "Run fetch_model.py to download it (about 6 MB), or place "
+                f"{core.PersonSegmenter.MODEL_FILENAME} in a 'models' folder "
+                "beside the application.")
+            self.title_bar.occlusion_action.setChecked(False)
+            return
+
+        panel.occlusion_enabled = enabled
+        if not enabled:
+            panel.segmenter = None
+        panel.refresh_display()
 
     def toggle_curved_edges(self, enabled: bool):
         """Switch curved edges on or off for the insertion area."""

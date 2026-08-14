@@ -12,9 +12,22 @@
 # Drop an ffmpeg binary next to the executable in dist/LUMEN/ to give renders
 # their audio; the app looks there before it looks at PATH.
 
+import os
 import sys
 
 block_cipher = None
+
+# Bundle the person-segmentation model if it has been fetched, so occlusion
+# works for whoever receives the build without them downloading anything.
+# Run fetch_model.py before building to include it.
+DATAS = []
+_models = os.path.join(os.path.abspath(SPECPATH), "models")
+if os.path.isdir(_models) and any(f.endswith(".onnx") for f in os.listdir(_models)):
+    DATAS.append((_models, "models"))
+    print("  spec: bundling models/ for occlusion support")
+else:
+    print("  spec: no models/ found -- occlusion will be unavailable in this "
+          "build (run fetch_model.py first to include it)")
 
 # Qt is the main source of bloat and of duplicate-library clashes. WebEngine
 # alone is hundreds of megabytes and nothing here uses it.
@@ -36,7 +49,7 @@ analysis = Analysis(
     # lumen_core is imported normally and picked up automatically; listed here
     # so the build fails loudly if it ever goes missing rather than shipping a
     # broken executable.
-    datas=[],
+    datas=DATAS,
     hiddenimports=["lumen_core"],
     hookspath=[],
     hooksconfig={},

@@ -31,3 +31,7 @@ dist/
 build/
 .buildenv/
 *.zip
+
+# Model weights are fetched by fetch_model.py, not committed
+models/
+*.onnx

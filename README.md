@@ -72,17 +72,63 @@ Brightness, contrast and colourise adjustments for the inserted creative are
 available from the left toolbar, and all three apply to the render as well as
 the preview.
 
+## Digital screens vs printed billboards
+
+This matters more than it sounds, and getting it wrong makes the insert slide
+off the panel entirely.
+
+By default the tracker follows the texture **inside** the marked area. That is
+right for a printed billboard or poster, whose artwork is fixed to the surface.
+
+A digital OOH screen is different: it is already playing an advert, and that
+picture moves on its own. Features found on it follow the advert rather than
+the screen showing it. On a test clip of a screen playing scrolling content,
+interior tracking drifts **100 px on average and 175 px by frame 30** — while
+reporting no failures at all, so it is confidently wrong rather than visibly
+broken.
+
+For those, turn on **Options → Digital screen (track surroundings)**. The
+tracker then follows the bezel, wall and fittings around the screen, which are
+genuinely rigid. On the same clip that gives **1.0 px** average error.
+
+> When using this mode, leave some room around the screen as you mark it —
+> the surrounding detail is what the tracking now depends on.
+
+## Occlusion — people walking in front
+
+In airports, malls and high streets somebody is constantly crossing between the
+camera and the screen. Painting the creative over them is the most obvious tell
+that a shot has been altered, which matters when the footage is a research
+stimulus.
+
+**Options → Draw behind people** segments the people in each frame and holds the
+creative back where they are, so they pass in front of it.
+
+This needs a model file, which is not committed to the repository:
+
+```bash
+python fetch_model.py      # about 6 MB, once
+```
+
+It runs through OpenCV's own DNN module, so there is no extra dependency to
+install, and a packaged build bundles it automatically if it was fetched before
+building. Without it the menu item warns and stays off.
+
+Note that this segments *people*. Something else crossing the shot — a bus, a
+trolley, a pillar in the foreground — is not handled.
+
 ## How the tracking works
 
 The four corners are deliberately *not* tracked directly. Hand-placed corners
 tend to land on occluding edges and flat, untextured areas — the worst possible
 things to follow — which is what makes an insert slide off its surface.
 
-Instead, `PlanarTracker` detects strong features across the whole interior of
-the area, follows them with pyramidal Lucas-Kanade optical flow, discards any
-that fail a forward-backward consistency check, and fits a RANSAC homography to
-the survivors. The corners are then carried by that homography. Because the fit
-is over many points, a few bad tracks are outliers RANSAC rejects rather than a
+Instead, `PlanarTracker` detects strong features across a whole region of the
+frame — the area's interior by default, or the band around it in digital-screen
+mode — follows them with pyramidal Lucas-Kanade optical flow, discards any that
+fail a forward-backward consistency check, and fits a RANSAC homography to the
+survivors. The corners are then carried by that homography. Because the fit is
+over many points, a few bad tracks are outliers RANSAC rejects rather than a
 quarter of the entire signal.
 
 Each step is sanity-checked before it is accepted: a homography that folds the
@@ -161,6 +207,7 @@ file, and the algorithms can be tested without a display.
 | --- | --- |
 | `lumen_core.PlanarTracker` | Feature-based planar tracking with RANSAC and sanity checks |
 | `lumen_core.ReferenceMatcher` | Locates a target in the footage from a reference image |
+| `lumen_core.PersonSegmenter` | Segments people so the insert can go behind them |
 | `lumen_core.Region` | Four corners plus per-edge curvature |
 | `lumen_core.composite_region` | Alpha-correct perspective/curved warp and blend |
 | `lumen_core.interpolate_tracking` | Fills the gaps between tracked frames |
@@ -182,4 +229,9 @@ No display required. Tracking accuracy is measured against synthetic footage
 whose motion is known exactly, so the tests assert real numbers — sub-pixel
 corner error, and that the current tracker beats the four-corner approach it
 replaced — rather than merely that the code runs. `tests/test_app_smoke.py`
-drives the actual Qt widgets through loading, tracking and a full render.
+drives the actual Qt widgets through loading, tracking and a full render, and
+`tests/test_digital_screens.py` pins down both the animated-screen failure and
+its fix.
+
+Occlusion tests that need the model file skip cleanly when it has not been
+fetched; the compositing side is tested with hand-made masks either way.
