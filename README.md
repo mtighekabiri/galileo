@@ -157,6 +157,39 @@ you would paste a billboard onto. That needs a dedicated detector, not this.
 For the best hit rate, use a sharp, roughly straight-on picture cropped to just
 the target.
 
+### Several matches at once
+
+The same poster often appears on more than one panel. The search finds **every**
+instance rather than only the strongest: it fits a homography, removes the
+keypoints that instance consumed, and fits again until nothing further stands
+up. You are shown what was found with the evidence for each, and every one you
+tick becomes its own placement.
+
+The bar for the additional instances is set a little lower than for the first,
+because the further ones are usually smaller and carry fewer keypoints.
+Measured on a frame holding the same poster at three sizes, a threshold of 12
+found two of them and 8 found all three, with no false positives on unrelated
+footage or against a different reference.
+
+### Using a clip as the reference
+
+*Find Target from Image…* also accepts a **video**. A short handheld clip of a
+billboard carries several angles and exposures, and a better chance that one of
+them resembles the shot being searched. Frames are sampled across it, each
+becomes a reference view, and the strongest result wins.
+
+> **Frame the clip on the target**, exactly as a reference photo has to be
+> cropped to it. Each sampled frame is taken to *be* the target, so its whole
+> rectangle is what gets mapped into the footage. Hand over a wide shot in
+> which the billboard sits in one corner and the match will succeed while the
+> quad describes the entire scene — measured at 234 px off the panel despite a
+> confident fit. The tool checks how much of the picture a match covers and
+> warns when it looks like this happened.
+
+A clip lands close but not as exactly as a cropped still — around 11 px on a
+270 px panel in testing — because a handheld view is never framed to the pixel.
+Treat it as a starting point and nudge the corners.
+
 ## Curved edges
 
 Each edge of the area carries two cubic Bezier control points. Their default
@@ -176,12 +209,54 @@ draw. That case is detected (`region_is_folded`) and the insert is left off the
 frame, the same way a self-intersecting bowtie quad is rejected. The outline
 turns red when this happens.
 
-## Audio
+## Several placements at once
 
-OpenCV's `VideoWriter` cannot write audio, so a render is silent until the
-original audio is copied back onto it. If `ffmpeg` is on `PATH` this happens
-automatically, offset to match the rendered frame range. If it is not, the
-render still succeeds and the completion message says the result is silent.
+A concourse or mall shot usually has more than one screen worth filling, and an
+A/B test wants different creatives in them. The **Placements** panel holds as
+many as you need. Each carries its own marked area, its own tracking, its own
+creative and its own tracker, so one losing its surface cannot disturb the
+others — and the digital-screen setting is per placement, since a single shot
+can hold a printed poster alongside a digital screen.
+
+Tick a placement to include it in the render; untick to leave it out without
+losing its tracking. Editing always applies to the selected one, drawn with
+solid handles; the rest stay visible as dashed outlines.
+
+The AOI export writes **one CSV per placement**, named after it, because an
+eye-tracking analysis has to tell the adverts apart.
+
+## Blending the creative into the shot
+
+A creative pasted in with correct geometry still reads as fake, because it is
+*too clean*. The footage around it has been through a lens, a sensor and a
+codec: unevenly lit, slightly soft, grainy, colour-cast by the ambient light,
+and smeared when the camera moves.
+
+The **Blend** tool measures those properties from the very pixels the creative
+is about to cover and reproduces them — lighting falloff, colour cast,
+softness, grain and motion blur — each on its own slider, updating the preview
+live.
+
+> **Colour is deliberately the weakest by default.** It is the one control that
+> alters the creative's own colours, which is frequently the thing an ad test is
+> measuring. On a cool-cast test scene, a colour strength of 0.5 moved the
+> creative's mean colour by 84 units and turned white type cyan; 0.15 moved it
+> by 27, nearly all of that from lighting rather than hue. Raise it only when
+> belonging in the frame matters more than the exact hue.
+
+## Audio and output quality
+
+Renders are encoded with **ffmpeg (x264, CRF 17)** when it is available, with
+the source audio muxed in the same pass.
+
+Without ffmpeg the render falls back to OpenCV's built-in `mp4v`, which is
+silent — `VideoWriter` cannot write audio — and measurably lossy, around 34 dB
+PSNR. That is enough to undo the subtler photometric matching: in one measured
+render, grain added at a sigma of 2.0 came back at 0.45, and a flat creative
+suffers worst because it is cheap to encode and gets quantised hardest. The
+render still succeeds and the completion message says which happened.
+
+Installing ffmpeg is therefore worth it for picture quality, not only audio.
 
 ## Saving and export formats
 

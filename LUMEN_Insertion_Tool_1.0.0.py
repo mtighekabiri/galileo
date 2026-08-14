@@ -7,6 +7,7 @@ import numpy as np
 import json
 
 import lumen_core as core
+import lumen_blend as blend
 
 from PyQt5.QtCore import (
     QObject, QThread, pyqtSignal, Qt, QSize, QUrl, QEvent, QTimer, QPoint, QRect,
@@ -15,7 +16,9 @@ from PyQt5.QtWidgets import (
     QApplication, QWidget, QFrame, QVBoxLayout, QHBoxLayout, QInputDialog,
     QGraphicsDropShadowEffect, QPushButton, QLabel, QMainWindow,
     QSpacerItem, QSizePolicy, QSlider, QFileDialog, QMenu, QAction,
-    QStyle, QMessageBox, QGridLayout, QCheckBox, QDialog, QDialogButtonBox, QProgressDialog)
+    QStyle, QMessageBox, QGridLayout, QCheckBox, QDialog, QDialogButtonBox,
+    QProgressDialog, QScrollArea, QSpinBox, QComboBox, QLineEdit,
+    QListWidget, QListWidgetItem)
 from PyQt5.QtGui import (
     QCursor, QPixmap, QColor, QPainter, QBrush, QPen, QImage, QPolygonF)
 from PyQt5.QtMultimedia import QMediaPlayer, QMediaContent
@@ -177,6 +180,126 @@ class AdjustmentDialog(QDialog):
     def get_value(self):
         return self.value
 
+class BlendDialog(QDialog):
+    """Live controls for how hard the creative is matched to the footage.
+
+    Non-modal in effect: every slider updates the preview as it moves, because
+    judging a blend from a number is impossible and the whole point is how it
+    looks against the shot.
+    """
+
+    EFFECTS = [
+        ("lighting", "Lighting",
+         "Carry the surface's uneven light and shadow onto the creative."),
+        ("colour", "Colour cast",
+         "Tint towards the ambient light. Kept low by default: this is the one\n"
+         "control that alters the creative's own colours, which an ad test is\n"
+         "often measuring."),
+        ("sharpness", "Softness",
+         "Soften a too-crisp creative to match the focus of the surface."),
+        ("grain", "Grain",
+         "Add sensor noise matching the footage, so the insert is not\n"
+         "conspicuously clean."),
+        ("motion", "Motion blur",
+         "Smear the creative when the camera pans, as the rest of the shot is."),
+        ("highlights", "Keep highlights",
+         "Let reflections on glass show through. Off for matte billboards."),
+    ]
+
+    def __init__(self, settings, on_change, parent=None):
+        super().__init__(parent)
+        self.settings = settings
+        self.on_change = on_change
+        self.original = settings.to_dict()
+
+        self.setWindowTitle("Blend into Footage")
+        self.setMinimumWidth(460)
+        self.setStyleSheet("""
+            QDialog { background-color: #2A2A2A; }
+            QLabel { color: #E8E8E8; font-size: 13px; }
+            QCheckBox { color: #E8E8E8; font-size: 13px; }
+            QSlider::groove:horizontal { background: #444; height: 5px;
+                                         border-radius: 2px; }
+            QSlider::handle:horizontal { background: #DDD; width: 14px;
+                                         margin: -5px 0; border-radius: 7px; }
+            QSlider::sub-page:horizontal { background: #00A000;
+                                           border-radius: 2px; }
+            QPushButton { background-color: #3C3C3C; color: white; border: none;
+                          border-radius: 6px; padding: 7px 16px; }
+            QPushButton:hover { background-color: #505050; }
+        """)
+
+        layout = QVBoxLayout(self)
+        layout.setSpacing(10)
+
+        self.enabled_box = QCheckBox("Match the creative to the footage")
+        self.enabled_box.setChecked(settings.enabled)
+        self.enabled_box.toggled.connect(self._on_enabled)
+        layout.addWidget(self.enabled_box)
+
+        note = QLabel("Measured from the pixels the creative covers.")
+        note.setStyleSheet("color: #9A9A9A; font-size: 11px;")
+        layout.addWidget(note)
+
+        self.sliders = {}
+        self.value_labels = {}
+        for name, title, hint in self.EFFECTS:
+            row = QHBoxLayout()
+            label = QLabel(title)
+            label.setFixedWidth(110)
+            label.setToolTip(hint)
+            slider = QSlider(Qt.Horizontal)
+            slider.setRange(0, 100)
+            slider.setValue(int(getattr(settings, name) * 100))
+            slider.setToolTip(hint)
+            slider.valueChanged.connect(
+                lambda value, key=name: self._on_slider(key, value))
+            value_label = QLabel(f"{getattr(settings, name):.2f}")
+            value_label.setFixedWidth(38)
+            value_label.setStyleSheet("color: #9A9A9A; font-size: 12px;")
+
+            row.addWidget(label)
+            row.addWidget(slider, 1)
+            row.addWidget(value_label)
+            layout.addLayout(row)
+            self.sliders[name] = slider
+            self.value_labels[name] = value_label
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel |
+                                   QDialogButtonBox.RestoreDefaults)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self._revert_and_reject)
+        buttons.button(QDialogButtonBox.RestoreDefaults).clicked.connect(self._defaults)
+        layout.addWidget(buttons, alignment=Qt.AlignRight)
+        self._sync_enabled()
+
+    def _on_enabled(self, checked):
+        self.settings.enabled = checked
+        self._sync_enabled()
+        self.on_change()
+
+    def _sync_enabled(self):
+        for slider in self.sliders.values():
+            slider.setEnabled(self.settings.enabled)
+
+    def _on_slider(self, key, value):
+        setattr(self.settings, key, value / 100.0)
+        self.value_labels[key].setText(f"{value / 100.0:.2f}")
+        self.on_change()
+
+    def _defaults(self):
+        fresh = blend.BlendSettings()
+        for name, _, _ in self.EFFECTS:
+            self.sliders[name].setValue(int(getattr(fresh, name) * 100))
+        self.enabled_box.setChecked(True)
+
+    def _revert_and_reject(self):
+        for key, value in self.original.items():
+            setattr(self.settings, key, value)
+        self.on_change()
+        self.reject()
+
+
 class QSwitch(QWidget):
     toggled = pyqtSignal(bool)  # Signal: emit True when turned on, False when turned off
 
@@ -231,7 +354,7 @@ class QSwitch(QWidget):
         painter.setRenderHint(QPainter.Antialiasing)
 
         # Draw the background
-        background_color = QColor("#00A000") if self._checked else QColor("#FF0000")
+        background_color = QColor("#00A000") if self._checked else QColor("#5A5A5A")
         painter.setBrush(background_color)
         painter.setPen(Qt.NoPen)
         painter.drawRoundedRect(self.rect(), 15, 15)
@@ -295,7 +418,11 @@ class IconWidget(QFrame):
         self.default_hover_color = "#333333"
         self.default_selected_color = "#555555"
 
-        if label_text in ["Draw", "Overlay"]:
+        # Latching modes get the bright fill so it is obvious which of them is
+        # currently changing what a click does. This keyed off "Overlay", which
+        # matches no icon, so Colourise and Curve were indicated at 2.3:1
+        # contrast against the panel.
+        if label_text in LeftColumn.STATEFUL_ICONS:
             self.selected_color = "#00A000"
         else:
             self.selected_color = self.default_selected_color
@@ -303,20 +430,23 @@ class IconWidget(QFrame):
         self.base_color = self.default_base_color
         self.hover_color = self.default_hover_color
 
-        self.setFixedSize(80, 100)
+        # 80x100 for eight tools needed 945px of column; a 1366x768 laptop has
+        # about 660, so the labels were clipped away and the toolbar became
+        # eight bare glyphs with no tooltips.
+        self.setFixedSize(78, 62)
         self.set_normal_style()
 
         self.layout = QVBoxLayout()
-        self.layout.setContentsMargins(5, 5, 5, 5)
-        self.layout.setSpacing(5)
+        self.layout.setContentsMargins(2, 4, 2, 4)
+        self.layout.setSpacing(1)
 
         self.icon_label = QLabel(icon_char)
         self.icon_label.setAlignment(Qt.AlignCenter)
-        self.icon_label.setStyleSheet("font-size: 24px; color: white;")
+        self.icon_label.setStyleSheet("font-size: 20px; color: white;")
 
         self.meaning_label = QLabel(label_text)
         self.meaning_label.setAlignment(Qt.AlignCenter)
-        self.meaning_label.setStyleSheet("font-size: 12px; color: #E0E0E0;")
+        self.meaning_label.setStyleSheet("font-size: 10px; color: #E0E0E0;")
 
         self.layout.addWidget(self.icon_label)
         self.layout.addWidget(self.meaning_label)
@@ -547,6 +677,123 @@ class MagnifierWidget(QWidget):
 
         painter.end()
 
+class Placement:
+    """One insertion: an area tracked through the clip, and what goes in it.
+
+    A single shot of a mall or an airport concourse routinely has several
+    screens worth filling, and an A/B test wants different creatives in them.
+    Everything that used to be a single set of attributes on the overlay lives
+    here instead, one instance per insertion, each with its own tracker.
+    """
+
+    _counter = 0
+
+    def __init__(self, name: str = None):
+        Placement._counter += 1
+        self.name = name or f"Placement {Placement._counter}"
+        self.enabled = True
+
+        # Geometry
+        self.points = []
+        self.curvature = np.zeros((4, 2, 2), np.float32)
+        self.curved_enabled = False
+        self.tracking_history = {}
+
+        # Creative
+        self.overlay_bgra = None
+        self.overlay_source_path = None
+        self.inserted_overlay_is_video = False
+        self.overlay_video_cap = None
+        self.overlay_video_path = None
+        self.inserted_overlay_start_frame = 0
+
+        # Look
+        self.brightness = 0
+        self.contrast = 1.0
+        self.colourise_enabled = False
+        self.colourise_factor = 0
+        self.blend = blend.BlendSettings()
+
+        # Tracking state, rebuilt whenever the shape is edited.
+        self.feature_source = core.PlanarTracker.INTERIOR
+        self.tracker = None
+        self.kalman_filters = []
+        self._previous_quad = None
+
+    def has_overlay(self) -> bool:
+        return self.overlay_bgra is not None or self.inserted_overlay_is_video
+
+    def is_ready(self) -> bool:
+        """True if this placement can actually draw something."""
+        return self.enabled and len(self.points) == 4 and self.has_overlay()
+
+    def reset_tracker(self):
+        self.tracker = None
+        self.kalman_filters = []
+        self._previous_quad = None
+
+    def release(self):
+        if self.overlay_video_cap:
+            self.overlay_video_cap.release()
+            self.overlay_video_cap = None
+
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "enabled": self.enabled,
+            "points": [list(p) for p in self.points],
+            "curvature": self.curvature.tolist(),
+            "curved": self.curved_enabled,
+            "tracking_history": core.history_to_lists(self.tracking_history),
+            "overlay_path": self.overlay_source_path,
+            "overlay_is_video": self.inserted_overlay_is_video,
+            "overlay_start_frame": self.inserted_overlay_start_frame,
+            "brightness": self.brightness,
+            "contrast": self.contrast,
+            "colourise": self.colourise_enabled,
+            "blend": self.blend.to_dict(),
+            "feature_source": self.feature_source,
+        }
+
+    @classmethod
+    def from_dict(cls, data) -> "Placement":
+        placement = cls(data.get("name"))
+        placement.enabled = bool(data.get("enabled", True))
+        placement.points = [tuple(p) for p in data.get("points", [])]
+        if data.get("curvature") is not None:
+            placement.curvature = np.array(data["curvature"], np.float32).reshape(4, 2, 2)
+        placement.curved_enabled = bool(data.get("curved", False))
+        placement.tracking_history = {
+            int(k): [tuple(p) for p in v]
+            for k, v in (data.get("tracking_history") or {}).items()}
+        placement.overlay_source_path = data.get("overlay_path")
+        placement.inserted_overlay_is_video = bool(data.get("overlay_is_video", False))
+        placement.inserted_overlay_start_frame = data.get("overlay_start_frame", 0)
+        placement.brightness = data.get("brightness", 0)
+        placement.contrast = data.get("contrast", 1.0)
+        placement.colourise_enabled = bool(data.get("colourise", False))
+        placement.blend = blend.BlendSettings.from_dict(data.get("blend"))
+        placement.feature_source = data.get("feature_source",
+                                            core.PlanarTracker.INTERIOR)
+        return placement
+
+    def __repr__(self):
+        return (f"Placement({self.name!r}, corners={len(self.points)}, "
+                f"tracked={len(self.tracking_history)})")
+
+
+def _active_property(attribute):
+    """Expose an attribute of the active placement as if it were the overlay's.
+
+    Nearly all of the GUI was written against a single insertion. Delegating
+    rather than rewriting every call site keeps that code working unchanged and
+    removes any chance of one path reading a stale copy -- the same reason the
+    duplicated tracking history was collapsed into one store.
+    """
+    return property(lambda self: getattr(self.active, attribute),
+                    lambda self, value: setattr(self.active, attribute, value))
+
+
 class TrackingOverlay(QWidget):
     points_updated = pyqtSignal(int, list)
     shape_changed = pyqtSignal()
@@ -557,42 +804,78 @@ class TrackingOverlay(QWidget):
         self.setStyleSheet("background-color: rgba(0, 0, 0, 0);")
 
         self.tracking_enabled = False
-        self.points = []  # list of (x, y) corner coords
         self.drag_index = -1  # index of corner being dragged, or -1 if none
         self.selected_point_index = -1  # which corner is selected (via keys, etc.)
-
-        # Curved edges. Each edge carries two Bezier control points, stored as
-        # offsets from their straight-line positions so they survive the
-        # corners moving. All-zero offsets == a plain straight-edged quad.
-        self.curved_enabled = False
-        self.curvature = np.zeros((4, 2, 2), np.float32)
         self.drag_control = None      # (edge_index, control_index) while dragging
-
-        # Overlay references. The creative is kept as a BGRA numpy array so the
-        # preview and the render composite from exactly the same pixels.
-        self.overlay_bgra = None
-        self.overlay_source_path = None
-        self.inserted_overlay_is_video = False
-        self.overlay_video_cap = None
-        self.overlay_video_path = None
-        self.inserted_overlay_start_frame = 0
 
         # For hovering
         self.active_point_index = -1
 
-        # Overlay effects
-        self.brightness = 0  # Range -100..100
-        self.contrast = 1.0   # Range 0..3
-        self.colourise_enabled = False
-        self.colourise_factor = 0
-
-        # Tracking history: frame_index -> list of 4 corners
-        self.tracking_history = {}
+        # Several insertions can be tracked at once -- a concourse shot often
+        # has more than one screen worth filling. Editing always applies to the
+        # active one; everything else is drawn dimmed and still renders.
+        self.placements = [Placement()]
+        self.active_index = 0
 
         # Widget config
         self.setAttribute(Qt.WA_TranslucentBackground, True)
         self.setAttribute(Qt.WA_NoSystemBackground, True)
         self.setFocusPolicy(Qt.StrongFocus)
+
+    # -- placements --------------------------------------------------------
+
+    @property
+    def active(self) -> Placement:
+        """The placement that editing applies to."""
+        if not self.placements:
+            self.placements = [Placement()]
+        self.active_index = max(0, min(self.active_index, len(self.placements) - 1))
+        return self.placements[self.active_index]
+
+    def add_placement(self, name: str = None) -> Placement:
+        placement = Placement(name)
+        self.placements.append(placement)
+        self.active_index = len(self.placements) - 1
+        self.selected_point_index = -1
+        self.update()
+        return placement
+
+    def remove_placement(self, index: int) -> None:
+        if not 0 <= index < len(self.placements) or len(self.placements) <= 1:
+            return
+        self.placements.pop(index).release()
+        self.active_index = min(self.active_index, len(self.placements) - 1)
+        self.update()
+
+    def set_active(self, index: int) -> None:
+        if 0 <= index < len(self.placements):
+            self.active_index = index
+            self.selected_point_index = -1
+            self.shape_changed.emit()
+            self.update()
+
+    def ready_placements(self):
+        """Those that can actually draw something this frame."""
+        return [p for p in self.placements if p.is_ready()]
+
+    # Everything below was written against a single insertion; these delegate
+    # to the active placement so that code goes on working untouched.
+    points = _active_property("points")
+    curvature = _active_property("curvature")
+    curved_enabled = _active_property("curved_enabled")
+    tracking_history = _active_property("tracking_history")
+    overlay_bgra = _active_property("overlay_bgra")
+    overlay_source_path = _active_property("overlay_source_path")
+    inserted_overlay_is_video = _active_property("inserted_overlay_is_video")
+    overlay_video_cap = _active_property("overlay_video_cap")
+    overlay_video_path = _active_property("overlay_video_path")
+    inserted_overlay_start_frame = _active_property("inserted_overlay_start_frame")
+    brightness = _active_property("brightness")
+    contrast = _active_property("contrast")
+    colourise_enabled = _active_property("colourise_enabled")
+    colourise_factor = _active_property("colourise_factor")
+    blend = _active_property("blend")
+    _previous_quad = _active_property("_previous_quad")
 
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
@@ -614,14 +897,21 @@ class TrackingOverlay(QWidget):
                     self.drag_control = hit
                     found_drag = True
 
+            if found_drag:
+                self.set_magnifier_visible(True)
+
             if not found_drag:
                 if len(self.points) < 4:
                     self.points.append((rx, ry))
+                    self.selected_point_index = len(self.points) - 1
                     self.update()
                     if len(self.points) == 4:
-                        self.auto_disable_tracking()
-            if self.points:
-                self.selected_point_index = len(self.points) - 1
+                        self.on_fourth_corner_placed()
+            elif self.drag_index != -1:
+                # Select what was actually grabbed. This used to snap the
+                # selection to the last corner on every click, so pressing "1"
+                # and then an arrow key moved corner 4 instead.
+                self.selected_point_index = self.drag_index
 
             self.shape_changed.emit()
 
@@ -663,6 +953,12 @@ class TrackingOverlay(QWidget):
 
         super(TrackingOverlay, self).mouseMoveEvent(event)
 
+    def set_magnifier_visible(self, visible: bool):
+        """Ask the panel to show the magnifier for the duration of a drag."""
+        mw = self.get_main_window()
+        if mw and mw.central_panel:
+            mw.central_panel.set_magnifier_temporarily_visible(visible)
+
     def control_at(self, disp_x, disp_y, radius=8):
         """Which Bezier handle, if any, is under this display position."""
         if not self.curved_enabled or len(self.points) != 4:
@@ -686,23 +982,36 @@ class TrackingOverlay(QWidget):
         region.set_control_point(edge, slot, point)
         self.curvature = region.curvature
 
+    def commit_shape(self):
+        """Record the current shape against the frame on screen.
+
+        Every edit has to come through here. Previously only a mouse release
+        did, so an arrow-key nudge -- the tool documented for precise corner
+        placement -- changed what was drawn without ever changing what would be
+        rendered.
+        """
+        mw = self.get_main_window()
+        if not mw or not mw.central_panel:
+            return
+        panel = mw.central_panel
+        if not panel.cap or not panel.cap.isOpened():
+            return
+
+        frame_index = panel.get_current_frame_index()
+        if len(self.points) == 4:
+            self.tracking_history[frame_index] = self.points[:]
+        elif frame_index in self.tracking_history:
+            del self.tracking_history[frame_index]
+        mw.mark_dirty()
+
     def mouseReleaseEvent(self, event):
         was_dragging = (self.drag_index != -1 or self.drag_control is not None)
         self.drag_index = -1
         self.drag_control = None
+        if was_dragging:
+            self.set_magnifier_visible(False)
 
-        mw = self.get_main_window()
-        if mw:
-            cpanel = mw.central_panel
-            if cpanel and cpanel.cap and cpanel.cap.isOpened():
-                current_frame_index = cpanel.get_current_frame_index()
-                if len(self.points) == 4:
-                    self.tracking_history[current_frame_index] = self.points[:]
-                else:
-                    if current_frame_index in self.tracking_history:
-                        del self.tracking_history[current_frame_index]
-
-        # shape changed
+        self.commit_shape()
         self.shape_changed.emit()
         super(TrackingOverlay, self).mouseReleaseEvent(event)
 
@@ -722,37 +1031,35 @@ class TrackingOverlay(QWidget):
             event.accept()
             return
 
-        if self.selected_point_index < 0:
+        # Anything not handled here must fall through to the parent, or
+        # CentralPanel's D (delete shape) and C (copy from previous frame)
+        # shortcuts never fire: this widget holds focus almost permanently, and
+        # a bare return leaves the event marked accepted.
+        arrows = {Qt.Key_Left: (-1, 0), Qt.Key_Right: (1, 0),
+                  Qt.Key_Up: (0, -1), Qt.Key_Down: (0, 1)}
+        if key not in arrows or self.selected_point_index < 0:
+            event.ignore()
+            super(TrackingOverlay, self).keyPressEvent(event)
             return
 
-        step = 1
-        dx, dy = 0, 0
-        if key == Qt.Key_Left:
-            dx = -step
-        elif key == Qt.Key_Right:
-            dx = step
-        elif key == Qt.Key_Up:
-            dy = -step
-        elif key == Qt.Key_Down:
-            dy = step
+        # Shift for a coarse jump, Ctrl for sub-pixel: corner placement on a
+        # distant billboard needs finer than one pixel per press.
+        step = 1.0
+        if event.modifiers() & Qt.ShiftModifier:
+            step = 10.0
+        elif event.modifiers() & Qt.ControlModifier:
+            step = 0.25
+        dx, dy = (v * step for v in arrows[key])
 
-        if dx == 0 and dy == 0:
-            # No arrow key => do nothing
-            return
-
-        if self.selected_point_index < 4:
-            # move just that corner
-            if len(self.points) == 4:
+        if len(self.points) == 4:
+            if self.selected_point_index < 4:
                 px, py = self.points[self.selected_point_index]
                 self.points[self.selected_point_index] = (px + dx, py + dy)
-        else:
-            # move entire shape
-            if len(self.points) == 4:
-                for i in range(4):
-                    px, py = self.points[i]
-                    self.points[i] = (px + dx, py + dy)
+            else:
+                self.points = [(px + dx, py + dy) for px, py in self.points]
 
         self.update()
+        self.commit_shape()
         self.shape_changed.emit()
         event.accept()
 
@@ -773,16 +1080,19 @@ class TrackingOverlay(QWidget):
         self.contrast = contrast
         self.update()
 
-    def auto_disable_tracking(self):
-        mw = self.get_main_window()
-        if mw:
-            for icon_widget in mw.left_col.icons:
-                if icon_widget.meaning_label.text() == "Draw":
-                    icon_widget.set_selected(False)
+    def on_fourth_corner_placed(self):
+        """Called once the shape is complete.
 
-            mw.central_panel.switch.setChecked(True)
-            mw.central_panel.magnifier_switch.setChecked(True)
-            self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        It used to make the overlay transparent to the mouse the instant the
+        fourth corner landed, so the corners became undraggable exactly when
+        the user wanted to nudge them, with no visible reason. Placement
+        already stops at four points, so the overlay stays live.
+        """
+        self.commit_shape()
+        mw = self.get_main_window()
+        if mw and mw.central_panel:
+            # The shape is now valid, so tracking becomes available.
+            mw.central_panel.update_tracking_availability()
 
     def get_main_window(self):
         w = self.parentWidget()
@@ -900,11 +1210,35 @@ class TrackingOverlay(QWidget):
         self.overlay_bgra = core.to_bgra(frame)
         self.update()
 
-    def styled_overlay(self, base_frame=None, quad=None) -> np.ndarray:
-        """The creative with brightness/contrast/colourise applied.
+    def styled_for(self, placement, base_frame, quad, motion=None) -> np.ndarray:
+        """One placement's creative, adapted to the frame it is going into."""
+        if placement.overlay_bgra is None:
+            return None
+        styled = core.apply_brightness_contrast(
+            placement.overlay_bgra, placement.brightness, placement.contrast)
+        if placement.colourise_enabled and base_frame is not None:
+            styled = core.apply_colourise(styled, base_frame, quad)
+        if base_frame is not None and placement.blend.enabled:
+            styled = blend.photometric_match(styled, base_frame, quad,
+                                             placement.blend, motion=motion)
+        return styled
+
+    def motion_for(self, placement, quad) -> tuple:
+        """How far this placement's surface moved since the previous frame."""
+        current = np.float32(quad) if quad is not None else None
+        previous = placement._previous_quad
+        placement._previous_quad = None if current is None else current.copy()
+        if previous is None or current is None:
+            return None
+        delta = (current - previous).mean(axis=0)
+        return (float(delta[0]), float(delta[1]))
+
+    def styled_overlay(self, base_frame=None, quad=None, motion=None) -> np.ndarray:
+        """The creative, adapted to the frame it is going into.
 
         The render calls the identical helper, so what is previewed is what is
-        written to the file.
+        written to the file. Manual brightness/contrast are applied first, then
+        the automatic photometric match measured from the footage itself.
         """
         if self.overlay_bgra is None:
             return None
@@ -912,7 +1246,26 @@ class TrackingOverlay(QWidget):
             self.overlay_bgra, self.brightness, self.contrast)
         if self.colourise_enabled and base_frame is not None and quad is not None:
             styled = core.apply_colourise(styled, base_frame, quad)
+        if base_frame is not None and quad is not None and self.blend.enabled:
+            styled = blend.photometric_match(styled, base_frame, quad,
+                                             self.blend, motion=motion)
         return styled
+
+    def grain_for(self, base_frame, quad) -> float:
+        """How much grain to lay over the insert, measured from the footage."""
+        if base_frame is None or quad is None or not self.blend.enabled:
+            return 0.0
+        return blend.grain_sigma_for(base_frame, quad, self.blend)
+
+    def motion_since(self, quad) -> tuple:
+        """How far the surface moved since the last frame, for motion blur."""
+        current = np.float32(quad) if quad is not None else None
+        previous, self._previous_quad = self._previous_quad, (
+            None if current is None else current.copy())
+        if previous is None or current is None:
+            return None
+        delta = (current - previous).mean(axis=0)
+        return (float(delta[0]), float(delta[1]))
 
     def apply_brightness_contrast(self, img: np.ndarray) -> np.ndarray:
         return core.apply_brightness_contrast(img, self.brightness, self.contrast)
@@ -926,6 +1279,25 @@ class TrackingOverlay(QWidget):
         """
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
+
+        # Inactive placements first, dimmed and unlabelled, so it is obvious
+        # which one an edit will apply to without hiding the others.
+        for index, placement in enumerate(self.placements):
+            if index == self.active_index or len(placement.points) != 4:
+                continue
+            region = core.Region(placement.points, placement.curvature,
+                                 placement.curved_enabled)
+            boundary = core.region_boundary(region, samples=32)
+            display = [self.raw_to_display(x, y) for x, y in boundary]
+            painter.setPen(QPen(QColor(120, 200, 120, 110), 1, Qt.DashLine))
+            for j in range(len(display)):
+                x1, y1 = display[j]
+                x2, y2 = display[(j + 1) % len(display)]
+                painter.drawLine(int(x1), int(y1), int(x2), int(y2))
+            cx = sum(p[0] for p in display) / len(display)
+            cy = sum(p[1] for p in display) / len(display)
+            painter.setPen(QPen(QColor(190, 230, 190, 170), 1))
+            painter.drawText(int(cx) - 30, int(cy), placement.name)
 
         valid = len(self.points) == 4 and core.is_valid_quad(self.points)
         outline = QColor(0, 255, 0) if valid or len(self.points) < 4 else QColor(255, 140, 0)
@@ -1235,6 +1607,7 @@ class LeftColumn(QWidget):
     brightnessClicked = pyqtSignal()
     contrastClicked = pyqtSignal()
     colouriseClicked = pyqtSignal(bool)
+    blendClicked = pyqtSignal()
     curveClicked = pyqtSignal(bool)
     clearClicked = pyqtSignal()
     
@@ -1247,26 +1620,53 @@ class LeftColumn(QWidget):
         layout.setContentsMargins(0, 20, 0, 20)
         layout.setSpacing(15)
 
+        # Emoji render inconsistently across Windows builds and several of
+        # these are hard to tell apart at 20px, so every tool carries a tooltip
+        # saying what it does. There were none anywhere on this toolbar.
         items = [
-            ("🖱", "Draw"),
-            ("📼", "Render"),
-            ("👀", "Frame"),
-            ("🌞", "Brightness"),
-            ("⛅", "Contrast"),
-            ("🎨", "Colourise"),
-            ("〰", "Curve"),
-            ("❌", "Clear"),
+            ("🖱", "Draw", "Click four corners to mark the area to fill.\n"
+                           "Drag a corner to adjust it."),
+            ("📼", "Render", "Export the video with the creative composited in."),
+            ("👀", "Frame", "Jump to a specific frame number."),
+            ("🌞", "Brightness", "Brighten or darken the inserted creative."),
+            ("⛅", "Contrast", "Raise or lower the creative's contrast."),
+            ("🎨", "Colourise", "Match the creative's colours to the surface\n"
+                                "it is covering."),
+            ("🌫", "Blend", "Match the creative's lighting, softness, grain and\n"
+                            "motion blur to the footage, so it does not look\n"
+                            "pasted on."),
+            ("〰", "Curve", "Bend the edges of the area around a curved\n"
+                            "screen or pillar."),
+            ("❌", "Clear", "Remove the tracking from every frame."),
         ]
 
         self.icons = []
-        for (icon_char, text) in items:
+        for (icon_char, text, hint) in items:
             icon_widget = IconWidget(icon_char, text)
+            icon_widget.setToolTip(f"{text}\n\n{hint}")
             layout.addWidget(icon_widget, 0, Qt.AlignHCenter)
             icon_widget.mousePressEvent = self.make_icon_click_handler(icon_widget, icon_widget.mousePressEvent)
             self.icons.append(icon_widget)
 
         layout.addStretch()
-        self.setLayout(layout)
+
+        # Scroll rather than clip. If the column ever runs out of height again
+        # the failure is a scrollbar the user can act on, not tools that
+        # silently disappear off the bottom.
+        inner = QWidget()
+        inner.setStyleSheet("background-color: #1A1A1A;")
+        inner.setLayout(layout)
+
+        scroll = QScrollArea(self)
+        scroll.setWidget(inner)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setStyleSheet("QScrollArea { background-color: #1A1A1A; border: none; }")
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.addWidget(scroll)
         self.setFixedWidth(80)
 
     # Toggles that stand for a mode rather than a one-off action. Clearing
@@ -1310,6 +1710,10 @@ class LeftColumn(QWidget):
                 icon_widget.set_selected(False)  # Instant action, deselect
             elif text == "Colourise":
                 self.colouriseClicked.emit(is_selected) # This is a state, so don't deselect
+            elif text == "Blend":
+                if is_selected:
+                    self.blendClicked.emit()
+                icon_widget.set_selected(False)   # opens a dialog, not a mode
             elif text == "Curve":
                 self.curveClicked.emit(is_selected)  # Also a state, keep it lit
             elif text == "Clear":
@@ -1341,8 +1745,6 @@ class CentralPanel(QWidget):
         self.playing = False
         self.prev_frame = None
         self.fps = 30
-        self.tracking_history = {}  # optional mirror of tracking_overlay
-        self.kalman_filters = []
 
         # The single source of truth for "which frame is on screen". Deriving
         # it from CAP_PROP_POS_MSEC in one place and CAP_PROP_POS_FRAMES in
@@ -1351,37 +1753,52 @@ class CentralPanel(QWidget):
         self.current_frame_index = 0
         self.total_frames = 0
 
-        # Feature-based planar tracker, rebuilt whenever the shape is re-drawn.
-        self.tracker = None
-        # Where the tracker looks for features. A digital screen needs the
-        # surroundings, since its own picture moves independently of it.
-        self.feature_source = core.PlanarTracker.INTERIOR
-
         # Person segmentation for occlusion, built on first use.
         self.segmenter = None
         self.occlusion_enabled = False
 
-        # 1) The container for video + overlay
+        # 1) The container for video + overlay.
+        #
+        # No layout manager here on purpose: layout_video_stage positions the
+        # label and the overlay by hand so the picture keeps its own aspect
+        # ratio. A layout would stretch it to fill, and judging whether an
+        # inserted advert looks convincing on a squashed image is not possible.
         self.video_container = QWidget(self)
-        self.video_layout = QGridLayout(self.video_container)
-        self.video_layout.setContentsMargins(0, 0, 0, 0)
-        self.video_layout.setSpacing(0)
+        self.video_container.setStyleSheet("background-color: #0D0D0D;")
 
         self.video_label = QLabel(self.video_container)
         self.video_label.setStyleSheet("background-color: black;")
         self.video_label.setScaledContents(True)
-        self.video_layout.addWidget(self.video_label, 0, 0)
+
+        # An empty black rectangle told a first-time user nothing at all. This
+        # sits over the stage until a video is loaded and then gets out of the
+        # way, naming the order of operations rather than leaving it to be
+        # discovered inside an unlabelled hamburger menu.
+        self.empty_state = QLabel(self.video_container)
+        self.empty_state.setAlignment(Qt.AlignCenter)
+        self.empty_state.setText(
+            "<div style='color:#E8E8E8; font-size:19px; font-weight:600;'>"
+            "Load a base video to begin</div>"
+            "<div style='color:#9A9A9A; font-size:13px; margin-top:14px;'>"
+            "Menu (☰) &rarr; Load &rarr; Base Video<br><br>"
+            "<span style='color:#7A7A7A;'>then</span><br><br>"
+            "1 &nbsp;Mark the screen or billboard &mdash; Draw, or "
+            "Find Target from Image<br>"
+            "2 &nbsp;Load a creative and press Insert<br>"
+            "3 &nbsp;Turn tracking on and play forward<br>"
+            "4 &nbsp;Render"
+            "</div>")
+        self.empty_state.setStyleSheet("background-color: #0D0D0D;")
 
         self.tracking_overlay = TrackingOverlay(self.video_container)
         self.tracking_overlay.setFocusPolicy(Qt.StrongFocus)
-        self.video_layout.addWidget(self.tracking_overlay, 0, 0)
         self.tracking_overlay.raise_()
         self.tracking_overlay.hide()
         self.tracking_overlay.shape_changed.connect(self.on_shape_changed)
         self.tracking_overlay.selection_changed.connect(self.update_magnifier)
 
         # Frame label
-        self.frame_label = QLabel("Frame: 0", self.video_container)
+        self.frame_label = QLabel("Frame: 0", self)
         self.frame_label.setStyleSheet("""
             QLabel {
                 color: white;
@@ -1398,10 +1815,10 @@ class CentralPanel(QWidget):
         self.switch.setToolTip("Toggle Tracking ON/OFF")
         self.switch.toggled.connect(self.on_tracking_toggled)
 
-        self.tracking_label = QLabel("Tracking Disabled", self.video_container)
+        self.tracking_label = QLabel("Tracking off", self)
         self.tracking_label.setStyleSheet("""
             QLabel {
-                color: red;
+                color: #BBBBBB;
                 font-size: 14px;
                 background-color: #1A1A1A;
                 padding: 5px;
@@ -1414,10 +1831,10 @@ class CentralPanel(QWidget):
         self.magnifier_switch.setToolTip("Toggle Magnifier ON/OFF")
         self.magnifier_switch.toggled.connect(self.on_magnifier_toggled)
 
-        self.magnifier_label = QLabel("Magnifier Off", self.video_container)
+        self.magnifier_label = QLabel("Magnifier off", self)
         self.magnifier_label.setStyleSheet("""
             QLabel {
-                color: red;
+                color: #BBBBBB;
                 font-size: 14px;
                 background-color: #1A1A1A;
                 padding: 5px;
@@ -1429,7 +1846,7 @@ class CentralPanel(QWidget):
         self.magnifier.hide()
 
         # Playback controls
-        self.controls_frame = QFrame(self.video_container)
+        self.controls_frame = QFrame(self)
         self.controls_frame.setStyleSheet("""
             QFrame {
                 background-color: #1A1A1A;
@@ -1512,11 +1929,32 @@ class CentralPanel(QWidget):
         controls_layout.addWidget(self.del_btn)
         self.controls_frame.setLayout(controls_layout)
 
-        # Final panel layout
+        # A status strip below the transport, holding what used to float on
+        # top of the picture.
+        self.status_bar = QFrame()
+        self.status_bar.setStyleSheet("background-color: #1A1A1A;")
+        self.status_bar.setFixedHeight(46)
+        status_layout = QHBoxLayout(self.status_bar)
+        status_layout.setContentsMargins(12, 4, 12, 4)
+        status_layout.setSpacing(12)
+        status_layout.addWidget(self.frame_label)
+        status_layout.addStretch(1)
+        status_layout.addWidget(self.tracking_label)
+        status_layout.addWidget(self.switch)
+        status_layout.addSpacing(16)
+        status_layout.addWidget(self.magnifier_label)
+        status_layout.addWidget(self.magnifier_switch)
+
+        # Final panel layout. The transport and the status strip are real rows,
+        # not free-floating children positioned against a phantom 16:9 box --
+        # which is how the playback bar came to sit a third of the way down the
+        # picture, across the very area being edited, stealing its clicks.
         self.main_layout = QVBoxLayout()
         self.main_layout.setContentsMargins(0, 0, 0, 0)
         self.main_layout.setSpacing(0)
         self.main_layout.addWidget(self.video_container, stretch=1)
+        self.main_layout.addWidget(self.controls_frame)
+        self.main_layout.addWidget(self.status_bar)
         self.setLayout(self.main_layout)
 
         # Timers
@@ -1638,11 +2076,10 @@ class CentralPanel(QWidget):
 
         self.read_frame()
 
-        # If there is tracking history for this frame, load it; otherwise clear.
+        # Show this frame's shape if it has one, otherwise keep what is on
+        # screen so the user can carry it to a frame that needs marking.
         if frame_index in self.tracking_history:
             self.tracking_overlay.points = self.tracking_history[frame_index][:]
-        else:
-            self.tracking_overlay.points.clear()
 
         self.tracking_overlay.update()
 
@@ -1673,7 +2110,7 @@ class CentralPanel(QWidget):
         self.tracking_label.setText("Tracking Disabled")
         self.tracking_label.setStyleSheet("""
             QLabel {
-                color: red;
+                color: #BBBBBB;
                 font-size: 14px;
                 background-color: #1A1A1A;
                 padding: 5px;
@@ -1698,22 +2135,65 @@ class CentralPanel(QWidget):
         """
         if self.prev_frame is None:
             return
-        overlay = self.tracking_overlay
-        display_frame = self.prev_frame
-        if len(overlay.points) == 4 and overlay.has_overlay():
-            styled = overlay.styled_overlay(self.prev_frame, overlay.points)
-            if styled is not None:
-                region = overlay.current_region()
-                if core.is_valid_region(region):
-                    display_frame = core.composite_region(
-                        self.prev_frame, styled, region,
-                        occlusion=self.occlusion_mask(self.prev_frame,
-                                                      overlay.points))
+        display_frame = self.composite_placements(self.prev_frame)
 
         frame_rgb = cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB)
         h, w, ch = frame_rgb.shape
         q_img = QImage(frame_rgb.data, w, h, ch * w, QImage.Format_RGB888)
         self.video_label.setPixmap(QPixmap.fromImage(q_img))
+
+    @property
+    def tracker(self):
+        """The active placement's tracker.
+
+        Tracking state moved onto the placement so that several insertions can
+        be followed at once without interfering; this keeps the panel-level
+        name working for the code and tests written against a single one.
+        """
+        return self.tracking_overlay.active.tracker
+
+    @tracker.setter
+    def tracker(self, value):
+        self.tracking_overlay.active.tracker = value
+
+    @property
+    def kalman_filters(self):
+        return self.tracking_overlay.active.kalman_filters
+
+    @kalman_filters.setter
+    def kalman_filters(self, value):
+        self.tracking_overlay.active.kalman_filters = value
+
+    @property
+    def feature_source(self):
+        """Where the active placement's tracker looks for features.
+
+        Per placement rather than global: one shot can hold a printed poster,
+        whose own artwork is rigid, alongside a digital screen, whose picture
+        is not.
+        """
+        return self.tracking_overlay.active.feature_source
+
+    @feature_source.setter
+    def feature_source(self, value):
+        self.tracking_overlay.active.feature_source = value
+
+    @property
+    def tracking_history(self):
+        """The one and only store of tracked shapes.
+
+        This used to be a second dict kept "as a mirror" of the overlay's, and
+        the two drifted apart: the preview read this one while the render, the
+        project file and the AOI export read the overlay's. A shape drawn by
+        hand was therefore invisible when you navigated back to its frame, yet
+        still present in the exported video. Aliasing the property removes the
+        possibility rather than relying on both being updated.
+        """
+        return self.tracking_overlay.tracking_history
+
+    @tracking_history.setter
+    def tracking_history(self, value):
+        self.tracking_overlay.tracking_history = value
 
     def get_current_frame_index(self):
         """The index of the frame currently on screen."""
@@ -1741,36 +2221,36 @@ class CentralPanel(QWidget):
         # The tracker follows the texture across the whole region and fits a
         # homography to it; the Kalman filters then smooth the result and
         # carry the shape through brief dropouts.
-        if self.tracking_mode and len(overlay.points) == 4:
-            if not self.kalman_filters:
-                self.kalman_filters = core.make_filters(overlay.points)
-            if self.tracker is None and self.prev_frame is not None:
-                self.tracker = core.PlanarTracker(
-                    self.prev_frame, overlay.points,
-                    feature_source=self.feature_source)
+        if self.tracking_mode:
+            # Each placement carries its own tracker and filters, so one losing
+            # its surface cannot disturb the others.
+            for placement in self.placements_to_track():
+                if not placement.kalman_filters:
+                    placement.kalman_filters = core.make_filters(placement.points)
+                if placement.tracker is None and self.prev_frame is not None:
+                    placement.tracker = core.PlanarTracker(
+                        self.prev_frame, placement.points,
+                        feature_source=placement.feature_source)
 
-            measurement = None
-            if self.tracker is not None:
-                result = self.tracker.track(frame)
-                if result.ok:
-                    measurement = result.quad
-                else:
-                    logging.debug("Tracking step failed on frame %d: %s",
-                                  current_frame_index, result.reason)
+                measurement = None
+                if placement.tracker is not None:
+                    result = placement.tracker.track(frame)
+                    if result.ok:
+                        measurement = result.quad
+                    else:
+                        logging.debug("Tracking failed on frame %d for %s: %s",
+                                      current_frame_index, placement.name,
+                                      result.reason)
 
-            smoothed = core.smooth_quad(self.kalman_filters, measurement)
-            overlay.points = [(float(x), float(y)) for x, y in smoothed]
-
-            overlay.tracking_history[current_frame_index] = overlay.points[:]
-            self.tracking_history[current_frame_index] = overlay.points[:]
+                smoothed = core.smooth_quad(placement.kalman_filters, measurement)
+                placement.points = [(float(x), float(y)) for x, y in smoothed]
+                placement.tracking_history[current_frame_index] = placement.points[:]
         elif not self.tracking_mode:
             # Tracking off: show whatever was recorded for this frame.
             self.kalman_filters = []
             self.tracker = None
             if current_frame_index in self.tracking_history:
                 overlay.points = self.tracking_history[current_frame_index][:]
-            else:
-                overlay.points = []
 
         # If an overlay video is inserted, advance it to the matching frame.
         if overlay.inserted_overlay_is_video:
@@ -1781,15 +2261,7 @@ class CentralPanel(QWidget):
         # Composite through the same code path the renderer uses, so the
         # preview is a true preview rather than a lookalike.
         self.prev_frame = frame.copy()
-        display_frame = frame
-        if len(overlay.points) == 4 and overlay.has_overlay():
-            styled = overlay.styled_overlay(frame, overlay.points)
-            if styled is not None:
-                region = overlay.current_region()
-                if core.is_valid_region(region):
-                    display_frame = core.composite_region(
-                        frame, styled, region,
-                        occlusion=self.occlusion_mask(frame, overlay.points))
+        display_frame = self.composite_placements(frame)
 
         frame_rgb = cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB)
         h_frame, w_frame, ch = frame_rgb.shape
@@ -1817,61 +2289,86 @@ class CentralPanel(QWidget):
             self.frame_label.setText("Frame: 0")
             self.timestamp_label.setText("00:00 / 00:00")
 
+    def video_aspect(self) -> float:
+        """Width divided by height of the loaded video, 16:9 when none."""
+        if self.prev_frame is not None:
+            h, w = self.prev_frame.shape[:2]
+            if h > 0:
+                return w / float(h)
+        if self.cap and self.cap.isOpened():
+            w = self.cap.get(cv2.CAP_PROP_FRAME_WIDTH)
+            h = self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
+            if w and h:
+                return w / float(h)
+        return 16.0 / 9.0
+
+    def layout_video_stage(self):
+        """Letterbox the picture inside its container without distorting it.
+
+        The label and the overlay are given *identical* geometry, matching the
+        picture exactly. That is what keeps display_to_raw/raw_to_display
+        correct with no offset term: mouse positions arrive relative to the
+        overlay, whose origin is the picture's top-left corner, and whose size
+        is the picture's size. Scaling the pixmap inside a larger label instead
+        would silently break every click, every corner drag and the magnifier,
+        with no visible symptom until the export was wrong.
+        """
+        available_w = max(1, self.video_container.width())
+        available_h = max(1, self.video_container.height())
+        aspect = self.video_aspect()
+
+        width = available_w
+        height = int(round(width / aspect))
+        if height > available_h:
+            height = available_h
+            width = int(round(height * aspect))
+
+        x = (available_w - width) // 2
+        y = (available_h - height) // 2
+        for widget in (self.video_label, self.tracking_overlay):
+            widget.setGeometry(x, y, max(1, width), max(1, height))
+
+        self.empty_state.setGeometry(0, 0, available_w, available_h)
+        self.empty_state.setVisible(self.cap is None or not self.cap.isOpened())
+        self.empty_state.raise_()
+
+        self.magnifier.move(x + 10, y + 10)
+        self.magnifier.raise_()
+        self.tracking_overlay.raise_()
+
     def resizeEvent(self, event):
         super(CentralPanel, self).resizeEvent(event)
-        width = self.width()
-        height = int(width / 16 * 9)
-        if height > self.height():
-            height = self.height()
-            width = int(height * 16 / 9)
+        self.main_layout.activate()
+        self.layout_video_stage()
 
-        self.video_container.setGeometry(0, 0, width, height)
-        self.frame_label.move(10, 10)
-        self.frame_label.raise_()
+    def update_tracking_availability(self):
+        """Only offer tracking once there is a shape to track.
 
-        switch_x = width - self.switch.width() - 20
-        switch_y = 10
-        self.switch.move(switch_x, switch_y)
-        self.switch.raise_()
-
-        label_w = self.tracking_label.sizeHint().width()
-        label_h = self.tracking_label.sizeHint().height()
-        self.tracking_label.move(switch_x - label_w - 10, switch_y + (self.switch.height() - label_h)//2)
-        self.tracking_label.raise_()
-
-        mag_label_y = switch_y + self.switch.height() + 10
-        self.magnifier_label.move(switch_x - label_w - 10, mag_label_y)
-        self.magnifier_label.raise_()
-
-        self.magnifier_switch.move(switch_x, mag_label_y)
-        self.magnifier_switch.raise_()
-
-        self.magnifier.move(10, 60)
-        self.magnifier.raise_()
-
-        controls_width = int(width*0.6)
-        controls_x = (width - controls_width)//2
-        controls_y = height - self.controls_frame.height() - 20
-        self.controls_frame.setGeometry(controls_x, controls_y, controls_width, self.controls_frame.height())
-        self.controls_frame.raise_()
-
-    def toggle_tracking(self, checked: bool):
-        if checked:
-            if len(self.tracking_overlay.points) == 4:
-                self.tracking_mode = True
-            else:
-                self.switch.setChecked(False)
-                QMessageBox.information(
-                    self, "Cannot Enable Tracking",
-                    "Draw all four corners of the area before turning tracking on."
-                )
-        else:
-            self.tracking_mode = False
+        The switch used to accept a click with no shape drawn: it would turn
+        green, say "Tracking Enabled", and record nothing for the whole clip,
+        because read_frame gates on having four corners. The guard for this
+        existed but was never connected to anything.
+        """
+        ready = (len(self.tracking_overlay.points) == 4
+                 and self.cap is not None and self.cap.isOpened())
+        self.switch.setEnabled(ready)
+        self.switch.setToolTip(
+            "Follow the marked area through the clip" if ready
+            else "Mark all four corners of the area first")
+        if not ready and self.switch.isChecked():
+            self.switch.setChecked(False)
 
     def on_tracking_toggled(self, on: bool):
+        if on and len(self.tracking_overlay.points) != 4:
+            self.switch.setChecked(False)
+            QMessageBox.information(
+                self, "Cannot Enable Tracking",
+                "Mark all four corners of the area before turning tracking on.")
+            return
+
         self.tracking_mode = on
         if on:
-            self.tracking_label.setText("Tracking Enabled")
+            self.tracking_label.setText("Tracking on")
             self.tracking_label.setStyleSheet("""
                 QLabel {
                     color: limegreen;
@@ -1882,42 +2379,22 @@ class CentralPanel(QWidget):
                 }
             """)
         else:
-            self.tracking_label.setText("Tracking Disabled")
+            self.tracking_label.setText("Tracking off")
             self.tracking_label.setStyleSheet("""
                 QLabel {
-                    color: red;
+                    color: #BBBBBB;
                     font-size: 14px;
                     background-color: #1A1A1A;
                     padding: 5px;
                     min-width: 150px;
                 }
             """)
-            self.tracking_overlay.points.clear()
+            # The shape deliberately survives. Turning tracking off means "stop
+            # following the surface", not "throw away what I marked" -- and
+            # rewinding, scrubbing backwards and Go-to-Frame all switch tracking
+            # off for you, so clearing here destroyed work without any warning
+            # and with no undo.
             self.tracking_overlay.update()
-
-    def set_tracking_toggle_state(self, on: bool):
-        if on:
-            self.tracking_toggle.setCheckState(Qt.Checked)
-            self.tracking_status_label.setText("Tracking Enabled")
-            self.tracking_status_label.setStyleSheet("""
-                QLabel {
-                    color: limegreen;
-                    font-size: 14px;
-                    background-color: #1A1A1A;
-                    padding: 5px;
-                }
-            """)
-        else:
-            self.tracking_toggle.setCheckState(Qt.Unchecked)
-            self.tracking_status_label.setText("Tracking Disabled")
-            self.tracking_status_label.setStyleSheet("""
-                QLabel {
-                    color: red;
-                    font-size: 14px;
-                    background-color: #1A1A1A;
-                    padding: 5px;
-                }
-            """)
 
     def track_with_optical_flow(self, old_frame, new_frame, old_points):
         """Advance a quad by one frame.
@@ -1933,6 +2410,62 @@ class CentralPanel(QWidget):
         if not result.ok:
             return None
         return [(float(x), float(y)) for x, y in result.quad]
+
+    def composite_placements(self, frame):
+        """Draw every ready placement into the frame.
+
+        Occlusion is segmented once and reused: the model is the slow part and
+        the mask is the same whichever insert is being drawn behind it.
+        """
+        overlay = self.tracking_overlay
+        ready = overlay.ready_placements()
+        if not ready:
+            return frame
+
+        occlusion = None
+        if self.occlusion_enabled:
+            occlusion = self.occlusion_mask(frame, None)
+
+        out = frame
+        for placement in ready:
+            region = core.Region(placement.points, placement.curvature,
+                                 placement.curved_enabled)
+            if not core.is_valid_region(region):
+                continue
+            motion = overlay.motion_for(placement, placement.points)
+            styled = overlay.styled_for(placement, frame, placement.points, motion)
+            if styled is None:
+                continue
+            out = core.composite_region(out, styled, region, occlusion=occlusion,
+                                        in_place=(out is not frame))
+            sigma = blend.grain_sigma_for(frame, region.corners, placement.blend) \
+                if placement.blend.enabled else 0.0
+            if sigma > 0.1:
+                h, w = out.shape[:2]
+                out = blend.add_grain(out, sigma,
+                                      core.quad_to_mask(region.corners, w, h),
+                                      seed=self.current_frame_index)
+        return out
+
+    def apply_grain(self, composited, source_frame, region):
+        """Lay matched sensor noise over the insert.
+
+        Applied after the warp, in frame space: grain added to the creative
+        beforehand would be resampled along with it and come out the wrong size
+        for the shot.
+        """
+        overlay = self.tracking_overlay
+        sigma = overlay.grain_for(source_frame, region.corners)
+        if sigma <= 0.1:
+            return composited
+        h, w = composited.shape[:2]
+        mask = core.quad_to_mask(region.corners, w, h)
+        return blend.add_grain(composited, sigma, mask, seed=self.current_frame_index)
+
+    def placements_to_track(self):
+        """Placements with a complete shape, so there is something to follow."""
+        return [p for p in self.tracking_overlay.placements
+                if p.enabled and len(p.points) == 4]
 
     def occlusion_mask(self, frame, quad):
         """A mask of people in front of the surface, or None if switched off."""
@@ -1952,7 +2485,7 @@ class CentralPanel(QWidget):
             return None
 
     def reset_tracker(self):
-        """Re-anchor tracking to the shape as it now stands.
+        """Re-anchor every placement's tracking to the shapes as they stand.
 
         Called whenever the user edits the shape by hand: without this the
         tracker would keep propagating from the pre-edit corners and drag the
@@ -1960,6 +2493,8 @@ class CentralPanel(QWidget):
         """
         self.tracker = None
         self.kalman_filters = []
+        for placement in self.tracking_overlay.placements:
+            placement.reset_tracker()
 
     def update_magnifier_dimensions(self):
         shape_pts = self.tracking_overlay.points
@@ -1996,8 +2531,23 @@ class CentralPanel(QWidget):
         if (new_w != current_w) or (new_h != current_h):
             self.magnifier.setFixedSize(new_w, new_h)
 
-    def update_magnifier(self):
-        if not self.magnifier_switch.isChecked():
+    def set_magnifier_temporarily_visible(self, visible: bool):
+        """Show the magnifier while a corner is being dragged.
+
+        Precise placement is exactly when a zoomed view is wanted, so it
+        appears on press and goes away on release -- unless the user has turned
+        it on properly, in which case it stays.
+        """
+        if self.magnifier_switch.isChecked():
+            return          # already on for good; leave it alone
+        self.magnifier.setVisible(visible)
+        if visible:
+            self.magnifier.raise_()
+            self.update_magnifier(force=True)
+
+    def update_magnifier(self, force: bool = False):
+        if not force and not self.magnifier_switch.isChecked() \
+                and not self.magnifier.isVisible():
             return
 
         if self.prev_frame is None:
@@ -2052,9 +2602,14 @@ class CentralPanel(QWidget):
         self.playing = False
         self.timer.stop()
         self.play_pause_btn.setIcon(self.style().standardIcon(QStyle.SP_MediaPlay))
+        self.layout_video_stage()   # the aspect ratio is only known now
         logging.debug(f"Loaded {file_path}, FPS={self.fps}")
 
         self.tracking_overlay.reset()
+        self.update_tracking_availability()
+        mw = self.window()
+        if isinstance(mw, QMainWindow) and hasattr(mw, "refresh_title"):
+            mw.refresh_title()
 
     def enable_tracking_mode(self):
         """
@@ -2076,7 +2631,7 @@ class CentralPanel(QWidget):
 
     def on_magnifier_toggled(self, on: bool):
         if on:
-            self.magnifier_label.setText("Magnifier On")
+            self.magnifier_label.setText("Magnifier on")
             self.magnifier_label.setStyleSheet("""
                 QLabel {
                     color: limegreen;
@@ -2089,10 +2644,10 @@ class CentralPanel(QWidget):
             self.magnifier.show()
             self.update_magnifier()
         else:
-            self.magnifier_label.setText("Magnifier Off")
+            self.magnifier_label.setText("Magnifier off")
             self.magnifier_label.setStyleSheet("""
                 QLabel {
-                    color: red;
+                    color: #BBBBBB;
                     font-size: 14px;
                     background-color: #1A1A1A;
                     padding: 5px;
@@ -2104,20 +2659,6 @@ class CentralPanel(QWidget):
 
         if self.tracking_mode:
             self.tracking_overlay.setFocus()
-
-    def auto_enable_tracking_if_shape_ready(self):
-        if len(self.tracking_overlay.points) == 4:
-            self.set_tracking_toggle_state(True)
-            self.tracking_mode = True
-
-    def save_tracking_points_for_frame(self, frame_index, points):
-        try:
-            with open('tracking_history.json', 'a') as f:
-                data = {'frame': frame_index, 'points': points}
-                f.write(json.dumps(data) + '\n')
-            logging.debug(f"Saved tracking points for frame {frame_index}")
-        except Exception as e:
-            logging.error(f"Failed to save tracking points for frame {frame_index}: {e}")
 
     def on_slider_pressed(self):
         self.playing = False
@@ -2142,6 +2683,211 @@ class CentralPanel(QWidget):
             self.cap.set(cv2.CAP_PROP_POS_FRAMES, value)
             self.read_frame()
 
+class RenderDialog(QDialog):
+    """One dialog for the whole render, showing what is actually tracked.
+
+    This replaces four chained prompts that asked for numbers with no context.
+    The frame range defaulted to the entire clip regardless of how much had
+    been tracked, and since the renderer leaves untracked frames untouched, the
+    usual first-run result was a video in which the advert appeared on a single
+    frame -- reported as "exported successfully".
+    """
+
+    def __init__(self, total_frames, tracked_range, video_size, fps,
+                 suggested_path, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Render Video")
+        self.setMinimumWidth(520)
+        self.setStyleSheet("""
+            QDialog { background-color: #2A2A2A; }
+            QLabel { color: #E8E8E8; font-size: 13px; }
+            QSpinBox, QComboBox, QLineEdit {
+                background-color: #1E1E1E; color: white; border: 1px solid #555;
+                border-radius: 4px; padding: 4px; font-size: 13px;
+            }
+            QPushButton {
+                background-color: #3C3C3C; color: white; border: none;
+                border-radius: 6px; padding: 7px 16px; font-size: 13px;
+            }
+            QPushButton:hover { background-color: #505050; }
+        """)
+
+        self.video_size = video_size
+        self.tracked_range = tracked_range
+        self.fps = fps or 30.0
+
+        layout = QVBoxLayout(self)
+        layout.setSpacing(12)
+
+        first, last = tracked_range
+        summary = QLabel(
+            f"<b>Tracked:</b> frames {first}–{last} "
+            f"of {total_frames}  ({(last - first + 1) / self.fps:.1f}s)")
+        layout.addWidget(summary)
+
+        range_row = QHBoxLayout()
+        range_row.addWidget(QLabel("Frames"))
+        self.start_spin = QSpinBox()
+        self.start_spin.setRange(0, max(0, total_frames - 1))
+        self.start_spin.setValue(first)
+        self.end_spin = QSpinBox()
+        self.end_spin.setRange(0, max(0, total_frames - 1))
+        self.end_spin.setValue(last)
+        range_row.addWidget(self.start_spin)
+        range_row.addWidget(QLabel("to"))
+        range_row.addWidget(self.end_spin)
+        range_row.addStretch(1)
+        layout.addLayout(range_row)
+
+        # Resolution as a plain choice showing real pixel sizes, rather than
+        # asking for a multiplier.
+        scale_row = QHBoxLayout()
+        scale_row.addWidget(QLabel("Resolution"))
+        self.scale_combo = QComboBox()
+        for label, factor in (("Full", 1.0), ("Half", 0.5), ("Quarter", 0.25)):
+            w = int(video_size[0] * factor)
+            h = int(video_size[1] * factor)
+            self.scale_combo.addItem(f"{label}  —  {w}×{h}", factor)
+        scale_row.addWidget(self.scale_combo)
+        scale_row.addStretch(1)
+        layout.addLayout(scale_row)
+
+        path_row = QHBoxLayout()
+        path_row.addWidget(QLabel("Save to"))
+        self.path_edit = QLineEdit(suggested_path)
+        browse = QPushButton("Browse…")
+        browse.clicked.connect(self._browse)
+        path_row.addWidget(self.path_edit, 1)
+        path_row.addWidget(browse)
+        layout.addLayout(path_row)
+
+        self.warning = QLabel("")
+        self.warning.setWordWrap(True)
+        self.warning.setStyleSheet("color: #FFB454; font-size: 12px;")
+        layout.addWidget(self.warning)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.button(QDialogButtonBox.Ok).setText("Render")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons, alignment=Qt.AlignRight)
+
+        for spin in (self.start_spin, self.end_spin):
+            spin.valueChanged.connect(self._update_warning)
+        self._update_warning()
+
+    def _browse(self):
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Rendered Video", self.path_edit.text(), "MP4 Files (*.mp4)")
+        if path:
+            self.path_edit.setText(path)
+
+    def _update_warning(self):
+        """Say plainly when the chosen range reaches past the tracking."""
+        first, last = self.tracked_range
+        start, end = self.start_spin.value(), self.end_spin.value()
+        gaps = []
+        if start < first:
+            gaps.append(f"{start}–{first - 1}")
+        if end > last:
+            gaps.append(f"{last + 1}–{end}")
+        if gaps:
+            self.warning.setText(
+                "⚠  No tracking on frames " + ", ".join(gaps) +
+                ". The creative will not appear on them.")
+        else:
+            self.warning.setText("")
+
+    def values(self):
+        return (self.start_spin.value(), self.end_spin.value(),
+                self.scale_combo.currentData(), self.path_edit.text().strip())
+
+
+class MatchChoiceDialog(QDialog):
+    """Pick which of several found instances to turn into placements.
+
+    The same poster often appears on more than one panel in a concourse shot.
+    Rather than silently taking the strongest, all of them are offered, ticked
+    by default, with the evidence for each so a marginal one can be dropped.
+    """
+
+    def __init__(self, detections, parent=None):
+        super().__init__(parent)
+        self.detections = detections
+        self.setWindowTitle("Several Matches Found")
+        self.setMinimumWidth(460)
+        self.setStyleSheet("""
+            QDialog { background-color: #2A2A2A; }
+            QLabel { color: #E8E8E8; font-size: 13px; }
+            QCheckBox { color: #E8E8E8; font-size: 12px; }
+            QPushButton { background-color: #3C3C3C; color: white; border: none;
+                          border-radius: 6px; padding: 7px 16px; }
+            QPushButton:hover { background-color: #505050; }
+        """)
+
+        layout = QVBoxLayout(self)
+        layout.setSpacing(10)
+        layout.addWidget(QLabel(
+            f"<b>{len(detections)} instances of that target were found.</b>"))
+        note = QLabel("Each ticked one becomes its own placement, with its own "
+                      "tracking and creative.")
+        note.setWordWrap(True)
+        note.setStyleSheet("color: #9A9A9A; font-size: 11px;")
+        layout.addWidget(note)
+
+        self.boxes = []
+        for index, detection in enumerate(detections, start=1):
+            centre = np.float32(detection.quad).mean(axis=0)
+            area = core.quad_area(detection.quad)
+            box = QCheckBox(
+                f"{index}.  {detection.n_inliers} features, "
+                f"{detection.confidence:.0%} confidence  —  "
+                f"{int(area):,} px at ({int(centre[0])}, {int(centre[1])})")
+            box.setChecked(True)
+            layout.addWidget(box)
+            self.boxes.append(box)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.button(QDialogButtonBox.Ok).setText("Create placements")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons, alignment=Qt.AlignRight)
+
+    def selected(self):
+        return [detection for detection, box in zip(self.detections, self.boxes)
+                if box.isChecked()]
+
+
+class PlacementSnapshot:
+    """One placement, detached from the GUI for the render thread."""
+
+    def __init__(self, placement, scale):
+        self.name = placement.name
+        self.history = {int(k): [(float(x), float(y)) for x, y in v]
+                        for k, v in placement.tracking_history.items()
+                        if v is not None and len(v) == 4}
+        self.curvature = np.array(placement.curvature, np.float32)
+        self.curved = bool(placement.curved_enabled)
+        self.creative = (placement.overlay_bgra.copy()
+                         if placement.overlay_bgra is not None
+                         and not placement.inserted_overlay_is_video else None)
+        self.video_path = (placement.overlay_video_path
+                           if placement.inserted_overlay_is_video else None)
+        self.start_frame = placement.inserted_overlay_start_frame
+        self.brightness = placement.brightness
+        self.contrast = placement.contrast
+        self.colourise = placement.colourise_enabled
+        self.blend = blend.BlendSettings.from_dict(placement.blend.to_dict())
+        self.scale = scale
+        # Per-placement decode state, filled in by the worker.
+        self.capture = None
+        self.cursor = -1
+        self.frame = None
+        self.exhausted = False
+        self.previous_quad = None
+        self.dense = {}
+
+
 class RenderSettings:
     """A self-contained snapshot of everything a render needs.
 
@@ -2155,7 +2901,8 @@ class RenderSettings:
                  scale_factor, fps, history, curvature, curved,
                  overlay_bgra=None, overlay_video_path=None,
                  overlay_start_frame=0, brightness=0, contrast=1.0,
-                 colourise=False, include_audio=True, occlusion=False):
+                 colourise=False, include_audio=True, occlusion=False,
+                 blend_settings=None, placements=None):
         self.base_video_path = base_video_path
         self.out_path = out_path
         self.start_frame = int(start_frame)
@@ -2175,6 +2922,10 @@ class RenderSettings:
         # A flag, not a segmenter: a cv2.dnn.Net cannot be shared across
         # threads, so the worker builds its own.
         self.occlusion = occlusion
+        self.blend = blend_settings or blend.BlendSettings.off()
+        # Every insertion to draw. The single-placement fields above are kept
+        # so existing callers and tests go on working.
+        self.placements = placements or []
 
 
 class RenderWorker(QObject):
@@ -2186,6 +2937,117 @@ class RenderWorker(QObject):
         super().__init__()
         self.settings = settings
         self.is_canceled = False
+
+    def _prepare_placements(self, settings, caveats):
+        """Work out what each placement covers, and open its creative video.
+
+        Returns only those with tracking inside the chosen range, so a
+        placement marked but never tracked simply does not draw rather than
+        aborting the whole render.
+        """
+        snapshots = list(settings.placements)
+        if not snapshots:
+            # A settings object built the old way, carrying a single insertion.
+            legacy = PlacementSnapshot.__new__(PlacementSnapshot)
+            legacy.name = "Placement 1"
+            legacy.history = settings.history
+            legacy.curvature = settings.curvature
+            legacy.curved = settings.curved
+            legacy.creative = settings.overlay_bgra
+            legacy.video_path = settings.overlay_video_path
+            legacy.start_frame = settings.overlay_start_frame
+            legacy.brightness = settings.brightness
+            legacy.contrast = settings.contrast
+            legacy.colourise = settings.colourise
+            legacy.blend = settings.blend
+            legacy.scale = settings.scale_factor
+            legacy.capture = None
+            legacy.cursor = -1
+            legacy.frame = None
+            legacy.exhausted = False
+            legacy.previous_quad = None
+            legacy.dense = {}
+            snapshots = [legacy]
+
+        usable = []
+        for placement in snapshots:
+            placement.dense = core.interpolate_tracking(
+                placement.history, settings.start_frame, settings.end_frame)
+            if not placement.dense:
+                continue
+
+            if placement.video_path:
+                placement.capture = cv2.VideoCapture(placement.video_path)
+                if placement.capture.isOpened():
+                    placement.fps = (placement.capture.get(cv2.CAP_PROP_FPS)
+                                     or settings.fps)
+                else:
+                    placement.capture = None
+                    caveats.append(
+                        f"the creative video for {placement.name} could not be "
+                        "opened, so it was not inserted")
+                    continue
+            usable.append(placement)
+        return usable
+
+    def _draw_placement(self, placement, base_frame, frame_idx, settings,
+                        occlusion, size):
+        """Composite one placement into the frame, if it is on screen here."""
+        quad = placement.dense.get(frame_idx)
+        if quad is None:
+            return base_frame
+
+        creative = placement.creative
+        if placement.capture is not None and not placement.exhausted:
+            # Map by time, not by frame count, so a creative shot at a
+            # different frame rate plays at the right speed.
+            elapsed = frame_idx - placement.start_frame
+            if elapsed >= 0:
+                wanted = int(round(elapsed * getattr(placement, "fps", settings.fps)
+                                   / max(settings.fps, 1e-6)))
+                while placement.cursor < wanted:
+                    got, next_frame = placement.capture.read()
+                    if not got:
+                        placement.exhausted = True
+                        break
+                    placement.frame = next_frame
+                    placement.cursor += 1
+                creative = placement.frame
+        if creative is None:
+            return base_frame
+
+        region = core.Region(np.float32(quad) * placement.scale,
+                             placement.curvature, placement.curved)
+        if not core.is_valid_region(region):
+            return base_frame
+
+        styled = core.apply_brightness_contrast(
+            creative, placement.brightness, placement.contrast)
+        if placement.colourise:
+            styled = core.apply_colourise(styled, base_frame, region.corners)
+
+        grain = 0.0
+        if placement.blend.enabled:
+            motion = None
+            if placement.previous_quad is not None:
+                delta = (region.corners - placement.previous_quad).mean(axis=0)
+                motion = (float(delta[0]), float(delta[1]))
+            styled = blend.photometric_match(styled, base_frame, region.corners,
+                                             placement.blend, motion=motion)
+            placement.previous_quad = region.corners.copy()
+            # Measure the footage's grain BEFORE the creative covers it, or the
+            # sample is of the clean creative and no grain gets added at all.
+            grain = blend.grain_sigma_for(base_frame, region.corners,
+                                          placement.blend)
+
+        base_frame = core.composite_region(base_frame, styled, region,
+                                           in_place=True, occlusion=occlusion)
+        if grain > 0.1:
+            base_frame = blend.add_grain(
+                base_frame, grain,
+                core.quad_to_mask(region.corners, size[0], size[1]),
+                seed=frame_idx)
+        return base_frame
 
     def run(self):
         """The main rendering loop."""
@@ -2202,27 +3064,28 @@ class RenderWorker(QObject):
 
             # Fill the gaps between tracked frames instead of holding the last
             # known position, which used to freeze the insert mid-shot.
-            dense = core.interpolate_tracking(
-                settings.history, settings.start_frame, settings.end_frame)
-            if not dense:
-                self.finished.emit("Completed (No tracking data to apply)")
+            # Things that went wrong but did not stop the render. These have
+            # to reach the user: each one changes what is in the file, and all
+            # of them used to be reported as an unqualified success.
+            caveats = []
+
+            placements = self._prepare_placements(settings, caveats)
+            if not placements:
+                # No file gets written here, so this is a failure, not a
+                # "Completed" with a note.
+                self.finished.emit(
+                    "Error: no tracking data covers the chosen frame range.")
                 return
 
-            out_writer = cv2.VideoWriter(
-                settings.out_path, cv2.VideoWriter_fourcc(*"mp4v"),
-                settings.fps, (width, height))
-            if not out_writer.isOpened():
-                raise IOError(f"Could not open {settings.out_path} for writing.")
-
-            overlay_fps = 0.0
-            if settings.overlay_video_path:
-                overlay_cap = cv2.VideoCapture(settings.overlay_video_path)
-                if overlay_cap.isOpened():
-                    overlay_fps = overlay_cap.get(cv2.CAP_PROP_FPS) or settings.fps
-                else:
-                    logging.error("Could not open the overlay video; "
-                                  "rendering without it.")
-                    overlay_cap = None
+            duration = ((settings.end_frame - settings.start_frame + 1)
+                        / max(settings.fps, 1e-6))
+            out_writer = core.FrameWriter(
+                settings.out_path, settings.fps, (width, height),
+                audio_source=(settings.base_video_path
+                              if settings.include_audio else None),
+                audio_start=settings.start_frame / max(settings.fps, 1e-6),
+                duration=duration)
+            caveats.extend(out_writer.caveats)
 
             # Seek once, then read straight through. Seeking per frame is slow
             # and, on long-GOP codecs, lands on the nearest keyframe rather
@@ -2236,10 +3099,9 @@ class RenderWorker(QObject):
                     segmenter = core.PersonSegmenter()
                 except (FileNotFoundError, IOError) as exc:
                     logging.warning("Rendering without occlusion: %s", exc)
+                    caveats.append("the person model is missing, so people "
+                                   "walking in front were painted over")
 
-            overlay_frame = None
-            overlay_cursor = -1
-            overlay_exhausted = False
             frame_counter = 0
 
             for frame_idx in range(settings.start_frame, settings.end_frame + 1):
@@ -2253,102 +3115,58 @@ class RenderWorker(QObject):
                     base_frame = cv2.resize(base_frame, (width, height),
                                             interpolation=cv2.INTER_AREA)
 
-                quad = dense.get(frame_idx)
-                if quad is not None:
-                    creative = settings.overlay_bgra
+                # Segment once per frame and share the mask: the model is the
+                # slow part and it does not depend on which insert is drawn.
+                occlusion = None
+                if segmenter is not None:
+                    try:
+                        occlusion = segmenter.mask(base_frame)
+                    except cv2.error as exc:
+                        logging.warning("Segmentation failed on frame %d: %s",
+                                        frame_idx, exc)
 
-                    if overlay_cap is not None and not overlay_exhausted:
-                        # Map by time, not by frame count, so a creative shot
-                        # at a different frame rate plays at the right speed.
-                        elapsed = frame_idx - settings.overlay_start_frame
-                        if elapsed >= 0:
-                            wanted = int(round(elapsed * overlay_fps / settings.fps))
-                            while overlay_cursor < wanted:
-                                got, next_frame = overlay_cap.read()
-                                if not got:
-                                    overlay_exhausted = True
-                                    break
-                                overlay_frame = next_frame
-                                overlay_cursor += 1
-                            creative = overlay_frame
-
-                    if creative is not None:
-                        region = core.Region(np.float32(quad) * scale,
-                                             settings.curvature, settings.curved)
-                        styled = core.apply_brightness_contrast(
-                            creative, settings.brightness, settings.contrast)
-                        if settings.colourise:
-                            styled = core.apply_colourise(
-                                styled, base_frame, region.corners)
-                        occlusion = None
-                        if segmenter is not None:
-                            try:
-                                occlusion = segmenter.mask(base_frame,
-                                                           region.corners)
-                            except cv2.error as exc:
-                                logging.warning("Segmentation failed on frame "
-                                                "%d: %s", frame_idx, exc)
-                        if core.is_valid_region(region):
-                            base_frame = core.composite_region(
-                                base_frame, styled, region, in_place=True,
-                                occlusion=occlusion)
+                for placement in placements:
+                    base_frame = self._draw_placement(
+                        placement, base_frame, frame_idx, settings,
+                        occlusion, (width, height))
 
                 out_writer.write(base_frame)
                 frame_counter += 1
                 self.progress.emit(frame_counter)
 
             base_cap.release()
-            out_writer.release()
-            base_cap = out_writer = None
-            if overlay_cap:
-                overlay_cap.release()
-                overlay_cap = None
+            base_cap = None
+            for placement in placements:
+                if placement.capture is not None:
+                    placement.capture.release()
+                    placement.capture = None
 
             if self.is_canceled:
+                out_writer.abort()
+                out_writer = None
                 self.finished.emit("Canceled")
                 return
 
-            self.finished.emit(self._attach_audio())
+            caveats.extend(c for c in out_writer.close()
+                           if c not in caveats)
+            out_writer = None
+
+            if frame_counter == 0:
+                self.finished.emit("Error: no frames were written.")
+                return
+
+            self.finished.emit("Completed" +
+                               (f" ({'; '.join(caveats)})" if caveats else ""))
 
         except Exception as e:
             logging.exception("Render worker failed")
             self.finished.emit(f"Error: {e}")
         finally:
-            for handle in (base_cap, overlay_cap, out_writer):
+            for handle in (base_cap, overlay_cap):
                 if handle is not None:
                     handle.release()
-
-    def _attach_audio(self) -> str:
-        """Graft the source audio back on, if ffmpeg is around to do it.
-
-        VideoWriter can only write pictures, so the render is silent until
-        ffmpeg copies the original audio across. Without ffmpeg the silent file
-        still stands, and the status says so rather than failing the render.
-        """
-        settings = self.settings
-        if not settings.include_audio:
-            return "Completed"
-        if not core.has_ffmpeg():
-            return "Completed (no audio: ffmpeg not found)"
-
-        base, ext = os.path.splitext(settings.out_path)
-        temp_path = f"{base}.audio{ext or '.mp4'}"
-        duration = ((settings.end_frame - settings.start_frame + 1)
-                    / max(settings.fps, 1e-6))
-
-        ok = core.remux_audio(settings.out_path, settings.base_video_path,
-                              temp_path,
-                              start_time=settings.start_frame / max(settings.fps, 1e-6),
-                              duration=duration)
-        if not ok:
-            return "Completed (no audio: the source may have none)"
-
-        try:
-            os.replace(temp_path, settings.out_path)
-        except OSError as exc:
-            logging.warning("Could not swap in the audio version: %s", exc)
-            return "Completed (no audio: could not replace the silent file)"
-        return "Completed"
+            if out_writer is not None:
+                out_writer.abort()
 
     def cancel(self):
         self.is_canceled = True
@@ -2360,8 +3178,10 @@ class MainWindow(QMainWindow):
         self.setWindowFlags(Qt.FramelessWindowHint)
         self.setMouseTracking(True)
 
-        self.aspect_ratio = 19 / 9
-        self.setMinimumSize(1200, int(1200 / self.aspect_ratio))
+        # No forced aspect ratio: calling resize() from inside resizeEvent
+        # fought every attempt to size the window and pinned it to 19:9, an
+        # ultrawide shape none of the target laptops have.
+        self.setMinimumSize(1024, 640)
 
         main_widget = QWidget()
         main_widget.setStyleSheet("background-color: #D3D3D3;")
@@ -2395,6 +3215,49 @@ class MainWindow(QMainWindow):
         self.overlay_layout.setContentsMargins(10, 10, 10, 10)
         self.overlay_layout.setSpacing(10)
 
+        # --- Placements -------------------------------------------------
+        placements_title = QLabel("Placements")
+        placements_title.setStyleSheet(
+            "color: white; font-size: 15px; font-weight: bold;")
+        self.overlay_layout.addWidget(placements_title)
+
+        hint = QLabel("Each one tracks its own surface and holds its own "
+                      "creative. Tick to include it in the render.")
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #8A8A8A; font-size: 10px;")
+        self.overlay_layout.addWidget(hint)
+
+        self.placement_list = QListWidget()
+        self.placement_list.setFixedHeight(110)
+        self.placement_list.setStyleSheet("""
+            QListWidget { background-color: #222; color: #E8E8E8;
+                          border: 1px solid #3A3A3A; border-radius: 6px;
+                          font-size: 12px; }
+            QListWidget::item { padding: 4px; }
+            QListWidget::item:selected { background-color: #00A000; color: white; }
+        """)
+        self.placement_list.currentRowChanged.connect(self.on_placement_selected)
+        self.placement_list.itemChanged.connect(self.on_placement_item_changed)
+        self.overlay_layout.addWidget(self.placement_list)
+
+        placement_buttons = QHBoxLayout()
+        for label, tip, slot in (
+                ("+ Add", "Add another placement to track and fill",
+                 self.add_placement),
+                ("Remove", "Delete the selected placement", self.remove_placement),
+                ("Rename", "Rename the selected placement", self.rename_placement)):
+            button = QPushButton(label)
+            button.setToolTip(tip)
+            button.setStyleSheet("""
+                QPushButton { background-color: #3C3C3C; color: white;
+                              border: none; border-radius: 5px; padding: 4px;
+                              font-size: 11px; }
+                QPushButton:hover { background-color: #505050; }
+            """)
+            button.clicked.connect(slot)
+            placement_buttons.addWidget(button)
+        self.overlay_layout.addLayout(placement_buttons)
+
         library_title = QLabel("Library")
         library_title.setStyleSheet("color: white; font-size: 16px; font-weight: bold;")
         library_title.setAlignment(Qt.AlignCenter)
@@ -2423,6 +3286,141 @@ class MainWindow(QMainWindow):
         logging.debug("MainWindow shown maximized")
 
         self.inserted_overlay_widget = None
+        self.dirty = False
+        # What the last successful render covered, so the AOI export can
+        # describe that file rather than the untouched source video.
+        self.last_render = None
+        self.pending_render = None
+        self.last_output_dir = ""
+        self.refresh_title()
+        self.refresh_placement_list()
+
+    # -- unsaved work ------------------------------------------------------
+
+    # -- placements --------------------------------------------------------
+
+    def refresh_placement_list(self):
+        """Rebuild the list, keeping the active placement selected."""
+        overlay = self.central_panel.tracking_overlay
+        self.placement_list.blockSignals(True)
+        self.placement_list.clear()
+        for placement in overlay.placements:
+            tracked = len(placement.tracking_history)
+            mark = "\u25cf" if placement.has_overlay() else "\u25cb"
+            item = QListWidgetItem(f"{mark}  {placement.name}   {tracked}f")
+            item.setToolTip(
+                f"{placement.name}\n"
+                f"{tracked} tracked frames\n"
+                + ("Creative loaded" if placement.has_overlay()
+                   else "No creative inserted yet"))
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setCheckState(Qt.Checked if placement.enabled else Qt.Unchecked)
+            self.placement_list.addItem(item)
+        self.placement_list.setCurrentRow(overlay.active_index)
+        self.placement_list.blockSignals(False)
+
+    def on_placement_selected(self, row):
+        if row < 0:
+            return
+        self.central_panel.tracking_overlay.set_active(row)
+        self.central_panel.refresh_display()
+        self.central_panel.update_tracking_availability()
+
+    def on_placement_item_changed(self, item):
+        row = self.placement_list.row(item)
+        overlay = self.central_panel.tracking_overlay
+        if 0 <= row < len(overlay.placements):
+            overlay.placements[row].enabled = item.checkState() == Qt.Checked
+            self.central_panel.refresh_display()
+            self.mark_dirty()
+
+    def add_placement(self):
+        self.central_panel.tracking_overlay.add_placement()
+        self.refresh_placement_list()
+        self.central_panel.update_tracking_availability()
+        self.central_panel.enable_tracking_mode()
+        self.mark_dirty()
+
+    def remove_placement(self):
+        overlay = self.central_panel.tracking_overlay
+        if len(overlay.placements) <= 1:
+            QMessageBox.information(
+                self, "Placements",
+                "There has to be at least one placement. Use Clear to empty "
+                "this one instead.")
+            return
+        row = self.placement_list.currentRow()
+        name = overlay.placements[row].name
+        if QMessageBox.question(
+                self, "Remove Placement",
+                f"Remove {name}, including its tracking?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
+            return
+        overlay.remove_placement(row)
+        self.refresh_placement_list()
+        self.central_panel.refresh_display()
+        self.mark_dirty()
+
+    def rename_placement(self):
+        overlay = self.central_panel.tracking_overlay
+        row = self.placement_list.currentRow()
+        if row < 0:
+            return
+        name, ok = QInputDialog.getText(self, "Rename Placement", "Name:",
+                                        text=overlay.placements[row].name)
+        if ok and name.strip():
+            overlay.placements[row].name = name.strip()
+            self.refresh_placement_list()
+            self.mark_dirty()
+
+    def mark_dirty(self):
+        """Note that there is tracking work which is not on disk."""
+        if not self.dirty:
+            self.dirty = True
+            self.refresh_title()
+        if hasattr(self, "placement_list"):
+            self.refresh_placement_list()
+
+    def mark_clean(self):
+        self.dirty = False
+        self.refresh_title()
+
+    def refresh_title(self):
+        name = os.path.basename(getattr(self.central_panel, "current_video_path", "")
+                                or "")
+        parts = ["LUMEN"]
+        if name:
+            parts.append(name)
+        title = "  —  ".join(parts) + (" *" if self.dirty else "")
+        self.title_bar.title_label.setText(title)
+        self.setWindowTitle(title)
+
+    def confirm_discard(self, action: str) -> bool:
+        """Ask before throwing away tracking work. True means carry on.
+
+        Tracking a clip is the expensive part of using this tool, and it was
+        previously discarded without a word by loading another video, loading a
+        project, or closing the window.
+        """
+        if not self.dirty:
+            return True
+        reply = QMessageBox.warning(
+            self, "Unsaved Tracking",
+            f"You have tracking work that has not been saved.\n\n{action}",
+            QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel,
+            QMessageBox.Save)
+        if reply == QMessageBox.Cancel:
+            return False
+        if reply == QMessageBox.Save:
+            self.save_project()
+            return not self.dirty
+        return True
+
+    def closeEvent(self, event):
+        if self.confirm_discard("Close anyway?"):
+            event.accept()
+        else:
+            event.ignore()
 
     def _connect_signals(self):
         """Connects signals from child widgets to main window slots."""
@@ -2433,6 +3431,7 @@ class MainWindow(QMainWindow):
         self.left_col.brightnessClicked.connect(self.on_brightness_clicked)
         self.left_col.contrastClicked.connect(self.on_contrast_clicked)
         self.left_col.colouriseClicked.connect(self.on_colourise_clicked)
+        self.left_col.blendClicked.connect(self.open_blend_dialog)
         self.left_col.curveClicked.connect(self.toggle_curved_edges)
         self.left_col.clearClicked.connect(self.on_clear_clicked)
 
@@ -2493,7 +3492,7 @@ class MainWindow(QMainWindow):
         )
         if reply == QMessageBox.Yes:
             self.central_panel.tracking_overlay.reset()
-            self.central_panel.tracking_history.clear()
+            self.mark_dirty()
             QMessageBox.information(
                 self,
                 "Tracking Cleared",
@@ -2512,19 +3511,45 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Render Error", "No overlay has been inserted to render.")
             return
 
-        # Use dialogs to get render settings... (This part is the same as your old code)
-        total_frames = int(self.central_panel.cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        start_frame, ok1 = QInputDialog.getInt(self, "Render Range", "Enter start frame:", 0, 0, total_frames - 1)
-        if not ok1: return
-        end_frame, ok2 = QInputDialog.getInt(self, "Render Range", "Enter end frame:", total_frames - 1, start_frame, total_frames - 1)
-        if not ok2: return
-        scale_factor, ok3 = QInputDialog.getDouble(self, "Render Scale", "Enter scale factor (e.g., 0.5 for half resolution):", 1.0, 0.1, 1.0, 2)
-        if not ok3: return
-        out_path, _ = QFileDialog.getSaveFileName(self, "Save Rendered Video", "", "MP4 Files (*.mp4)")
-        if not out_path: return
+        panel = self.central_panel
+        total_frames = int(panel.cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        keys = sorted(overlay.tracking_history)
+        tracked_range = (keys[0], keys[-1])
+        video_size = (int(panel.cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
+                      int(panel.cap.get(cv2.CAP_PROP_FRAME_HEIGHT)))
+
+        base = os.path.splitext(os.path.basename(panel.current_video_path or "video"))[0]
+        creative = os.path.splitext(os.path.basename(
+            overlay.overlay_source_path or "creative"))[0]
+        directory = self.last_output_dir or os.path.dirname(
+            panel.current_video_path or "")
+        suggested = os.path.join(directory, f"{base}_{creative}.mp4")
+
+        dialog = RenderDialog(total_frames, tracked_range, video_size,
+                              panel.fps, suggested, parent=self)
+        if dialog.exec_() != QDialog.Accepted:
+            return
+        start_frame, end_frame, scale_factor, out_path = dialog.values()
+        if not out_path:
+            QMessageBox.warning(self, "Render Error", "Choose where to save the video.")
+            return
+        if end_frame < start_frame:
+            QMessageBox.warning(self, "Render Error",
+                                "The end frame is before the start frame.")
+            return
+        self.last_output_dir = os.path.dirname(out_path)
 
         settings = self.build_render_settings(start_frame, end_frame,
                                               scale_factor, out_path)
+        # Remember what was rendered so the AOI export can describe *this*
+        # file rather than the untouched source.
+        self.pending_render = {
+            "out_path": out_path, "start_frame": start_frame,
+            "end_frame": end_frame, "scale_factor": scale_factor,
+            "fps": panel.fps,
+            "width": int(video_size[0] * scale_factor),
+            "height": int(video_size[1] * scale_factor),
+        }
 
         # --- Threading Setup ---
         self.render_thread = QThread()
@@ -2579,6 +3604,10 @@ class MainWindow(QMainWindow):
             contrast=overlay.contrast,
             colourise=overlay.colourise_enabled,
             occlusion=panel.occlusion_enabled,
+            blend_settings=blend.BlendSettings.from_dict(overlay.blend.to_dict()),
+            placements=[PlacementSnapshot(p, scale_factor)
+                        for p in overlay.placements
+                        if p.is_ready()],
         )
 
     def on_render_finished(self, status):
@@ -2588,11 +3617,33 @@ class MainWindow(QMainWindow):
         self.render_thread.wait()
 
         if status.startswith("Completed"):
+            pending = self.pending_render or {}
+            out_path = pending.get("out_path")
+
+            # "Completed" used to be claimed even when no file was written.
+            if out_path and not os.path.exists(out_path):
+                QMessageBox.critical(
+                    self, "Render Failed",
+                    f"No file was written to:\n{out_path}\n\n"
+                    "See the log for details.")
+                self.pending_render = None
+                return
+
+            self.last_render = pending
             detail = status[len("Completed"):].strip(" ()")
-            message = "Video exported successfully."
+            frames = pending.get("end_frame", 0) - pending.get("start_frame", 0) + 1
+            message = (f"Exported {frames} frames to:\n{out_path}\n\n"
+                       f"{pending.get('width')}×{pending.get('height')}")
             if detail:
-                message += f"\n\n{detail[0].upper()}{detail[1:]}."
-            QMessageBox.information(self, "Render Complete", message)
+                # A caveat is a warning, not a success notice: the render may
+                # have gone out with no audio, no creative, or the ad painted
+                # over every pedestrian.
+                QMessageBox.warning(
+                    self, "Render Complete — with a caveat",
+                    f"{message}\n\n⚠  {detail[0].upper()}{detail[1:]}.")
+            else:
+                QMessageBox.information(self, "Render Complete", message)
+            self.pending_render = None
         elif status == "Canceled":
             QMessageBox.warning(self, "Render Canceled", "The rendering process was canceled.")
         else: # Error
@@ -2610,20 +3661,25 @@ class MainWindow(QMainWindow):
             "base_video": getattr(self.central_panel, "current_video_path", ""),
             "tracking_points": [list(p) for p in overlay.points],
             "tracking_history": core.history_to_lists(overlay.tracking_history),
+            "placements": [p.to_dict() for p in overlay.placements],
             "curvature": overlay.curvature.tolist(),
             "curved": overlay.curved_enabled,
             "brightness": overlay.brightness,
             "contrast": overlay.contrast,
             "colourise": overlay.colourise_enabled,
+            "blend": overlay.blend.to_dict(),
             "overlay_path": overlay.overlay_source_path,
             "overlay_is_video": overlay.inserted_overlay_is_video,
             "overlay_start_frame": overlay.inserted_overlay_start_frame,
         }
         with open(path, "w") as f:
             json.dump(data, f, indent=2)
+        self.mark_clean()
         QMessageBox.information(self, "Saved", f"Project saved to:\n{path}")
 
     def load_project(self):
+        if not self.confirm_discard("Loading a project will replace it."):
+            return
         path, _ = QFileDialog.getOpenFileName(self, "Load Project", "", "JSON Files (*.json)")
         if not path:
             return
@@ -2635,6 +3691,25 @@ class MainWindow(QMainWindow):
             self.central_panel.load_video(base_video)
 
         overlay = self.central_panel.tracking_overlay
+        if data.get("placements"):
+            for placement in overlay.placements:
+                placement.release()
+            overlay.placements = [Placement.from_dict(d) for d in data["placements"]]
+            overlay.active_index = 0
+            for placement in overlay.placements:
+                path_ = placement.overlay_source_path
+                if not path_ or not os.path.exists(path_):
+                    continue
+                if placement.inserted_overlay_is_video:
+                    placement.overlay_video_path = path_
+                else:
+                    try:
+                        placement.overlay_bgra = core.load_image_bgra(path_)
+                    except IOError:
+                        logging.warning("Missing creative for %s: %s",
+                                        placement.name, path_)
+            self.refresh_placement_list()
+
         history = {int(k): v for k, v in data.get("tracking_history", {}).items()}
         overlay.tracking_history = {k: [tuple(p) for p in v] for k, v in history.items()}
         self.central_panel.tracking_history = dict(overlay.tracking_history)
@@ -2645,6 +3720,7 @@ class MainWindow(QMainWindow):
         overlay.brightness = data.get("brightness", 0)
         overlay.contrast = data.get("contrast", 1.0)
         overlay.colourise_enabled = bool(data.get("colourise", False))
+        overlay.blend = blend.BlendSettings.from_dict(data.get("blend"))
 
         overlay_path = data.get("overlay_path")
         if overlay_path and os.path.exists(overlay_path):
@@ -2662,8 +3738,10 @@ class MainWindow(QMainWindow):
         points = overlay.tracking_history.get(current) or data.get("tracking_points", [])
         overlay.points = [tuple(p) for p in points]
         self.central_panel.reset_tracker()
+        self.central_panel.update_tracking_availability()
         self.central_panel.refresh_display()
         overlay.update()
+        self.mark_clean()
 
     def detect_from_reference(self):
         """Locate the insertion area from an uploaded picture of the target.
@@ -2678,13 +3756,17 @@ class MainWindow(QMainWindow):
             return
 
         ref_path, _ = QFileDialog.getOpenFileName(
-            self, "Select an image of the target", "",
-            "Images (*.png *.jpg *.jpeg *.bmp *.webp)")
+            self, "Select a picture or clip of the target", "",
+            "Images and video (*.png *.jpg *.jpeg *.bmp *.webp *.mp4 *.avi "
+            "*.mkv *.mov *.m4v);;Images (*.png *.jpg *.jpeg *.bmp *.webp);;"
+            "Video (*.mp4 *.avi *.mkv *.mov *.m4v)")
         if not ref_path:
             return
 
         try:
-            matcher = core.ReferenceMatcher(ref_path)
+            # A clip of the target carries several angles and exposures, so it
+            # is sampled into a handful of reference views rather than one.
+            matcher = core.open_reference(ref_path)
         except (IOError, ValueError) as exc:
             QMessageBox.warning(self, "Detect Error", str(exc))
             return
@@ -2701,15 +3783,26 @@ class MainWindow(QMainWindow):
             if progress.wasCanceled():
                 canceled["value"] = True
 
-        detection = None
+        detections = []
         try:
             # Try the frame on screen first; it is what the user is looking at.
             if panel.prev_frame is not None:
-                detection = matcher.locate(panel.prev_frame,
-                                           frame_index=panel.get_current_frame_index())
-            if detection is None and not canceled["value"]:
-                detection = matcher.scan_video(panel.current_video_path,
-                                               step=5, progress=report)
+                detections = matcher.locate_all(
+                    panel.prev_frame,
+                    frame_index=panel.get_current_frame_index())
+            if not detections and not canceled["value"]:
+                found = matcher.scan_video(panel.current_video_path,
+                                           step=5, progress=report)
+                if found is not None:
+                    # Re-examine that frame properly: the scan stops at the
+                    # first sighting, but the panel it found may not be alone.
+                    capture = cv2.VideoCapture(panel.current_video_path)
+                    capture.set(cv2.CAP_PROP_POS_FRAMES, found.frame_index or 0)
+                    ok, hit_frame = capture.read()
+                    capture.release()
+                    detections = (matcher.locate_all(
+                        hit_frame, frame_index=found.frame_index)
+                        if ok else [found])
         except (IOError, cv2.error) as exc:
             progress.close()
             QMessageBox.warning(self, "Detect Error", str(exc))
@@ -2718,7 +3811,7 @@ class MainWindow(QMainWindow):
 
         if canceled["value"]:
             return
-        if detection is None:
+        if not detections:
             QMessageBox.information(
                 self, "Not Found",
                 "Could not find that target in the video.\n\n"
@@ -2727,25 +3820,70 @@ class MainWindow(QMainWindow):
                 "just the target.")
             return
 
-        if detection.frame_index is not None and \
-                detection.frame_index != panel.get_current_frame_index():
-            panel.jump_to_frame(detection.frame_index)
+        # A reference that was a wide shot rather than a crop of the target
+        # matches confidently and returns the corners of the whole scene. Say
+        # so, rather than dropping a scene-sized quad on the user.
+        reference_frame = panel.prev_frame
+        if reference_frame is not None and detections:
+            coverage = core.frame_coverage(detections[0], reference_frame.shape)
+            if coverage > 0.5:
+                if QMessageBox.question(
+                        self, "Check the Reference",
+                        f"The match covers {coverage:.0%} of the picture, which "
+                        "usually means the reference was a wide shot rather "
+                        "than a crop of the target.\n\n"
+                        "Crop the image, or film the clip framed on the screen "
+                        "or billboard itself, and try again.\n\n"
+                        "Use this match anyway?",
+                        QMessageBox.Yes | QMessageBox.No,
+                        QMessageBox.No) != QMessageBox.Yes:
+                    return
+
+        chosen = detections
+        if len(detections) > 1:
+            dialog = MatchChoiceDialog(detections, parent=self)
+            if dialog.exec_() != QDialog.Accepted:
+                return
+            chosen = dialog.selected()
+            if not chosen:
+                return
+
+        frame_index = chosen[0].frame_index
+        if frame_index is not None and frame_index != panel.get_current_frame_index():
+            panel.jump_to_frame(frame_index)
 
         overlay = panel.tracking_overlay
-        overlay.points = [(float(x), float(y)) for x, y in detection.quad]
-        overlay.tracking_history[panel.get_current_frame_index()] = overlay.points[:]
-        panel.tracking_history[panel.get_current_frame_index()] = overlay.points[:]
-        panel.reset_tracker()
+        current = panel.get_current_frame_index()
+        created = []
+        for index, detection in enumerate(chosen):
+            # The first match fills the active placement if it is still blank,
+            # so the common single-target case does not leave an empty one
+            # behind; the rest each get their own.
+            if index == 0 and not overlay.active.points:
+                placement = overlay.active
+            else:
+                placement = overlay.add_placement()
+            placement.points = [(float(x), float(y)) for x, y in detection.quad]
+            placement.tracking_history[current] = placement.points[:]
+            placement.reset_tracker()
+            created.append(placement.name)
+
+        overlay.set_active(overlay.placements.index(
+            next(p for p in overlay.placements if p.name == created[0])))
         panel.enable_tracking_mode()
         panel.refresh_display()
         overlay.update()
+        self.refresh_placement_list()
+        self.mark_dirty()
 
+        summary = "\n".join(
+            f"  {name}: {d.n_inliers} matching features, {d.confidence:.0%} confidence"
+            for name, d in zip(created, chosen))
         QMessageBox.information(
             self, "Target Found",
-            f"Found on frame {detection.frame_index} "
-            f"({detection.n_inliers} matching features, "
-            f"{detection.confidence:.0%} confidence).\n\n"
-            "Adjust the corners if you need to, then turn tracking on.")
+            f"Found {len(chosen)} on frame {frame_index}:\n\n{summary}\n\n"
+            "Give each one a creative, adjust corners if needed, then turn "
+            "tracking on.")
 
     def toggle_digital_screen(self, enabled: bool):
         """Choose where the tracker looks for the features it follows.
@@ -2790,6 +3928,25 @@ class MainWindow(QMainWindow):
             panel.segmenter = None
         panel.refresh_display()
 
+    def open_blend_dialog(self):
+        """Tune how the creative is matched to the shot, with a live preview."""
+        panel = self.central_panel
+        if panel.prev_frame is None:
+            QMessageBox.warning(self, "Blend", "Load a base video first.")
+            return
+        overlay = panel.tracking_overlay
+        if not overlay.has_overlay() or len(overlay.points) != 4:
+            QMessageBox.warning(
+                self, "Blend",
+                "Mark the area and insert a creative first -- the match is "
+                "measured from the pixels the creative covers.")
+            return
+
+        dialog = BlendDialog(overlay.blend, panel.refresh_display, parent=self)
+        dialog.exec_()
+        panel.refresh_display()
+        self.mark_dirty()
+
     def toggle_curved_edges(self, enabled: bool):
         """Switch curved edges on or off for the insertion area."""
         overlay = self.central_panel.tracking_overlay
@@ -2815,6 +3972,8 @@ class MainWindow(QMainWindow):
 
     def load_tracking_points(self):
         import json
+        if not self.confirm_discard("Loading tracking points will replace it."):
+            return
         path, _ = QFileDialog.getOpenFileName(self, "Load Tracking", "", "JSON Files (*.json)")
         if not path:
             return
@@ -2841,22 +4000,85 @@ class MainWindow(QMainWindow):
 
         QMessageBox.information(self, "Loaded", f"Tracking loaded from:\n{path}")
 
+    def _write_aoi_file(self, path, placement, fps, video_w, video_h,
+                        first_frame, last_frame, scale) -> int:
+        """Write one placement's AOI geometry. Returns the row count."""
+        frame_dict = core.interpolate_tracking(placement.tracking_history,
+                                               first_frame, last_frame)
+        origin = first_frame if first_frame is not None else 0
+        rows = []
+        for frame_idx in sorted(frame_dict):
+            corners = frame_dict[frame_idx]
+            if not core.is_valid_quad(corners):
+                continue
+            scaled = [(float(x) * scale, float(y) * scale) for x, y in corners]
+            rows.append([
+                f"{(frame_idx - origin) / fps:.3f}",
+                f"{(frame_idx - origin + 1) / fps:.3f}",
+                "0; 0; 0", "0; 0; 0", "0; 0; 0", "0; 0; 0",
+                "None", "None", "None", "None", "0", "None", "None", "None",
+                ";".join(f"{v:.4f}" for point in scaled for v in point),
+            ])
+
+        with open(path, "w", newline="", encoding="utf-8") as handle:
+            writer = csv.writer(handle, delimiter=",")
+            writer.writerow([f"name:{placement.name}", "csv_type_3",
+                             "width:None", "height:None",
+                             f"stim_width:{video_w}", f"stim_height:{video_h}"])
+            writer.writerow([
+                "START", "END", "topleft_coords_XYZ_m", "topright_coords_XYZ_m",
+                "bottomleft_coords_XYZ_m", "bottomright_coords_XYZ_m",
+                "top_angle_deg", "left_angle_deg", "bottom_angle_deg",
+                "right_angle_deg", "average_dist_from_corners",
+                "disc_viewable_anagle", "disc_deflection_angle", "disc_diam",
+                "points"])
+            writer.writerows(rows)
+        return len(rows)
+
     def save_aoi_geometry(self):
         import csv
         if not self.central_panel.cap or not self.central_panel.cap.isOpened():
             QMessageBox.warning(self, "Export Error", "No base video is loaded.")
             return
 
+        # The CSV has to describe the *rendered* stimulus, not the source
+        # footage. The render starts at start_frame, may be scaled down, and
+        # covers only part of the clip; exporting absolute source times and
+        # full-resolution coordinates produced a file that parsed perfectly and
+        # was wrong in three independent ways, so every fixation would be
+        # mapped to the wrong place with no visible symptom.
+        render = self.last_render
+        if render:
+            fps = render["fps"] or 30
+            video_w, video_h = render["width"], render["height"]
+            first_frame, last_frame = render["start_frame"], render["end_frame"]
+            scale = render["scale_factor"]
+            default_name = os.path.splitext(
+                os.path.basename(render["out_path"]))[0] + "_aoi.csv"
+            default_dir = os.path.dirname(render["out_path"])
+        else:
+            reply = QMessageBox.question(
+                self, "No Render Yet",
+                "Nothing has been rendered in this session, so the AOI geometry "
+                "can only describe the full-length, full-resolution source "
+                "video.\n\nIf the stimulus you show participants is a trimmed or "
+                "scaled render, this CSV will not line up with it.\n\n"
+                "Export against the source anyway?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if reply != QMessageBox.Yes:
+                return
+            fps = self.central_panel.fps or 30
+            video_w = int(self.central_panel.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            video_h = int(self.central_panel.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            first_frame, last_frame, scale = None, None, 1.0
+            default_name = "aoi.csv"
+            default_dir = self.last_output_dir or ""
+
         save_path, _ = QFileDialog.getSaveFileName(
-            self, "Save AOI Geometry", "", "CSV Files (*.csv)"
-        )
+            self, "Save AOI Geometry", os.path.join(default_dir, default_name),
+            "CSV Files (*.csv)")
         if not save_path:
             return
-
-        # base video dims
-        video_w = int(self.central_panel.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        video_h = int(self.central_panel.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        fps = self.central_panel.fps or 30
 
         # Row 1 (optional)
         row1 = [
@@ -2887,6 +4109,27 @@ class MainWindow(QMainWindow):
             "points"
         ]
 
+        # One AOI file per placement: an eye-tracking analysis needs to tell
+        # the adverts apart, so they cannot share a single area of interest.
+        placements = [pl for pl in self.central_panel.tracking_overlay.placements
+                      if pl.enabled and pl.tracking_history]
+        if len(placements) > 1:
+            written = []
+            stem, ext = os.path.splitext(save_path)
+            for placement in placements:
+                safe = "".join(c if c.isalnum() or c in "-_ " else "_"
+                               for c in placement.name).strip().replace(" ", "_")
+                target = f"{stem}_{safe}{ext or '.csv'}"
+                rows = self._write_aoi_file(
+                    target, placement, fps, video_w, video_h,
+                    first_frame, last_frame, scale)
+                written.append(f"{os.path.basename(target)}  ({rows} frames)")
+            QMessageBox.information(
+                self, "Export Complete",
+                "AOI geometry written, one file per placement:\n\n"
+                + "\n".join(written))
+            return
+
         geometry_data = []
 
         # Interpolate exactly as the renderer does. Exporting only the frames
@@ -2896,25 +4139,29 @@ class MainWindow(QMainWindow):
         # time and fixation counts. It would also disagree with the rendered
         # video, which draws the ad on every frame in the range.
         frame_dict = core.interpolate_tracking(
-            self.central_panel.tracking_overlay.tracking_history)
+            self.central_panel.tracking_overlay.tracking_history,
+            first_frame, last_frame)
+
+        origin = first_frame if first_frame is not None else 0
+        skipped = 0
 
         # Sort the frame numbers so CSV rows are in ascending order
         for frame_idx in sorted(frame_dict.keys()):
             corners = frame_dict[frame_idx]
 
-            # For the START/END times:
-            start_time = frame_idx / fps
-            end_time   = (frame_idx + 1) / fps
+            # An unrenderable shape draws no advert, so it must not claim an
+            # area of interest either.
+            if not core.is_valid_quad(corners):
+                skipped += 1
+                continue
 
-            # Build the “points” string if we have 4 corners
-            if len(corners) == 4:
-                x0, y0 = corners[0]
-                x1, y1 = corners[1]
-                x2, y2 = corners[2]
-                x3, y3 = corners[3]
-                points_str = f"{x0:.4f};{y0:.4f};{x1:.4f};{y1:.4f};{x2:.4f};{y2:.4f};{x3:.4f};{y3:.4f}"
-            else:
-                points_str = ""
+            # Times are relative to the start of the rendered file.
+            start_time = (frame_idx - origin) / fps
+            end_time = (frame_idx - origin + 1) / fps
+
+            # Coordinates must be in the rendered file's pixel space.
+            scaled = [(float(x) * scale, float(y) * scale) for x, y in corners]
+            points_str = ";".join(f"{v:.4f}" for point in scaled for v in point)
 
             row_out = [
                 f"{start_time:.3f}",
@@ -2941,20 +4188,31 @@ class MainWindow(QMainWindow):
             writer.writerow(row2)
             writer.writerows(geometry_data)
 
-        QMessageBox.information(self, "Export Complete", f"AOI Geometry saved to {save_path}.")
+        if not geometry_data:
+            QMessageBox.warning(
+                self, "Nothing Exported",
+                "No usable tracking data, so an empty AOI file was written.\n\n"
+                "Track the area across the frames you intend to show before "
+                "exporting.")
+            return
 
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
-        if not self.isMaximized():
-            width = self.width()
-            height = int(width / self.aspect_ratio)
-            screen_geometry = QApplication.primaryScreen().availableGeometry()
-            if height > screen_geometry.height():
-                height = screen_geometry.height()
-                width = int(height * self.aspect_ratio)
-            self.resize(width, height)
+        detail = (f"{len(geometry_data)} frames, "
+                  f"{geometry_data[0][0]}s–{geometry_data[-1][1]}s, "
+                  f"{video_w}×{video_h}")
+        if render:
+            detail += f"\nMatched to: {os.path.basename(render['out_path'])}"
+        else:
+            detail += "\n\n⚠  Describes the full-resolution source video."
+        if skipped:
+            detail += f"\n{skipped} frame(s) skipped: the shape was unrenderable."
+
+        QMessageBox.information(self, "Export Complete",
+                                f"AOI geometry saved to:\n{save_path}\n\n{detail}")
+
 
     def upload_base_video(self):
+        if not self.confirm_discard("Loading another video will replace it."):
+            return
         file_path, _ = QFileDialog.getOpenFileName(
             self, "Select Base Video", "", "Video Files (*.mp4 *.avi *.mkv)"
         )
@@ -3020,11 +4278,16 @@ class MainWindow(QMainWindow):
         select_btn.setFixedSize(60, 25)
         select_btn.setCursor(QCursor(Qt.PointingHandCursor))
 
-        # Create an extension label for display.
-        ext_label = QLabel(file_path.split('.')[-1].upper())
-        ext_label.setStyleSheet("color: white; font-size: 12px;")
+        # Name the creative, not its file type. Labelling by extension meant an
+        # A/B/C test set showed as three identical cards reading "PNG".
+        name = os.path.basename(file_path)
+        ext_label = QLabel(name)
+        ext_label.setStyleSheet("color: white; font-size: 11px;")
         ext_label.setFixedHeight(25)
-        ext_label.setAlignment(Qt.AlignCenter)
+        ext_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        ext_label.setToolTip(file_path)
+        metrics = ext_label.fontMetrics()
+        ext_label.setText(metrics.elidedText(name, Qt.ElideMiddle, 118))
 
         # Add the buttons and label to the horizontal layout.
         button_layout.addWidget(remove_btn)

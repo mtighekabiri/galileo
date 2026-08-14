@@ -1103,6 +1103,38 @@ class Detection:
                 f"confidence={self.confidence:.2f}, inliers={self.n_inliers})")
 
 
+def _quads_overlap(a, b, threshold: float = 0.4) -> bool:
+    """True if two quads cover much the same ground."""
+    corners = np.vstack([as_quad(a), as_quad(b)])
+    offset = corners.min(axis=0)
+    size = np.ceil(corners.max(axis=0) - offset).astype(int) + 2
+    if size.min() <= 0:
+        return False
+    width, height = int(size[0]), int(size[1])
+    if width * height > 4_000_000:      # too big to rasterise; fall back
+        return False
+
+    mask_a = quad_to_mask(as_quad(a) - offset, width, height) > 0
+    mask_b = quad_to_mask(as_quad(b) - offset, width, height) > 0
+    intersection = float(np.count_nonzero(mask_a & mask_b))
+    smaller = float(min(np.count_nonzero(mask_a), np.count_nonzero(mask_b)))
+    if smaller <= 0:
+        return False
+    return intersection / smaller > threshold
+
+
+def _drop_overlapping(detections, threshold: float = 0.4) -> list:
+    """Keep the strongest of any detections describing the same panel."""
+    ordered = sorted(detections, key=lambda d: d.n_inliers, reverse=True)
+    kept = []
+    for detection in ordered:
+        if any(_quads_overlap(detection.quad, other.quad, threshold)
+               for other in kept):
+            continue
+        kept.append(detection)
+    return kept
+
+
 class ReferenceMatcher:
     """Find a picture of a target inside a video frame.
 
@@ -1181,51 +1213,119 @@ class ReferenceMatcher:
 
     # -- matching ----------------------------------------------------------
 
-    def locate(self, frame, frame_index: int = None) -> Detection:
-        """Find the reference in one frame, or return None."""
-        gray = self._gray(frame)
+    def _good_matches(self, gray):
+        """Ratio-tested matches between the reference and one frame."""
         keypoints, descriptors = self.detector.detectAndCompute(gray, None)
         if descriptors is None or len(keypoints) < 4:
-            return None
-
+            return [], []
         try:
             knn = self.matcher.knnMatch(self.descriptors, descriptors, k=2)
         except cv2.error:
-            return None
+            return [], []
 
         # Lowe's ratio test: keep a match only when the best candidate is
         # clearly better than the runner-up, which throws out the ambiguous
         # matches that repetitive texture generates.
         good = [m for pair in knn if len(pair) == 2
                 for m, n in [pair] if m.distance < self.ratio * n.distance]
-        if len(good) < max(4, self.min_inliers // 2):
-            return None
+        return good, keypoints
 
-        src = np.float32([self.keypoints[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
-        dst = np.float32([keypoints[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
+    def _fit(self, matches, keypoints, shape, frame_index=None,
+             min_inliers=None):
+        """Fit one homography to these matches. Returns (detection, inliers)."""
+        min_inliers = self.min_inliers if min_inliers is None else min_inliers
+        if len(matches) < max(4, min_inliers // 2):
+            return None, None
+
+        src = np.float32([self.keypoints[m.queryIdx].pt
+                          for m in matches]).reshape(-1, 1, 2)
+        dst = np.float32([keypoints[m.trainIdx].pt
+                          for m in matches]).reshape(-1, 1, 2)
 
         matrix, mask = cv2.findHomography(src, dst, cv2.RANSAC, self.ransac_threshold)
         if matrix is None or mask is None:
-            return None
+            return None, None
 
-        n_inliers = int(mask.sum())
-        if n_inliers < self.min_inliers:
-            return None
+        inliers = mask.ravel().astype(bool)
+        n_inliers = int(inliers.sum())
+        if n_inliers < min_inliers:
+            return None, None
 
         quad = cv2.perspectiveTransform(
             self.reference_corners.reshape(-1, 1, 2), matrix).reshape(4, 2)
         if not is_valid_quad(quad, min_area=16.0):
-            return None
+            return None, None
 
         # A homography fitted to noise loves to produce a sliver stretching
         # off the frame; require something plausibly on screen.
-        h, w = gray.shape[:2]
+        h, w = shape[:2]
         if quad_area(quad) > 4.0 * w * h:
-            return None
+            return None, None
 
-        confidence = n_inliers / float(len(good))
-        return Detection(quad.astype(np.float32), confidence, n_inliers,
-                         len(good), frame_index)
+        detection = Detection(quad.astype(np.float32),
+                              n_inliers / float(len(matches)),
+                              n_inliers, len(matches), frame_index)
+        return detection, inliers
+
+    def locate(self, frame, frame_index: int = None) -> Detection:
+        """Find the reference in one frame, or return None."""
+        gray = self._gray(frame)
+        matches, keypoints = self._good_matches(gray)
+        if not matches:
+            return None
+        detection, _ = self._fit(matches, keypoints, gray.shape, frame_index)
+        return detection
+
+    def locate_all(self, frame, max_results: int = 8, frame_index: int = None,
+                   min_inliers: int = None) -> list:
+        """Find *every* instance of the target in one frame.
+
+        A concourse often carries the same poster on several panels, and a
+        single homography can only describe one of them. This fits one, removes
+        the keypoints it consumed along with anything else lying inside the
+        quad it found, and fits again, until nothing further stands up. The
+        results come back strongest first.
+
+        The bar is set a little lower than for a single search, because the
+        further instances of a target are usually the smaller, more distant
+        ones and carry fewer keypoints. Measured on a frame holding the same
+        poster at three sizes, a threshold of 12 found two of them and 8 found
+        all three, with no false positives on unrelated footage or against a
+        different reference.
+        """
+        if min_inliers is None:
+            min_inliers = max(6, self.min_inliers * 2 // 3)
+
+        gray = self._gray(frame)
+        matches, keypoints = self._good_matches(gray)
+        if not matches:
+            return []
+
+        detections = []
+        remaining = list(matches)
+        while len(detections) < max_results:
+            detection, inliers = self._fit(remaining, keypoints, gray.shape,
+                                           frame_index, min_inliers=min_inliers)
+            if detection is None:
+                break
+            detections.append(detection)
+
+            polygon = detection.quad.astype(np.float32)
+            survivors = []
+            for index, match in enumerate(remaining):
+                if inliers is not None and index < len(inliers) and inliers[index]:
+                    continue        # consumed by the instance just found
+                point = keypoints[match.trainIdx].pt
+                if cv2.pointPolygonTest(polygon, (float(point[0]), float(point[1])),
+                                        False) >= 0:
+                    continue        # lies inside it, so belongs to it
+                survivors.append(match)
+
+            if len(survivors) == len(remaining):
+                break               # made no progress; stop rather than loop
+            remaining = survivors
+
+        return _drop_overlapping(detections)
 
     def scan_video(self, path: str, start: int = 0, max_frames: int = None,
                    step: int = 5, min_confidence: float = 0.3,
@@ -1409,6 +1509,141 @@ class PersonSegmenter:
         return mask
 
 
+VIDEO_SUFFIXES = (".mp4", ".avi", ".mkv", ".mov", ".m4v", ".webm")
+
+
+class VideoReferenceMatcher:
+    """Find a target described by a *clip* of it rather than a single still.
+
+    A short pan around a billboard carries far more than one photograph does:
+    several angles, several exposures, and a better chance that one of them
+    resembles the shot being searched. Frames are sampled across the clip, each
+    becomes its own matcher, and a search tries them all and keeps the strongest
+    result. Views too plain to match against are skipped rather than failing
+    the whole thing.
+
+    **The clip must be framed on the target**, in exactly the way a reference
+    photograph has to be cropped to it. Each sampled frame is taken to *be* the
+    target, so its whole rectangle is what gets mapped into the footage. Hand
+    over a wide shot in which the billboard occupies a corner and the match
+    will succeed while the returned quad describes the entire scene: on a test
+    clip where the poster filled about a tenth of the frame, the corners came
+    back 234 px from the panel despite 91 inliers and a confident fit.
+
+    :meth:`frame_coverage` reports how much of the base frame the result would
+    cover, which is how a caller can spot that mistake and say so.
+    """
+
+    def __init__(self, path: str, samples: int = 6, **matcher_kwargs):
+        frames = self._sample(path, samples)
+        if not frames:
+            raise IOError(f"Could not read any frames from: {path}")
+
+        self.views = []
+        problems = []
+        for index, frame in frames:
+            try:
+                matcher = ReferenceMatcher(frame, **matcher_kwargs)
+            except ValueError as exc:
+                problems.append(f"frame {index}: {exc}")
+                continue
+            self.views.append(matcher)
+
+        if not self.views:
+            raise ValueError(
+                "None of the sampled frames had enough detail to match "
+                "against. Try a clip that holds still on the target.\n"
+                + "\n".join(problems[:3]))
+
+        self.detector_name = self.views[0].detector_name
+        self.reference_path = path
+
+    @staticmethod
+    def _sample(path: str, samples: int):
+        """Take frames spread across the clip, skipping unreadable ones."""
+        capture = cv2.VideoCapture(path)
+        if not capture.isOpened():
+            raise IOError(f"Could not open the reference video: {path}")
+        try:
+            total = int(capture.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
+            if total <= 0:
+                # Some containers do not report a length; read what we can.
+                collected = []
+                while len(collected) < samples:
+                    ok, frame = capture.read()
+                    if not ok:
+                        break
+                    collected.append((len(collected), frame))
+                return collected
+
+            wanted = np.linspace(0, max(0, total - 1),
+                                 min(samples, total)).astype(int)
+            collected = []
+            for index in sorted(set(int(i) for i in wanted)):
+                capture.set(cv2.CAP_PROP_POS_FRAMES, index)
+                ok, frame = capture.read()
+                if ok:
+                    collected.append((index, frame))
+            return collected
+        finally:
+            capture.release()
+
+    def locate(self, frame, frame_index: int = None) -> Detection:
+        """The best sighting across every sampled view."""
+        best = None
+        for view in self.views:
+            detection = view.locate(frame, frame_index=frame_index)
+            if detection is not None and (best is None
+                                          or detection.n_inliers > best.n_inliers):
+                best = detection
+        return best
+
+    def locate_all(self, frame, max_results: int = 8,
+                   frame_index: int = None) -> list:
+        """Every instance found by any view, with duplicates removed."""
+        found = []
+        for view in self.views:
+            found.extend(view.locate_all(frame, max_results=max_results,
+                                         frame_index=frame_index))
+        return _drop_overlapping(found)[:max_results]
+
+    def scan_video(self, path: str, **kwargs) -> Detection:
+        """Search a video, taking the strongest hit any view produces."""
+        best = None
+        for view in self.views:
+            detection = view.scan_video(path, **kwargs)
+            if detection is not None and (best is None
+                                          or detection.n_inliers > best.n_inliers):
+                best = detection
+                if detection.confidence >= kwargs.get("min_confidence", 0.3):
+                    break
+        return best
+
+
+def frame_coverage(detection: Detection, frame_shape) -> float:
+    """What fraction of the frame a detection's quad covers.
+
+    A result covering most of the picture usually means the reference was a
+    wide shot rather than a crop of the target, so the quad describes the whole
+    scene instead of the thing to insert onto.
+    """
+    if detection is None:
+        return 0.0
+    height, width = frame_shape[:2]
+    if width <= 0 or height <= 0:
+        return 0.0
+    return float(quad_area(detection.quad) / (width * height))
+
+
+def open_reference(path: str, **kwargs):
+    """Build a matcher from either a picture of the target or a clip of it."""
+    if os.path.splitext(path)[1].lower() in VIDEO_SUFFIXES:
+        samples = kwargs.pop("samples", 6)
+        return VideoReferenceMatcher(path, samples=samples, **kwargs)
+    kwargs.pop("samples", None)
+    return ReferenceMatcher(path, **kwargs)
+
+
 # --------------------------------------------------------------------------
 # Tracking history
 # --------------------------------------------------------------------------
@@ -1484,6 +1719,148 @@ def find_binary(name: str) -> str:
 def has_ffmpeg() -> bool:
     """True if an ``ffmpeg`` binary is available."""
     return find_binary("ffmpeg") is not None
+
+
+class FrameWriter:
+    """Writes rendered frames to a video file, as well as it can.
+
+    OpenCV's VideoWriter is limited to whatever codecs its wheel was built
+    with, and in practice that means ``mp4v`` at a fixed, fairly low bitrate:
+    measured here at 34 dB PSNR, which is enough to wipe out exactly the
+    subtle work that makes an insert convincing. Added film grain fell from a
+    sigma of 2.0 to 0.45, and a flat creative suffers worst because it is cheap
+    to encode and gets quantised hardest, while the busy footage around it
+    keeps its texture. For a research stimulus that is the wrong trade.
+
+    When ffmpeg is available, frames are piped to it and encoded with x264 at a
+    visually-lossless CRF, and the source audio is muxed in the same pass. When
+    it is not, this falls back to VideoWriter and reports the fact, so the
+    render still succeeds and the caveat reaches the user.
+    """
+
+    def __init__(self, path: str, fps: float, size, crf: int = 17,
+                 audio_source: str = None, audio_start: float = 0.0,
+                 duration: float = None):
+        self.path = path
+        self.fps = float(fps) or 25.0
+        self.width, self.height = int(size[0]), int(size[1])
+        self.crf = int(crf)
+        self.audio_source = audio_source
+        self.audio_start = float(audio_start)
+        self.duration = duration
+
+        self.process = None
+        self.writer = None
+        self.caveats = []
+        self._frames = 0
+
+        if not self._start_ffmpeg():
+            self._start_opencv()
+
+    # -- back ends ---------------------------------------------------------
+
+    def _start_ffmpeg(self) -> bool:
+        ffmpeg = find_binary("ffmpeg")
+        if not ffmpeg:
+            self.caveats.append(
+                "encoded with OpenCV's built-in codec; install ffmpeg for "
+                "noticeably better quality and to keep the audio")
+            return False
+
+        cmd = [ffmpeg, "-y", "-loglevel", "error",
+               "-f", "rawvideo", "-pix_fmt", "bgr24",
+               "-s", f"{self.width}x{self.height}", "-r", f"{self.fps}",
+               "-i", "-"]
+
+        has_audio = bool(self.audio_source) and source_has_audio(self.audio_source)
+        if has_audio:
+            if self.audio_start:
+                cmd += ["-ss", f"{self.audio_start:.6f}"]
+            cmd += ["-i", self.audio_source]
+            if self.duration:
+                cmd += ["-t", f"{self.duration:.6f}"]
+
+        cmd += ["-map", "0:v:0"]
+        if has_audio:
+            cmd += ["-map", "1:a:0?", "-c:a", "aac", "-shortest"]
+        cmd += ["-c:v", "libx264", "-preset", "medium", "-crf", str(self.crf),
+                "-pix_fmt", "yuv420p", self.path]
+
+        try:
+            self.process = subprocess.Popen(
+                cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE)
+        except (OSError, subprocess.SubprocessError) as exc:
+            logger.warning("Could not start ffmpeg (%s); using OpenCV instead", exc)
+            self.process = None
+            self.caveats.append("ffmpeg could not be started, so the built-in "
+                                "codec was used")
+            return False
+
+        if not has_audio and self.audio_source:
+            self.caveats.append("the source has no audio track")
+        return True
+
+    def _start_opencv(self):
+        self.writer = cv2.VideoWriter(
+            self.path, cv2.VideoWriter_fourcc(*"mp4v"), self.fps,
+            (self.width, self.height))
+        if not self.writer.isOpened():
+            raise IOError(f"Could not open {self.path} for writing.")
+
+    # -- writing -----------------------------------------------------------
+
+    @property
+    def using_ffmpeg(self) -> bool:
+        return self.process is not None
+
+    def write(self, frame_bgr: np.ndarray) -> None:
+        if self.process is not None:
+            if self.process.poll() is not None:
+                raise IOError("ffmpeg stopped early: " + self._ffmpeg_error())
+            try:
+                self.process.stdin.write(np.ascontiguousarray(frame_bgr).tobytes())
+            except (BrokenPipeError, OSError) as exc:
+                raise IOError(f"ffmpeg stopped accepting frames: {exc}") from exc
+        else:
+            self.writer.write(frame_bgr)
+        self._frames += 1
+
+    def _ffmpeg_error(self) -> str:
+        try:
+            return (self.process.stderr.read() or b"").decode("utf-8", "replace").strip()
+        except (OSError, ValueError):
+            return "no error output"
+
+    def close(self) -> list:
+        """Finish the file and return any caveats worth telling the user."""
+        if self.process is not None:
+            try:
+                self.process.stdin.close()
+            except (OSError, ValueError):
+                pass
+            code = self.process.wait(timeout=600)
+            if code != 0:
+                self.caveats.append("ffmpeg reported an error while encoding")
+                logger.warning("ffmpeg failed: %s", self._ffmpeg_error())
+            self.process = None
+        elif self.writer is not None:
+            self.writer.release()
+            self.writer = None
+        return self.caveats
+
+    def abort(self) -> None:
+        """Give up without waiting, for a cancelled render."""
+        if self.process is not None:
+            try:
+                self.process.stdin.close()
+            except (OSError, ValueError):
+                pass
+            self.process.terminate()
+            self.process = None
+        elif self.writer is not None:
+            self.writer.release()
+            self.writer = None
 
 
 def remux_audio(video_path: str, source_path: str, out_path: str,
