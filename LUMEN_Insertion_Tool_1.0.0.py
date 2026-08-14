@@ -15,7 +15,8 @@ from PyQt5.QtWidgets import (
     QApplication, QWidget, QFrame, QVBoxLayout, QHBoxLayout, QInputDialog,
     QGraphicsDropShadowEffect, QPushButton, QLabel, QMainWindow,
     QSpacerItem, QSizePolicy, QSlider, QFileDialog, QMenu, QAction,
-    QStyle, QMessageBox, QGridLayout, QCheckBox, QDialog, QDialogButtonBox, QProgressDialog)
+    QStyle, QMessageBox, QGridLayout, QCheckBox, QDialog, QDialogButtonBox,
+    QProgressDialog, QScrollArea)
 from PyQt5.QtGui import (
     QCursor, QPixmap, QColor, QPainter, QBrush, QPen, QImage, QPolygonF)
 from PyQt5.QtMultimedia import QMediaPlayer, QMediaContent
@@ -231,7 +232,7 @@ class QSwitch(QWidget):
         painter.setRenderHint(QPainter.Antialiasing)
 
         # Draw the background
-        background_color = QColor("#00A000") if self._checked else QColor("#FF0000")
+        background_color = QColor("#00A000") if self._checked else QColor("#5A5A5A")
         painter.setBrush(background_color)
         painter.setPen(Qt.NoPen)
         painter.drawRoundedRect(self.rect(), 15, 15)
@@ -295,7 +296,11 @@ class IconWidget(QFrame):
         self.default_hover_color = "#333333"
         self.default_selected_color = "#555555"
 
-        if label_text in ["Draw", "Overlay"]:
+        # Latching modes get the bright fill so it is obvious which of them is
+        # currently changing what a click does. This keyed off "Overlay", which
+        # matches no icon, so Colourise and Curve were indicated at 2.3:1
+        # contrast against the panel.
+        if label_text in LeftColumn.STATEFUL_ICONS:
             self.selected_color = "#00A000"
         else:
             self.selected_color = self.default_selected_color
@@ -303,20 +308,23 @@ class IconWidget(QFrame):
         self.base_color = self.default_base_color
         self.hover_color = self.default_hover_color
 
-        self.setFixedSize(80, 100)
+        # 80x100 for eight tools needed 945px of column; a 1366x768 laptop has
+        # about 660, so the labels were clipped away and the toolbar became
+        # eight bare glyphs with no tooltips.
+        self.setFixedSize(78, 62)
         self.set_normal_style()
 
         self.layout = QVBoxLayout()
-        self.layout.setContentsMargins(5, 5, 5, 5)
-        self.layout.setSpacing(5)
+        self.layout.setContentsMargins(2, 4, 2, 4)
+        self.layout.setSpacing(1)
 
         self.icon_label = QLabel(icon_char)
         self.icon_label.setAlignment(Qt.AlignCenter)
-        self.icon_label.setStyleSheet("font-size: 24px; color: white;")
+        self.icon_label.setStyleSheet("font-size: 20px; color: white;")
 
         self.meaning_label = QLabel(label_text)
         self.meaning_label.setAlignment(Qt.AlignCenter)
-        self.meaning_label.setStyleSheet("font-size: 12px; color: #E0E0E0;")
+        self.meaning_label.setStyleSheet("font-size: 10px; color: #E0E0E0;")
 
         self.layout.addWidget(self.icon_label)
         self.layout.addWidget(self.meaning_label)
@@ -1263,26 +1271,50 @@ class LeftColumn(QWidget):
         layout.setContentsMargins(0, 20, 0, 20)
         layout.setSpacing(15)
 
+        # Emoji render inconsistently across Windows builds and several of
+        # these are hard to tell apart at 20px, so every tool carries a tooltip
+        # saying what it does. There were none anywhere on this toolbar.
         items = [
-            ("🖱", "Draw"),
-            ("📼", "Render"),
-            ("👀", "Frame"),
-            ("🌞", "Brightness"),
-            ("⛅", "Contrast"),
-            ("🎨", "Colourise"),
-            ("〰", "Curve"),
-            ("❌", "Clear"),
+            ("🖱", "Draw", "Click four corners to mark the area to fill.\n"
+                           "Drag a corner to adjust it."),
+            ("📼", "Render", "Export the video with the creative composited in."),
+            ("👀", "Frame", "Jump to a specific frame number."),
+            ("🌞", "Brightness", "Brighten or darken the inserted creative."),
+            ("⛅", "Contrast", "Raise or lower the creative's contrast."),
+            ("🎨", "Colourise", "Match the creative's colours to the surface\n"
+                                "it is covering."),
+            ("〰", "Curve", "Bend the edges of the area around a curved\n"
+                            "screen or pillar."),
+            ("❌", "Clear", "Remove the tracking from every frame."),
         ]
 
         self.icons = []
-        for (icon_char, text) in items:
+        for (icon_char, text, hint) in items:
             icon_widget = IconWidget(icon_char, text)
+            icon_widget.setToolTip(f"{text}\n\n{hint}")
             layout.addWidget(icon_widget, 0, Qt.AlignHCenter)
             icon_widget.mousePressEvent = self.make_icon_click_handler(icon_widget, icon_widget.mousePressEvent)
             self.icons.append(icon_widget)
 
         layout.addStretch()
-        self.setLayout(layout)
+
+        # Scroll rather than clip. If the column ever runs out of height again
+        # the failure is a scrollbar the user can act on, not tools that
+        # silently disappear off the bottom.
+        inner = QWidget()
+        inner.setStyleSheet("background-color: #1A1A1A;")
+        inner.setLayout(layout)
+
+        scroll = QScrollArea(self)
+        scroll.setWidget(inner)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setStyleSheet("QScrollArea { background-color: #1A1A1A; border: none; }")
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.addWidget(scroll)
         self.setFixedWidth(80)
 
     # Toggles that stand for a mode rather than a one-off action. Clearing
@@ -1376,27 +1408,48 @@ class CentralPanel(QWidget):
         self.segmenter = None
         self.occlusion_enabled = False
 
-        # 1) The container for video + overlay
+        # 1) The container for video + overlay.
+        #
+        # No layout manager here on purpose: layout_video_stage positions the
+        # label and the overlay by hand so the picture keeps its own aspect
+        # ratio. A layout would stretch it to fill, and judging whether an
+        # inserted advert looks convincing on a squashed image is not possible.
         self.video_container = QWidget(self)
-        self.video_layout = QGridLayout(self.video_container)
-        self.video_layout.setContentsMargins(0, 0, 0, 0)
-        self.video_layout.setSpacing(0)
+        self.video_container.setStyleSheet("background-color: #0D0D0D;")
 
         self.video_label = QLabel(self.video_container)
         self.video_label.setStyleSheet("background-color: black;")
         self.video_label.setScaledContents(True)
-        self.video_layout.addWidget(self.video_label, 0, 0)
+
+        # An empty black rectangle told a first-time user nothing at all. This
+        # sits over the stage until a video is loaded and then gets out of the
+        # way, naming the order of operations rather than leaving it to be
+        # discovered inside an unlabelled hamburger menu.
+        self.empty_state = QLabel(self.video_container)
+        self.empty_state.setAlignment(Qt.AlignCenter)
+        self.empty_state.setText(
+            "<div style='color:#E8E8E8; font-size:19px; font-weight:600;'>"
+            "Load a base video to begin</div>"
+            "<div style='color:#9A9A9A; font-size:13px; margin-top:14px;'>"
+            "Menu (☰) &rarr; Load &rarr; Base Video<br><br>"
+            "<span style='color:#7A7A7A;'>then</span><br><br>"
+            "1 &nbsp;Mark the screen or billboard &mdash; Draw, or "
+            "Find Target from Image<br>"
+            "2 &nbsp;Load a creative and press Insert<br>"
+            "3 &nbsp;Turn tracking on and play forward<br>"
+            "4 &nbsp;Render"
+            "</div>")
+        self.empty_state.setStyleSheet("background-color: #0D0D0D;")
 
         self.tracking_overlay = TrackingOverlay(self.video_container)
         self.tracking_overlay.setFocusPolicy(Qt.StrongFocus)
-        self.video_layout.addWidget(self.tracking_overlay, 0, 0)
         self.tracking_overlay.raise_()
         self.tracking_overlay.hide()
         self.tracking_overlay.shape_changed.connect(self.on_shape_changed)
         self.tracking_overlay.selection_changed.connect(self.update_magnifier)
 
         # Frame label
-        self.frame_label = QLabel("Frame: 0", self.video_container)
+        self.frame_label = QLabel("Frame: 0", self)
         self.frame_label.setStyleSheet("""
             QLabel {
                 color: white;
@@ -1413,10 +1466,10 @@ class CentralPanel(QWidget):
         self.switch.setToolTip("Toggle Tracking ON/OFF")
         self.switch.toggled.connect(self.on_tracking_toggled)
 
-        self.tracking_label = QLabel("Tracking Disabled", self.video_container)
+        self.tracking_label = QLabel("Tracking off", self)
         self.tracking_label.setStyleSheet("""
             QLabel {
-                color: red;
+                color: #BBBBBB;
                 font-size: 14px;
                 background-color: #1A1A1A;
                 padding: 5px;
@@ -1429,10 +1482,10 @@ class CentralPanel(QWidget):
         self.magnifier_switch.setToolTip("Toggle Magnifier ON/OFF")
         self.magnifier_switch.toggled.connect(self.on_magnifier_toggled)
 
-        self.magnifier_label = QLabel("Magnifier Off", self.video_container)
+        self.magnifier_label = QLabel("Magnifier off", self)
         self.magnifier_label.setStyleSheet("""
             QLabel {
-                color: red;
+                color: #BBBBBB;
                 font-size: 14px;
                 background-color: #1A1A1A;
                 padding: 5px;
@@ -1444,7 +1497,7 @@ class CentralPanel(QWidget):
         self.magnifier.hide()
 
         # Playback controls
-        self.controls_frame = QFrame(self.video_container)
+        self.controls_frame = QFrame(self)
         self.controls_frame.setStyleSheet("""
             QFrame {
                 background-color: #1A1A1A;
@@ -1527,11 +1580,32 @@ class CentralPanel(QWidget):
         controls_layout.addWidget(self.del_btn)
         self.controls_frame.setLayout(controls_layout)
 
-        # Final panel layout
+        # A status strip below the transport, holding what used to float on
+        # top of the picture.
+        self.status_bar = QFrame()
+        self.status_bar.setStyleSheet("background-color: #1A1A1A;")
+        self.status_bar.setFixedHeight(46)
+        status_layout = QHBoxLayout(self.status_bar)
+        status_layout.setContentsMargins(12, 4, 12, 4)
+        status_layout.setSpacing(12)
+        status_layout.addWidget(self.frame_label)
+        status_layout.addStretch(1)
+        status_layout.addWidget(self.tracking_label)
+        status_layout.addWidget(self.switch)
+        status_layout.addSpacing(16)
+        status_layout.addWidget(self.magnifier_label)
+        status_layout.addWidget(self.magnifier_switch)
+
+        # Final panel layout. The transport and the status strip are real rows,
+        # not free-floating children positioned against a phantom 16:9 box --
+        # which is how the playback bar came to sit a third of the way down the
+        # picture, across the very area being edited, stealing its clicks.
         self.main_layout = QVBoxLayout()
         self.main_layout.setContentsMargins(0, 0, 0, 0)
         self.main_layout.setSpacing(0)
         self.main_layout.addWidget(self.video_container, stretch=1)
+        self.main_layout.addWidget(self.controls_frame)
+        self.main_layout.addWidget(self.status_bar)
         self.setLayout(self.main_layout)
 
         # Timers
@@ -1687,7 +1761,7 @@ class CentralPanel(QWidget):
         self.tracking_label.setText("Tracking Disabled")
         self.tracking_label.setStyleSheet("""
             QLabel {
-                color: red;
+                color: #BBBBBB;
                 font-size: 14px;
                 background-color: #1A1A1A;
                 padding: 5px;
@@ -1846,43 +1920,57 @@ class CentralPanel(QWidget):
             self.frame_label.setText("Frame: 0")
             self.timestamp_label.setText("00:00 / 00:00")
 
+    def video_aspect(self) -> float:
+        """Width divided by height of the loaded video, 16:9 when none."""
+        if self.prev_frame is not None:
+            h, w = self.prev_frame.shape[:2]
+            if h > 0:
+                return w / float(h)
+        if self.cap and self.cap.isOpened():
+            w = self.cap.get(cv2.CAP_PROP_FRAME_WIDTH)
+            h = self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
+            if w and h:
+                return w / float(h)
+        return 16.0 / 9.0
+
+    def layout_video_stage(self):
+        """Letterbox the picture inside its container without distorting it.
+
+        The label and the overlay are given *identical* geometry, matching the
+        picture exactly. That is what keeps display_to_raw/raw_to_display
+        correct with no offset term: mouse positions arrive relative to the
+        overlay, whose origin is the picture's top-left corner, and whose size
+        is the picture's size. Scaling the pixmap inside a larger label instead
+        would silently break every click, every corner drag and the magnifier,
+        with no visible symptom until the export was wrong.
+        """
+        available_w = max(1, self.video_container.width())
+        available_h = max(1, self.video_container.height())
+        aspect = self.video_aspect()
+
+        width = available_w
+        height = int(round(width / aspect))
+        if height > available_h:
+            height = available_h
+            width = int(round(height * aspect))
+
+        x = (available_w - width) // 2
+        y = (available_h - height) // 2
+        for widget in (self.video_label, self.tracking_overlay):
+            widget.setGeometry(x, y, max(1, width), max(1, height))
+
+        self.empty_state.setGeometry(0, 0, available_w, available_h)
+        self.empty_state.setVisible(self.cap is None or not self.cap.isOpened())
+        self.empty_state.raise_()
+
+        self.magnifier.move(x + 10, y + 10)
+        self.magnifier.raise_()
+        self.tracking_overlay.raise_()
+
     def resizeEvent(self, event):
         super(CentralPanel, self).resizeEvent(event)
-        width = self.width()
-        height = int(width / 16 * 9)
-        if height > self.height():
-            height = self.height()
-            width = int(height * 16 / 9)
-
-        self.video_container.setGeometry(0, 0, width, height)
-        self.frame_label.move(10, 10)
-        self.frame_label.raise_()
-
-        switch_x = width - self.switch.width() - 20
-        switch_y = 10
-        self.switch.move(switch_x, switch_y)
-        self.switch.raise_()
-
-        label_w = self.tracking_label.sizeHint().width()
-        label_h = self.tracking_label.sizeHint().height()
-        self.tracking_label.move(switch_x - label_w - 10, switch_y + (self.switch.height() - label_h)//2)
-        self.tracking_label.raise_()
-
-        mag_label_y = switch_y + self.switch.height() + 10
-        self.magnifier_label.move(switch_x - label_w - 10, mag_label_y)
-        self.magnifier_label.raise_()
-
-        self.magnifier_switch.move(switch_x, mag_label_y)
-        self.magnifier_switch.raise_()
-
-        self.magnifier.move(10, 60)
-        self.magnifier.raise_()
-
-        controls_width = int(width*0.6)
-        controls_x = (width - controls_width)//2
-        controls_y = height - self.controls_frame.height() - 20
-        self.controls_frame.setGeometry(controls_x, controls_y, controls_width, self.controls_frame.height())
-        self.controls_frame.raise_()
+        self.main_layout.activate()
+        self.layout_video_stage()
 
     def update_tracking_availability(self):
         """Only offer tracking once there is a shape to track.
@@ -1911,7 +1999,7 @@ class CentralPanel(QWidget):
 
         self.tracking_mode = on
         if on:
-            self.tracking_label.setText("Tracking Enabled")
+            self.tracking_label.setText("Tracking on")
             self.tracking_label.setStyleSheet("""
                 QLabel {
                     color: limegreen;
@@ -1922,10 +2010,10 @@ class CentralPanel(QWidget):
                 }
             """)
         else:
-            self.tracking_label.setText("Tracking Disabled")
+            self.tracking_label.setText("Tracking off")
             self.tracking_label.setStyleSheet("""
                 QLabel {
-                    color: red;
+                    color: #BBBBBB;
                     font-size: 14px;
                     background-color: #1A1A1A;
                     padding: 5px;
@@ -2072,6 +2160,7 @@ class CentralPanel(QWidget):
         self.playing = False
         self.timer.stop()
         self.play_pause_btn.setIcon(self.style().standardIcon(QStyle.SP_MediaPlay))
+        self.layout_video_stage()   # the aspect ratio is only known now
         logging.debug(f"Loaded {file_path}, FPS={self.fps}")
 
         self.tracking_overlay.reset()
@@ -2100,7 +2189,7 @@ class CentralPanel(QWidget):
 
     def on_magnifier_toggled(self, on: bool):
         if on:
-            self.magnifier_label.setText("Magnifier On")
+            self.magnifier_label.setText("Magnifier on")
             self.magnifier_label.setStyleSheet("""
                 QLabel {
                     color: limegreen;
@@ -2113,10 +2202,10 @@ class CentralPanel(QWidget):
             self.magnifier.show()
             self.update_magnifier()
         else:
-            self.magnifier_label.setText("Magnifier Off")
+            self.magnifier_label.setText("Magnifier off")
             self.magnifier_label.setStyleSheet("""
                 QLabel {
-                    color: red;
+                    color: #BBBBBB;
                     font-size: 14px;
                     background-color: #1A1A1A;
                     padding: 5px;
@@ -2370,8 +2459,10 @@ class MainWindow(QMainWindow):
         self.setWindowFlags(Qt.FramelessWindowHint)
         self.setMouseTracking(True)
 
-        self.aspect_ratio = 19 / 9
-        self.setMinimumSize(1200, int(1200 / self.aspect_ratio))
+        # No forced aspect ratio: calling resize() from inside resizeEvent
+        # fought every attempt to size the window and pinned it to 19:9, an
+        # ultrawide shape none of the target laptops have.
+        self.setMinimumSize(1024, 640)
 
         main_widget = QWidget()
         main_widget.setStyleSheet("background-color: #D3D3D3;")
@@ -2434,6 +2525,7 @@ class MainWindow(QMainWindow):
 
         self.inserted_overlay_widget = None
         self.dirty = False
+        self.refresh_title()
 
     # -- unsaved work ------------------------------------------------------
 
@@ -3010,16 +3102,6 @@ class MainWindow(QMainWindow):
 
         QMessageBox.information(self, "Export Complete", f"AOI Geometry saved to {save_path}.")
 
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
-        if not self.isMaximized():
-            width = self.width()
-            height = int(width / self.aspect_ratio)
-            screen_geometry = QApplication.primaryScreen().availableGeometry()
-            if height > screen_geometry.height():
-                height = screen_geometry.height()
-                width = int(height * self.aspect_ratio)
-            self.resize(width, height)
 
     def upload_base_video(self):
         if not self.confirm_discard("Loading another video will replace it."):
@@ -3089,11 +3171,16 @@ class MainWindow(QMainWindow):
         select_btn.setFixedSize(60, 25)
         select_btn.setCursor(QCursor(Qt.PointingHandCursor))
 
-        # Create an extension label for display.
-        ext_label = QLabel(file_path.split('.')[-1].upper())
-        ext_label.setStyleSheet("color: white; font-size: 12px;")
+        # Name the creative, not its file type. Labelling by extension meant an
+        # A/B/C test set showed as three identical cards reading "PNG".
+        name = os.path.basename(file_path)
+        ext_label = QLabel(name)
+        ext_label.setStyleSheet("color: white; font-size: 11px;")
         ext_label.setFixedHeight(25)
-        ext_label.setAlignment(Qt.AlignCenter)
+        ext_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        ext_label.setToolTip(file_path)
+        metrics = ext_label.fontMetrics()
+        ext_label.setText(metrics.elidedText(name, Qt.ElideMiddle, 118))
 
         # Add the buttons and label to the horizontal layout.
         button_layout.addWidget(remove_btn)
