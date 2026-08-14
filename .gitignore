@@ -25,3 +25,9 @@ output/
 .vscode/
 .idea/
 .DS_Store
+
+# PyInstaller build output
+dist/
+build/
+.buildenv/
+*.zip

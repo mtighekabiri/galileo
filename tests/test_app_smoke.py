@@ -271,6 +271,70 @@ class TestPreviewMatchesRender:
         assert np.array_equal(preview, rendered)
 
 
+class TestAoiExport:
+    """The AOI CSV is what the eye-tracking analysis is run against."""
+
+    def _export(self, window, tmp_path, monkeypatch, history):
+        overlay = window.central_panel.tracking_overlay
+        overlay.tracking_history = history
+        out = str(tmp_path / "aoi.csv")
+        monkeypatch.setattr(lumen_app.QFileDialog, "getSaveFileName",
+                            staticmethod(lambda *a, **k: (out, "")))
+        monkeypatch.setattr(lumen_app.QMessageBox, "information",
+                            staticmethod(lambda *a, **k: None))
+        window.save_aoi_geometry()
+
+        import csv
+        with open(out, newline="") as handle:
+            rows = list(csv.reader(handle))
+        return rows[0], rows[1], rows[2:]
+
+    def test_gaps_are_filled_so_the_aoi_never_vanishes(self, loaded, tmp_path,
+                                                       monkeypatch):
+        """A hole in the AOI loses every fixation that lands in it."""
+        window, path, truth = loaded
+        sparse = {0: [tuple(map(float, p)) for p in truth[0]],
+                  9: [tuple(map(float, p)) for p in truth[9]]}
+        _, _, rows = self._export(window, tmp_path, monkeypatch, sparse)
+
+        # One row per frame across the tracked range, not just the two keys.
+        assert len(rows) == 10
+        assert all(row[-1] for row in rows), "a frame exported with no points"
+
+    def test_rows_are_contiguous_in_time(self, loaded, tmp_path, monkeypatch):
+        window, path, truth = loaded
+        sparse = {0: [tuple(map(float, p)) for p in truth[0]],
+                  5: [tuple(map(float, p)) for p in truth[5]]}
+        _, _, rows = self._export(window, tmp_path, monkeypatch, sparse)
+
+        ends = [float(r[1]) for r in rows]
+        starts = [float(r[0]) for r in rows]
+        for previous_end, next_start in zip(ends, starts[1:]):
+            assert next_start == pytest.approx(previous_end, abs=1e-6)
+
+    def test_points_track_the_moving_surface(self, loaded, tmp_path, monkeypatch):
+        window, path, truth = loaded
+        history = {i: [tuple(map(float, p)) for p in q]
+                   for i, q in enumerate(truth[:6])}
+        _, _, rows = self._export(window, tmp_path, monkeypatch, history)
+
+        first = [float(v) for v in rows[0][-1].split(";")]
+        last = [float(v) for v in rows[-1][-1].split(";")]
+        assert len(first) == 8
+        assert first != last, "AOI did not move with the surface"
+
+    def test_stimulus_dimensions_are_consistent(self, loaded, tmp_path, monkeypatch):
+        window, path, truth = loaded
+        header, _, _ = self._export(
+            window, tmp_path, monkeypatch,
+            {0: [tuple(map(float, p)) for p in truth[0]]})
+        stim = {k: v for k, v in (f.split(":", 1) for f in header if ":" in f)}
+        # Both were not formatted the same way before; a parser reading them as
+        # a matched pair would disagree about the frame size.
+        assert stim["stim_width"].isdigit()
+        assert stim["stim_height"].isdigit()
+
+
 class TestProjectRoundTrip:
     def test_project_saves_the_whole_history(self, loaded, tmp_path, monkeypatch):
         window, path, truth = loaded
