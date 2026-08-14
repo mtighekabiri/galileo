@@ -19,7 +19,7 @@ from PyQt5.QtWidgets import (
     QSpacerItem, QSizePolicy, QSlider, QFileDialog, QMenu, QAction,
     QStyle, QMessageBox, QGridLayout, QCheckBox, QDialog, QDialogButtonBox,
     QProgressDialog, QScrollArea, QSpinBox, QComboBox, QLineEdit,
-    QListWidget, QListWidgetItem)
+    QListWidget, QListWidgetItem, QWIDGETSIZE_MAX)
 from PyQt5.QtGui import (
     QCursor, QPixmap, QColor, QPainter, QBrush, QPen, QImage, QPolygonF)
 from PyQt5.QtMultimedia import QMediaPlayer, QMediaContent
@@ -710,12 +710,33 @@ class MagnifierWidget(QWidget):
     """
 
     #: Above this magnification, interpolating between source pixels hides the
-    #: very boundaries the user is trying to place a corner on.
-    CRISP_ABOVE = 6.0
+    #: very boundaries the user is trying to place a corner on. Four is where a
+    #: source pixel is first big enough to be told apart from its neighbour;
+    #: below it smoothing is the better picture, since nobody is counting
+    #: pixels while looking for a handle.
+    CRISP_ABOVE = 4.0
     #: Above this, source pixels are big enough on screen to rule off.
     GRID_ABOVE = 12.0
 
     MIN_ZOOM, MAX_ZOOM = 2.0, 32.0
+
+    #: How many pixels of footage to show across the shorter side of a tile
+    #: when choosing the magnification for itself.
+    #:
+    #: Magnification cannot sensibly be a fixed number, because a tile is
+    #: anywhere from 50 to 500 pixels across depending on the size of the
+    #: widget and how many handles are in it. A fixed 8x put nine pixels of
+    #: footage in a default-sized tile: no context to align against, and
+    #: blocks so large the picture reads as mush. Holding the amount of
+    #: *footage* steady instead means a small tile stays legible and a large
+    #: one earns real magnification.
+    DEFAULT_SPAN = 28.0
+
+    #: Asks the panel to fill the video stage with this widget, or to put it
+    #: back. Twelve handles in a floating box a couple of hundred pixels wide
+    #: leaves each one smaller than the thumbnail it replaced, which is worse
+    #: than the four quadrants ever were.
+    expandToggled = pyqtSignal(bool)
 
     def __init__(self, parent=None):
         super(MagnifierWidget, self).__init__(parent)
@@ -731,6 +752,9 @@ class MagnifierWidget(QWidget):
         self.region = None
 
         self.zoom_factor = 8.0
+        #: Let each tile pick its own magnification from its size. Scrolling
+        #: sets a fixed one instead.
+        self.auto_zoom = True
         # Kept for callers that still pass it; the view is centred exactly on
         # the point now, so there is no ROI to pad.
         self.buffer = 10
@@ -745,6 +769,10 @@ class MagnifierWidget(QWidget):
         self.resizing = False
         self.last_mouse_pos = None
         self.resize_handle_size = 20  # size of the "corner handle"
+        self._grip_lit = False        # brighten it while the mouse is over it
+        #: Filling the video stage rather than floating over a corner of it.
+        self.expanded = False
+        self._expand_lit = False
         # Set here as well as on the first manual resize: update_magnifier_dimensions
         # reads it as soon as a second corner exists, which is long before the
         # user has had any reason to drag the magnifier.
@@ -793,6 +821,7 @@ class MagnifierWidget(QWidget):
         if zoom_factor is not None:
             self.zoom_factor = float(np.clip(zoom_factor, self.MIN_ZOOM,
                                              self.MAX_ZOOM))
+            self.auto_zoom = False       # an explicit number means fix it
         if buffer is not None:
             self.buffer = buffer
         if selected_index is not None:
@@ -809,20 +838,64 @@ class MagnifierWidget(QWidget):
         handle and placing it."""
         steps = event.angleDelta().y() / 120.0
         if steps:
-            self.zoom_factor = float(np.clip(self.zoom_factor * (1.25 ** steps),
+            # Start from whatever is on screen, so the first notch nudges the
+            # current view rather than jumping to some remembered number.
+            tiles = self.tiles()
+            current = self.zoom_for(tiles[0][0]) if tiles else self.zoom_factor
+            self.auto_zoom = False
+            self.zoom_factor = float(np.clip(current * (1.25 ** steps),
                                              self.MIN_ZOOM, self.MAX_ZOOM))
             self.update()
             event.accept()
             return
         super(MagnifierWidget, self).wheelEvent(event)
 
+    def zoom_badge_rect(self) -> QRect:
+        """Where the magnification is shown. Clicking it hands the choice back
+        to the tiles, which is the only way out of a zoom scrolled somewhere
+        unhelpful without guessing at the number it started from."""
+        return QRect(6, self.height() - 20, 46, 15)
+
+    def expand_button_rect(self) -> QRect:
+        """Where the fill-the-stage button sits."""
+        return QRect(self.width() - 27, 5, 22, 22)
+
+    def set_expanded(self, expanded: bool):
+        if expanded == self.expanded:
+            return
+        self.expanded = bool(expanded)
+        self.expandToggled.emit(self.expanded)
+        self.update()
+
+    def mouseDoubleClickEvent(self, event):
+        """Double-click anywhere as well, since the button is small."""
+        if event.button() == Qt.LeftButton and not self.over_grip(event.x(),
+                                                                  event.y()):
+            self.set_expanded(not self.expanded)
+            event.accept()
+            return
+        super(MagnifierWidget, self).mouseDoubleClickEvent(event)
+
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
-            if (event.x() >= self.width() - self.resize_handle_size and
-                event.y() >= self.height() - self.resize_handle_size):
+            if self.expand_button_rect().contains(event.pos()):
+                self.set_expanded(not self.expanded)
+                event.accept()
+                return
+            if not self.auto_zoom and self.zoom_badge_rect().contains(event.pos()):
+                self.auto_zoom = True
+                self.update()
+                event.accept()
+                return
+            if self.over_grip(event.x(), event.y()):
                 self.resizing = True
                 self.last_mouse_pos = event.globalPos()
                 self.user_resized = True   # This flag disables auto-resizing
+                # Whatever pinned the size, a drag on the grip has to be able
+                # to change it. Anything that fixes the size leaves the maximum
+                # equal to the minimum, and then resize() below does nothing at
+                # all -- no error, no movement, just a handle that seems dead.
+                self.setMaximumSize(QWIDGETSIZE_MAX, QWIDGETSIZE_MAX)
                 event.accept()
                 return
         super(MagnifierWidget, self).mousePressEvent(event)
@@ -838,13 +911,29 @@ class MagnifierWidget(QWidget):
             event.accept()
             return
         else:
-            # Change mouse cursor if near bottom-right corner
-            if (event.x() >= self.width() - self.resize_handle_size
-                and event.y() >= self.height() - self.resize_handle_size):
+            over_grip = self.over_grip(event.x(), event.y())
+            over_expand = self.expand_button_rect().contains(event.pos())
+            if over_expand:
+                self.setCursor(Qt.PointingHandCursor)
+            elif over_grip:
                 self.setCursor(Qt.SizeFDiagCursor)
             else:
                 self.setCursor(Qt.ArrowCursor)
+            if (over_grip, over_expand) != (self._grip_lit, self._expand_lit):
+                self._grip_lit, self._expand_lit = over_grip, over_expand
+                self.update()
         super(MagnifierWidget, self).mouseMoveEvent(event)
+
+    def leaveEvent(self, event):
+        if self._grip_lit or self._expand_lit:
+            self._grip_lit = self._expand_lit = False
+            self.update()
+        super(MagnifierWidget, self).leaveEvent(event)
+
+    def over_grip(self, x, y) -> bool:
+        """Whether this position is on the corner that resizes the widget."""
+        return (x >= self.width() - self.resize_handle_size
+                and y >= self.height() - self.resize_handle_size)
 
     def mouseReleaseEvent(self, event):
         if self.resizing:
@@ -912,6 +1001,14 @@ class MagnifierWidget(QWidget):
             return [0, 1, 3, 2]
         return list(range(len(self.points)))
 
+    def zoom_for(self, rect) -> float:
+        """The magnification this tile should use."""
+        if not self.auto_zoom:
+            return self.zoom_factor
+        shorter = max(1, min(rect.width(), rect.height()))
+        return float(np.clip(shorter / self.DEFAULT_SPAN,
+                             self.MIN_ZOOM, self.MAX_ZOOM))
+
     def tile_mapping(self, rect, point):
         """``(scale, offset_x, offset_y)`` taking frame coordinates to widget
         ones inside this tile, so that ``widget = frame * scale + offset``.
@@ -921,7 +1018,7 @@ class MagnifierWidget(QWidget):
         what guarantees they agree: the handle lands exactly at the centre of
         its tile for every handle, including ones outside the frame entirely.
         """
-        zoom = self.zoom_factor
+        zoom = self.zoom_for(rect)
         return (zoom,
                 rect.x() + rect.width() / 2.0 - point.x * zoom,
                 rect.y() + rect.height() / 2.0 - point.y * zoom)
@@ -942,6 +1039,9 @@ class MagnifierWidget(QWidget):
             painter.setPen(QPen(QColor(130, 130, 130)))
             painter.drawText(self.rect(), Qt.AlignCenter,
                              "Mark an area to magnify it")
+            # Still offer the button: expanding and then clearing the shape
+            # would otherwise leave the stage covered with no way back.
+            self._draw_expand_button(painter)
             painter.end()
             return
 
@@ -953,6 +1053,8 @@ class MagnifierWidget(QWidget):
         painter.setPen(QPen(QColor(60, 60, 60), 1))
         painter.drawRect(0, 0, self.width() - 1, self.height() - 1)
         self._draw_zoom_badge(painter)
+        self._draw_resize_grip(painter)
+        self._draw_expand_button(painter)
         painter.end()
 
     def _draw_tile(self, painter, rect, point, index):
@@ -961,7 +1063,7 @@ class MagnifierWidget(QWidget):
         painter.save()
         painter.setClipRect(rect)
 
-        zoom = self.zoom_factor
+        zoom = self.zoom_for(rect)
         # The view is centred exactly on the handle and never slid back inside
         # the frame. Clamping it used to leave the crosshair drawn at the
         # middle of the tile while the picture behind it had been shifted, so
@@ -1113,13 +1215,59 @@ class MagnifierWidget(QWidget):
     def _draw_zoom_badge(self, painter):
         if self.height() < 40:
             return
-        text = f"{self.zoom_factor:.0f}x"
-        box = QRect(self.width() - 46, self.height() - 20, 40, 15)
+        tiles = self.tiles()
+        zoom = self.zoom_for(tiles[0][0]) if tiles else self.zoom_factor
+        # Bottom left, out of the resize grip's way.
+        box = self.zoom_badge_rect()
         painter.setPen(Qt.NoPen)
         painter.setBrush(QBrush(QColor(0, 0, 0, 140)))
         painter.drawRect(box)
-        painter.setPen(QPen(QColor(190, 190, 190)))
-        painter.drawText(box, Qt.AlignCenter, text)
+        painter.setPen(QPen(QColor(150, 150, 150) if self.auto_zoom
+                            else QColor(210, 210, 210)))
+        painter.drawText(box, Qt.AlignCenter,
+                         f"{zoom:.0f}x" if self.auto_zoom else f"{zoom:.0f}x •")
+
+    def _draw_expand_button(self, painter):
+        """Arrows out to fill the stage, arrows in to put it back."""
+        box = self.expand_button_rect()
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QBrush(QColor(0, 0, 0, 190 if self._expand_lit else 140)))
+        painter.drawRect(box)
+
+        shade = QColor(245, 245, 245) if self._expand_lit else QColor(185, 185, 185)
+        painter.setPen(QPen(shade, 2))
+        painter.setBrush(Qt.NoBrush)
+        left, top = box.x() + 5, box.y() + 5
+        right, bottom = box.right() - 5, box.bottom() - 5
+        span = 4
+        if self.expanded:
+            # Pointing inwards: this will shrink it back.
+            painter.drawLine(left, top + span, left, top)
+            painter.drawLine(left, top, left + span, top)
+            painter.drawLine(right, bottom - span, right, bottom)
+            painter.drawLine(right, bottom, right - span, bottom)
+        else:
+            painter.drawLine(left, top, left + span, top)
+            painter.drawLine(left, top, left, top + span)
+            painter.drawLine(right, bottom, right - span, bottom)
+            painter.drawLine(right, bottom, right, bottom - span)
+        painter.drawLine(left + 1, top + 1, right - 1, bottom - 1)
+
+    def _draw_resize_grip(self, painter):
+        """The usual diagonal ribs in the corner.
+
+        The corner has always resized the widget, but nothing said so: there
+        was no mark of any kind, so the only way to find it was to already
+        know. Three ribs is what every other resizable corner looks like.
+        """
+        if self.expanded:
+            return          # it fills the stage; there is nothing to drag
+        painter.setBrush(Qt.NoBrush)
+        shade = QColor(235, 235, 235) if self._grip_lit else QColor(150, 150, 150)
+        painter.setPen(QPen(shade, 2))
+        right, bottom = self.width() - 4, self.height() - 4
+        for offset in (4, 9, 14):
+            painter.drawLine(right - offset, bottom, right, bottom - offset)
 
 class Placement:
     """One insertion: an area tracked through the clip, and what goes in it.
@@ -1545,6 +1693,7 @@ class TrackingOverlay(QWidget):
         if mw and mw.central_panel:
             # The shape is now valid, so tracking becomes available.
             mw.central_panel.update_tracking_availability()
+            mw.check_for_a_playing_screen()
 
     def get_main_window(self):
         w = self.parentWidget()
@@ -2298,6 +2447,8 @@ class CentralPanel(QWidget):
         self.magnifier_label.show()
         self.magnifier = MagnifierWidget(self.video_container)
         self.magnifier.hide()
+        self._magnifier_geometry = None
+        self.magnifier.expandToggled.connect(self.on_magnifier_expanded)
 
         # Playback controls
         self.controls_frame = QFrame(self)
@@ -2799,7 +2950,10 @@ class CentralPanel(QWidget):
         self.empty_state.setVisible(self.cap is None or not self.cap.isOpened())
         self.empty_state.raise_()
 
-        self.magnifier.move(x + 10, y + 10)
+        if self.magnifier.expanded:
+            self.magnifier.setGeometry(x, y, max(1, width), max(1, height))
+        else:
+            self.magnifier.move(x + 10, y + 10)
         self.magnifier.raise_()
         self.tracking_overlay.raise_()
 
@@ -2963,12 +3117,32 @@ class CentralPanel(QWidget):
         for placement in self.tracking_overlay.placements:
             placement.reset_tracker()
 
+    def on_magnifier_expanded(self, expanded: bool):
+        """Fill the video stage with the magnifier, or put it back.
+
+        Twelve handles in a floating box a couple of hundred pixels wide gives
+        each one less room than the four quadrants had, which is worse than
+        what it replaced. Filling the stage is what makes the crowded layouts
+        usable, so the size it had before is remembered and restored.
+        """
+        magnifier = self.magnifier
+        if expanded:
+            self._magnifier_geometry = magnifier.geometry()
+            magnifier.setMaximumSize(QWIDGETSIZE_MAX, QWIDGETSIZE_MAX)
+        elif getattr(self, "_magnifier_geometry", None) is not None:
+            magnifier.setGeometry(self._magnifier_geometry)
+        self.layout_video_stage()
+        magnifier.raise_()
+        self.update_magnifier(force=True)
+
     def update_magnifier_dimensions(self):
         shape_pts = self.tracking_overlay.points
         if len(shape_pts) < 2:
             return
-        # Skip auto-resizing if the user has manually resized.
-        if self.magnifier.resizing or self.magnifier.user_resized:
+        # Skip auto-resizing if the user has manually resized, or if it is
+        # filling the stage and its size is not its own to choose.
+        if (self.magnifier.resizing or self.magnifier.user_resized
+                or self.magnifier.expanded):
             return
         xs = [p[0] for p in shape_pts]
         ys = [p[1] for p in shape_pts]
@@ -2996,7 +3170,11 @@ class CentralPanel(QWidget):
         if computed_h > current_h:
             new_h = computed_h
         if (new_w != current_w) or (new_h != current_h):
-            self.magnifier.setFixedSize(new_w, new_h)
+            # resize, not setFixedSize: the latter pins the minimum and maximum
+            # together, so the drag handle's own resize() silently did nothing
+            # and the magnifier could not be enlarged by hand from the moment
+            # it first sized itself -- which is as soon as two corners exist.
+            self.magnifier.resize(new_w, new_h)
 
     def set_magnifier_temporarily_visible(self, visible: bool):
         """Show the magnifier while a corner is being dragged.
@@ -4409,6 +4587,74 @@ class MainWindow(QMainWindow):
             f"Found {len(chosen)} on frame {frame_index}:\n\n{summary}\n\n"
             "Give each one a creative, adjust corners if needed, then turn "
             "tracking on.")
+
+    def read_ahead(self, count: int = 14):
+        """A short run of frames from where playback is, for inspection.
+
+        Read through a capture of its own so the one driving playback is left
+        exactly where the user left it.
+        """
+        panel = self.central_panel
+        path = getattr(panel, "current_video_path", None)
+        if not path:
+            return []
+        capture = cv2.VideoCapture(path)
+        if not capture.isOpened():
+            return []
+        try:
+            capture.set(cv2.CAP_PROP_POS_FRAMES, panel.get_current_frame_index())
+            frames = []
+            for _ in range(count):
+                ok, frame = capture.read()
+                if not ok:
+                    break
+                frames.append(frame)
+            return frames
+        finally:
+            capture.release()
+
+    def check_for_a_playing_screen(self):
+        """Warn if the area just marked is a screen showing its own picture.
+
+        This is the one mistake that ruins an export without ever looking like
+        a mistake: the tracker follows the advert being played instead of the
+        panel playing it, and ends hundreds of pixels off with barely a
+        complaint. The setting that avoids it has always been there, under
+        Options, but only helps someone who already knows to look for it.
+        """
+        panel = self.central_panel
+        overlay = panel.tracking_overlay
+        if (len(overlay.points) != 4
+                or panel.feature_source != core.PlanarTracker.INTERIOR):
+            return                      # nothing marked, or already switched
+
+        frames = self.read_ahead()
+        if len(frames) < 4:
+            return                      # too near the end of the clip to judge
+        quads = [overlay.points] * len(frames)
+        try:
+            verdict = core.looks_like_a_playing_screen(frames, quads)
+        except cv2.error as exc:        # never block marking an area over this
+            logging.debug("screen check skipped: %s", exc)
+            return
+
+        logging.debug("screen check: %r", verdict)
+        if not verdict.independent:
+            return
+
+        answer = QMessageBox.question(
+            self, "This Looks Like a Playing Screen",
+            "The picture inside the area you marked is moving independently "
+            "of the panel it is on, by up to "
+            f"{verdict.worst_gap:.0f} pixels a frame.\n\n"
+            "That is what a digital screen looks like: the advert it is "
+            "playing changes, so following the picture follows the advert "
+            "rather than the screen, and the insert wanders off the panel "
+            "without the tracking reporting anything wrong.\n\n"
+            "Track the bezel and wall around it instead?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
+        if answer == QMessageBox.Yes:
+            self.title_bar.digital_screen_action.setChecked(True)
 
     def toggle_digital_screen(self, enabled: bool):
         """Choose where the tracker looks for the features it follows.

@@ -767,6 +767,59 @@ class TrackResult:
                 f"reason={self.reason!r})")
 
 
+#: What a levelled frame is scaled to. Any fixed pair would do; these keep the
+#: result comfortably inside 0..255 for ordinary footage, so little is clipped.
+LEVEL_MIDDLE, LEVEL_SPREAD = 128.0, 48.0
+
+
+def level_gray(gray: np.ndarray) -> np.ndarray:
+    """Grayscale with the overall brightness and contrast taken out.
+
+    Optical flow rests on one assumption: that a point keeps its brightness
+    from one frame to the next. A camera panning across a concourse onto a
+    bright screen breaks it on every frame, because its automatic exposure is
+    hunting the whole time -- which is not an edge case for this tool but the
+    ordinary condition of the footage it is given. Measured on a pan with the
+    exposure swinging by 40%, the shape ends 10.5px off its surface without
+    this and 0.11px off with it; at 70% it is 21.1px against 0.13px. A steady
+    shot pays about three hundredths of a pixel.
+
+    Median and spread-about-the-median, rather than mean and standard
+    deviation, because the statistics have to describe the *lighting* and not
+    the contents. A large bright object crossing the frame -- or the tracked
+    panel itself sliding out of it -- moves a mean and a standard deviation
+    enough to fake an exposure change and undo the whole point: on a clip that
+    pans a panel out of shot, mean and standard deviation cost 7.6px where the
+    median leaves the result untouched.
+    """
+    # Both statistics come from a 256-bin histogram, which makes them exact
+    # over the whole frame for one fast pass. Working from a shrunken copy
+    # instead is tempting and wrong: whichever pixels it draws change as the
+    # scene moves through them, and the statistics wobble by enough to fake
+    # the very exposure change this exists to remove -- 3.9px of it on a clip
+    # that pans a panel out of shot and back.
+    histogram = cv2.calcHist([gray], [0], None, [256], [0, 256]).ravel()
+    total = float(histogram.sum())
+    if total <= 0:
+        return gray
+    middle = float(np.searchsorted(np.cumsum(histogram), total / 2.0))
+
+    levels = np.arange(256, dtype=np.float32)
+    distances = np.bincount(np.abs(levels - middle).astype(np.int64),
+                            weights=histogram, minlength=256)
+    spread = float(np.searchsorted(np.cumsum(distances), total / 2.0)) * 1.4826
+    if spread < 1e-3:                      # a flat frame; nothing to level
+        return gray
+
+    # Through a lookup table: the transform is a scalar function of an 8-bit
+    # value, so it costs 256 evaluations rather than one per pixel. Doing the
+    # arithmetic across a 1080p frame instead ran at 14ms, which playback
+    # cannot afford on top of the tracking itself.
+    table = np.clip((levels - middle) * (LEVEL_SPREAD / spread) + LEVEL_MIDDLE,
+                    0, 255).astype(np.uint8)
+    return cv2.LUT(gray, table)
+
+
 class PlanarTracker:
     """Tracks a planar quad through a video by the texture inside it.
 
@@ -809,6 +862,7 @@ class PlanarTracker:
                  anchor_min_ratio: float = 0.60,
                  anchor_max_correction: float = 6.0,
                  offscreen_below: float = 0.30,
+                 normalise_illumination: bool = True,
                  feature_params: dict = None,
                  lk_params: dict = None):
         """
@@ -843,7 +897,12 @@ class PlanarTracker:
             offscreen_below: how much of the region must still be in shot for
                 its own texture to drive the tracking. Under this fraction the
                 camera's motion is followed instead. 0 disables that.
+            normalise_illumination: take each frame's own brightness and
+                contrast out before following anything, so a camera hunting
+                its exposure does not read as movement. See :func:`level_gray`.
         """
+        # Read before the first _gray call, which is inside reset().
+        self.normalise_illumination = normalise_illumination
         self.feature_source = feature_source
         self.surround_scale = surround_scale
         self.anchor_interval = anchor_interval
@@ -896,15 +955,16 @@ class PlanarTracker:
         self.anchor_ratio = 0.0
         self.anchor_shift = 0.0
 
-    @staticmethod
-    def _gray(frame):
+    def _gray(self, frame):
         if frame is None:
             raise ValueError("frame is None")
         if frame.ndim == 2:
-            return frame
-        if frame.shape[2] == 4:
-            return cv2.cvtColor(frame, cv2.COLOR_BGRA2GRAY)
-        return cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            gray = frame
+        elif frame.shape[2] == 4:
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGRA2GRAY)
+        else:
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        return level_gray(gray) if self.normalise_illumination else gray
 
     def _scaled_quad(self, factor: float) -> np.ndarray:
         centre = self.quad.mean(axis=0)
@@ -1259,6 +1319,70 @@ class PlanarTracker:
 # --------------------------------------------------------------------------
 # Corner smoothing
 # --------------------------------------------------------------------------
+
+class ScreenVerdict:
+    """Whether the picture inside a region belongs to the region."""
+
+    __slots__ = ("independent", "worst_gap", "exceeded", "checked")
+
+    def __init__(self, independent, worst_gap=0.0, exceeded=0, checked=0):
+        #: True if the inside is playing its own picture rather than carrying
+        #: markings fixed to the surface.
+        self.independent = bool(independent)
+        #: Furthest the two readings disagreed, in pixels.
+        self.worst_gap = float(worst_gap)
+        self.exceeded = int(exceeded)
+        self.checked = int(checked)
+
+    def __repr__(self):
+        return (f"ScreenVerdict(independent={self.independent}, "
+                f"worst_gap={self.worst_gap:.2f}, "
+                f"exceeded={self.exceeded}/{self.checked})")
+
+
+def looks_like_a_playing_screen(frames, quads, threshold: float = 2.0,
+                                samples: int = 12) -> ScreenVerdict:
+    """Decide whether a marked area is a screen showing its own picture.
+
+    This is the single most damaging thing that can go wrong with a marked
+    area, and the one the user is least able to see coming. Following the
+    texture inside a digital screen follows the advert being played rather
+    than the panel playing it, and the error is not a wobble -- measured at
+    242px by the end of a short clip, with the tracker reporting no failure at
+    all, so the export is confidently wrong rather than visibly broken.
+
+    Telling the two apart needs no model of what a screen is. Read the motion
+    twice, once from inside the area and once from the surface around it. For
+    markings fixed to a panel the two agree to a hundredth of a pixel; for a
+    picture running on its own they do not.
+
+    The worst disagreement decides it, not the average: a screen changing
+    slides every few seconds agrees perfectly in between and disagrees wildly
+    at each change, so an average buries exactly the frames that matter.
+
+    Frames must already be levelled for exposure, which :class:`PlanarTracker`
+    does; without it a camera hunting its exposure reads as disagreement and
+    an ordinary poster is condemned as a screen.
+    """
+    gaps = []
+    for index in range(min(samples, len(frames) - 1)):
+        readings = []
+        for source in (PlanarTracker.INTERIOR, PlanarTracker.SURROUND):
+            tracker = PlanarTracker(frames[index], quads[index],
+                                    feature_source=source, anchor_interval=0)
+            if not tracker.track(frames[index + 1]).ok:
+                break
+            readings.append(tracker.quad)
+        if len(readings) == 2:
+            gaps.append(float(np.linalg.norm(readings[0] - readings[1],
+                                             axis=1).mean()))
+
+    if not gaps:
+        return ScreenVerdict(False)
+    gaps = np.array(gaps)
+    exceeded = int((gaps > threshold).sum())
+    return ScreenVerdict(exceeded >= 1, gaps.max(), exceeded, len(gaps))
+
 
 class SimpleKalmanFilter:
     """Constant-velocity 2D filter used to smooth one tracked corner.

@@ -23,7 +23,9 @@ import galileo_core as core
 
 pytest.importorskip("PyQt5.QtWidgets")
 
-from PyQt5.QtCore import QRect                                   # noqa: E402
+from PyQt5.QtCore import (QEvent, QPoint, QPointF, QRect,        # noqa: E402
+                          Qt)
+from PyQt5.QtGui import QMouseEvent, QWheelEvent                # noqa: E402
 from PyQt5.QtWidgets import QApplication                         # noqa: E402
 
 _spec = importlib.util.spec_from_file_location(
@@ -285,6 +287,242 @@ class TestOlderCallers:
     def test_the_buffer_argument_is_tolerated(self, magnifier):
         magnifier.setData(screen_frame(), CORNERS, buffer=25)
         assert len(magnifier.tiles()) == 4
+
+
+class TestHowMuchItMagnifies:
+    """A fixed magnification means wildly different things in a tile 50 pixels
+    across and one 500 across. At 8x a default-sized tile held nine pixels of
+    footage: nothing to align against, and blocks so large it read as mush."""
+
+    def span(self, magnifier):
+        """How much footage the first tile shows across its shorter side."""
+        rect, _ = magnifier.tiles()[0]
+        return min(rect.width(), rect.height()) / magnifier.zoom_for(rect)
+
+    def test_a_small_tile_still_shows_useful_context(self, magnifier):
+        magnifier.resize(150, 150)
+        magnifier.setData(screen_frame(), CORNERS)
+        assert self.span(magnifier) > 20
+
+    def test_the_same_footage_is_shown_whatever_the_size(self, magnifier):
+        spans = []
+        for size in ((150, 150), (320, 320), (700, 500)):
+            magnifier.resize(*size)
+            magnifier.setData(screen_frame(), CORNERS)
+            spans.append(self.span(magnifier))
+        assert max(spans) - min(spans) < 3, spans
+
+    def test_a_bigger_tile_earns_more_magnification(self, magnifier):
+        magnifier.resize(150, 150)
+        magnifier.setData(screen_frame(), CORNERS)
+        small = magnifier.zoom_for(magnifier.tiles()[0][0])
+        magnifier.resize(760, 560)
+        big = magnifier.zoom_for(magnifier.tiles()[0][0])
+        assert big > small * 3
+
+    def test_a_stage_sized_view_is_crisp_enough_to_count_pixels(self, magnifier):
+        magnifier.resize(940, 530)
+        magnifier.setData(screen_frame(), handle_points(curved_region()),
+                          region=curved_region())
+        assert magnifier.zoom_for(magnifier.tiles()[0][0]) >= magnifier.CRISP_ABOVE
+
+    def test_scrolling_takes_the_choice_over(self, magnifier):
+        magnifier.setData(screen_frame(), CORNERS)
+        assert magnifier.auto_zoom is True
+        magnifier.wheelEvent(QWheelEvent(
+            QPointF(60, 60), QPointF(60, 60), QPoint(0, 120), QPoint(0, 120),
+            Qt.NoButton, Qt.NoModifier, Qt.NoScrollPhase, False))
+        assert magnifier.auto_zoom is False
+        assert magnifier.zoom_factor > magnifier.zoom_for(magnifier.tiles()[0][0]) - 1
+
+    def test_an_explicit_zoom_is_kept(self, magnifier):
+        magnifier.setData(screen_frame(), CORNERS, zoom_factor=16)
+        assert magnifier.auto_zoom is False
+        assert magnifier.zoom_for(magnifier.tiles()[0][0]) == 16
+
+    def test_clicking_the_badge_hands_the_choice_back(self, magnifier):
+        """Otherwise a zoom scrolled somewhere unhelpful can only be undone by
+        guessing at the number it started from."""
+        magnifier.setData(screen_frame(), CORNERS, zoom_factor=30)
+        badge = magnifier.zoom_badge_rect().center()
+        magnifier.mousePressEvent(QMouseEvent(
+            QEvent.MouseButtonPress, badge, magnifier.mapToGlobal(badge),
+            Qt.LeftButton, Qt.LeftButton, Qt.NoModifier))
+        assert magnifier.auto_zoom is True
+
+
+class TestFillingTheStage:
+    """Twelve handles in a floating box a couple of hundred pixels wide leaves
+    each one smaller than the thumbnail it replaced."""
+
+    def test_it_starts_floating(self, magnifier):
+        assert magnifier.expanded is False
+
+    def test_the_button_toggles_it(self, magnifier):
+        magnifier.setData(screen_frame(), CORNERS)
+        centre = magnifier.expand_button_rect().center()
+        for expected in (True, False):
+            magnifier.mousePressEvent(QMouseEvent(
+                QEvent.MouseButtonPress, centre, magnifier.mapToGlobal(centre),
+                Qt.LeftButton, Qt.LeftButton, Qt.NoModifier))
+            assert magnifier.expanded is expected
+
+    def test_double_clicking_toggles_it_too(self, magnifier):
+        magnifier.setData(screen_frame(), CORNERS)
+        middle = QPoint(magnifier.width() // 2, magnifier.height() // 2)
+        magnifier.mouseDoubleClickEvent(QMouseEvent(
+            QEvent.MouseButtonDblClick, middle, magnifier.mapToGlobal(middle),
+            Qt.LeftButton, Qt.LeftButton, Qt.NoModifier))
+        assert magnifier.expanded is True
+
+    def test_a_double_click_on_the_grip_resizes_instead(self, magnifier):
+        """The grip is a drag target; toggling on it would fight the drag."""
+        magnifier.setData(screen_frame(), CORNERS)
+        corner = QPoint(magnifier.width() - 5, magnifier.height() - 5)
+        magnifier.mouseDoubleClickEvent(QMouseEvent(
+            QEvent.MouseButtonDblClick, corner, magnifier.mapToGlobal(corner),
+            Qt.LeftButton, Qt.LeftButton, Qt.NoModifier))
+        assert magnifier.expanded is False
+
+    def test_it_says_when_it_changes(self, magnifier):
+        seen = []
+        magnifier.expandToggled.connect(seen.append)
+        magnifier.set_expanded(True)
+        magnifier.set_expanded(True)      # no change, no repeat
+        magnifier.set_expanded(False)
+        assert seen == [True, False]
+
+    def test_the_button_is_offered_even_with_nothing_to_show(self, magnifier):
+        """Expanding and then clearing the shape would otherwise leave the
+        stage covered with no way back."""
+        magnifier.set_expanded(True)
+        magnifier.setData(None, [])
+        box = magnifier.expand_button_rect()
+        drawn = grab(magnifier)[box.y():box.bottom(), box.x():box.right()]
+        assert drawn.max() > 120
+
+    def test_the_panel_fills_the_stage_and_puts_it_back(self, qapp, clip_video):
+        path, truth = clip_video
+        window = galileo_app.MainWindow()
+        try:
+            window.resize(1280, 800)
+            panel = window.central_panel
+            panel.load_video(path)
+            panel.tracking_overlay.points = [tuple(map(float, p)) for p in truth[0]]
+            panel.layout_video_stage()
+            floating = panel.magnifier.geometry()
+
+            panel.magnifier.set_expanded(True)
+            assert panel.magnifier.geometry() == panel.tracking_overlay.geometry()
+
+            panel.magnifier.set_expanded(False)
+            assert panel.magnifier.geometry() == floating
+        finally:
+            window.dirty = False
+            window.close()
+
+    def test_a_relayout_keeps_it_filling_the_stage(self, qapp, clip_video):
+        """Anything that re-lays the video out must not drop it back into the
+        corner while it is meant to be filling the stage."""
+        path, truth = clip_video
+        window = galileo_app.MainWindow()
+        try:
+            window.resize(1280, 800)
+            panel = window.central_panel
+            panel.load_video(path)
+            panel.magnifier.set_expanded(True)
+            panel.layout_video_stage()
+            assert panel.magnifier.geometry() == panel.tracking_overlay.geometry()
+        finally:
+            window.dirty = False
+            window.close()
+
+    def test_the_panel_does_not_resize_it_while_it_fills_the_stage(self, qapp,
+                                                                   clip_video):
+        path, truth = clip_video
+        window = galileo_app.MainWindow()
+        try:
+            window.resize(1280, 800)
+            panel = window.central_panel
+            panel.load_video(path)
+            panel.tracking_overlay.points = [tuple(map(float, p)) for p in truth[0]]
+            panel.magnifier.set_expanded(True)
+            filled = panel.magnifier.geometry()
+            panel.update_magnifier_dimensions()
+            assert panel.magnifier.geometry() == filled
+        finally:
+            window.dirty = False
+            window.close()
+
+
+class TestDraggingItBigger:
+    """The corner has always resized it, but only until the panel sized it
+    once -- which happens as soon as two corners exist, so in practice the
+    handle was dead for the whole of a real session."""
+
+    def drag_the_corner(self, widget, dx, dy):
+        start = QPoint(widget.width() - 5, widget.height() - 5)
+        widget.mousePressEvent(QMouseEvent(
+            QEvent.MouseButtonPress, start, widget.mapToGlobal(start),
+            Qt.LeftButton, Qt.LeftButton, Qt.NoModifier))
+        end = start + QPoint(dx, dy)
+        widget.mouseMoveEvent(QMouseEvent(
+            QEvent.MouseMove, end, widget.mapToGlobal(end),
+            Qt.NoButton, Qt.LeftButton, Qt.NoModifier))
+        widget.mouseReleaseEvent(QMouseEvent(
+            QEvent.MouseButtonRelease, end, widget.mapToGlobal(end),
+            Qt.LeftButton, Qt.NoButton, Qt.NoModifier))
+        return widget.width(), widget.height()
+
+    def test_dragging_the_corner_makes_it_bigger(self, magnifier):
+        assert self.drag_the_corner(magnifier, 60, 40) == (380, 360)
+
+    def test_it_still_works_after_the_size_has_been_pinned(self, magnifier):
+        """setFixedSize leaves the maximum equal to the minimum, and then the
+        drag's own resize() does nothing at all -- no error, no movement, just
+        a handle that seems dead. Whatever pinned it, the grip must win."""
+        magnifier.setFixedSize(200, 150)
+        assert self.drag_the_corner(magnifier, 60, 60) == (260, 210)
+
+    def test_it_will_not_shrink_below_its_minimum(self, magnifier):
+        assert self.drag_the_corner(magnifier, -900, -900) == (150, 150)
+
+    def test_dragging_it_stops_the_panel_resizing_it_again(self, magnifier):
+        assert magnifier.user_resized is False
+        self.drag_the_corner(magnifier, 30, 30)
+        assert magnifier.user_resized is True
+
+    def test_a_click_away_from_the_corner_is_not_a_resize(self, magnifier):
+        press = QPoint(20, 20)
+        magnifier.mousePressEvent(QMouseEvent(
+            QEvent.MouseButtonPress, press, magnifier.mapToGlobal(press),
+            Qt.LeftButton, Qt.LeftButton, Qt.NoModifier))
+        assert magnifier.resizing is False
+        assert magnifier.user_resized is False
+
+    def test_the_corner_is_marked_so_it_can_be_found(self, magnifier):
+        """It had no mark of any kind, so the only way to find it was to
+        already know it was there."""
+        magnifier.setData(np.zeros((80, 80, 3), np.uint8), [(40.0, 40.0)])
+        corner = grab(magnifier)[-20:, -20:]
+        assert corner.max() > 120, "nothing is drawn in the resize corner"
+
+    def test_the_panels_auto_size_leaves_it_resizable(self, qapp, clip_video):
+        """The fault came in through the panel, so it is checked there too."""
+        path, truth = clip_video
+        window = galileo_app.MainWindow()
+        try:
+            window.central_panel.load_video(path)
+            overlay = window.central_panel.tracking_overlay
+            overlay.points = [tuple(map(float, p)) for p in truth[0]]
+            window.central_panel.update_magnifier_dimensions()
+            magnifier = window.central_panel.magnifier
+            assert magnifier.maximumWidth() > magnifier.minimumWidth()
+            before = magnifier.width()
+            assert self.drag_the_corner(magnifier, 50, 50)[0] == before + 50
+        finally:
+            window.dirty = False
+            window.close()
 
 
 class TestWiredIntoThePanel:
