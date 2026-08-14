@@ -222,15 +222,36 @@ def load_image_bgra(path: str) -> np.ndarray:
     return to_bgra(img)
 
 
+def _apply_occlusion(alpha: np.ndarray, occlusion, box) -> np.ndarray:
+    """Hold the insert back wherever something is in front of the surface.
+
+    ``occlusion`` is a frame-sized mask where 255 means "this pixel belongs to
+    something nearer than the surface". Scaling the creative's alpha by its
+    inverse is what lets a passer-by cross in front of the insert instead of
+    having it painted over them.
+    """
+    if occlusion is None:
+        return alpha
+    x0, y0, x1, y1 = box
+    patch = occlusion[y0:y1, x0:x1]
+    if patch.shape[:2] != alpha.shape[:2]:
+        patch = cv2.resize(patch, (alpha.shape[1], alpha.shape[0]),
+                           interpolation=cv2.INTER_LINEAR)
+    return alpha * (1.0 - patch.astype(np.float32) / 255.0)
+
+
 def composite_overlay(base_bgr: np.ndarray, overlay: np.ndarray, quad,
                       opacity: float = 1.0, feather: float = 0.0,
-                      in_place: bool = False) -> np.ndarray:
+                      in_place: bool = False, occlusion=None) -> np.ndarray:
     """Warp ``overlay`` into ``quad`` on ``base_bgr`` with real alpha blending.
 
     The creative's own alpha channel is honoured and multiplied by an
     anti-aliased quad mask, so transparent PNGs stay transparent and edges do
     not stair-step. Work is confined to the quad's bounding box, so cost
     scales with the size of the insert rather than the size of the frame.
+
+    Pass ``occlusion`` (a frame-sized mask, 255 where something is in front of
+    the surface) to have the insert render behind it.
 
     Returns the composited frame (a copy unless ``in_place`` is set).
     """
@@ -275,6 +296,7 @@ def composite_overlay(base_bgr: np.ndarray, overlay: np.ndarray, quad,
     alpha *= mask.astype(np.float32) / 255.0
     if opacity < 1.0:
         alpha *= float(max(0.0, opacity))
+    alpha = _apply_occlusion(alpha, occlusion, (x0, y0, x1, y1))
     if not alpha.any():
         return out
 
@@ -629,7 +651,7 @@ def _region_inverse(region: Region, points: np.ndarray,
 
 def composite_region(base_bgr: np.ndarray, overlay: np.ndarray, region: Region,
                      opacity: float = 1.0, feather: float = 0.0,
-                     in_place: bool = False) -> np.ndarray:
+                     in_place: bool = False, occlusion=None) -> np.ndarray:
     """Composite a creative into a :class:`Region`, curved edges included.
 
     Straight regions are handed to the plain homography path, which is both
@@ -638,7 +660,7 @@ def composite_region(base_bgr: np.ndarray, overlay: np.ndarray, region: Region,
     if region.is_straight():
         return composite_overlay(base_bgr, overlay, region.corners,
                                  opacity=opacity, feather=feather,
-                                 in_place=in_place)
+                                 in_place=in_place, occlusion=occlusion)
 
     if base_bgr is None or overlay is None:
         return base_bgr
@@ -692,6 +714,7 @@ def composite_region(base_bgr: np.ndarray, overlay: np.ndarray, region: Region,
     alpha *= mask.astype(np.float32) / 255.0
     if opacity < 1.0:
         alpha *= float(max(0.0, opacity))
+    alpha = _apply_occlusion(alpha, occlusion, (x0, y0, x1, y1))
     if not alpha.any():
         return out
 
@@ -752,6 +775,19 @@ class PlanarTracker:
     that RANSAC rejects, rather than a quarter of the total signal.
     """
 
+    #: Track the texture inside the region. Right for printed billboards,
+    #: posters and any surface whose own markings are fixed to it.
+    INTERIOR = "interior"
+    #: Track a band around the region instead. Necessary for a digital screen:
+    #: its picture changes and slides about independently of the panel, so
+    #: features detected on it follow the advert being played rather than the
+    #: screen playing it. The bezel, wall and fittings around it are what is
+    #: actually rigid.
+    SURROUND = "surround"
+    #: Both, and let RANSAC arbitrate. A reasonable hedge for a static screen,
+    #: but the interior points can outvote the surround if the picture moves.
+    BOTH = "both"
+
     def __init__(self, frame, quad,
                  fb_threshold: float = 1.0,
                  ransac_threshold: float = 3.0,
@@ -759,6 +795,8 @@ class PlanarTracker:
                  reseed_below: int = 40,
                  max_area_ratio: float = 1.8,
                  max_step_fraction: float = 0.25,
+                 feature_source: str = INTERIOR,
+                 surround_scale: float = 1.9,
                  feature_params: dict = None,
                  lk_params: dict = None):
         """
@@ -772,7 +810,12 @@ class PlanarTracker:
             max_area_ratio: reject a step that scales the quad more than this.
             max_step_fraction: reject a step moving a corner more than this
                 fraction of the frame diagonal.
+            feature_source: :attr:`INTERIOR`, :attr:`SURROUND` or :attr:`BOTH`.
+            surround_scale: how far the surround band reaches out, as a
+                multiple of the region's size about its centre.
         """
+        self.feature_source = feature_source
+        self.surround_scale = surround_scale
         self.fb_threshold = fb_threshold
         self.ransac_threshold = ransac_threshold
         self.min_features = min_features
@@ -807,18 +850,37 @@ class PlanarTracker:
             return cv2.cvtColor(frame, cv2.COLOR_BGRA2GRAY)
         return cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-    def _seed_features(self):
-        """Detect trackable features strictly inside the current quad."""
+    def _scaled_quad(self, factor: float) -> np.ndarray:
+        centre = self.quad.mean(axis=0)
+        return ((self.quad - centre) * factor + centre).astype(np.float32)
+
+    def _feature_mask(self) -> np.ndarray:
+        """Where to look for features, according to ``feature_source``."""
         h, w = self.prev_gray.shape[:2]
-        mask = quad_to_mask(self.quad, w, h)
 
-        # Pull the mask in from the boundary: features sitting on the edge of
-        # the region are usually on an occluding contour and track badly.
-        eroded = cv2.erode(mask, np.ones((5, 5), np.uint8))
-        if cv2.countNonZero(eroded) > 100:
-            mask = eroded
+        if self.feature_source in (self.INTERIOR, self.BOTH):
+            mask = quad_to_mask(self.quad, w, h)
+            # Pull in from the boundary: features sitting on the edge of the
+            # region are usually on an occluding contour and track badly.
+            eroded = cv2.erode(mask, np.ones((5, 5), np.uint8))
+            if cv2.countNonZero(eroded) > 100:
+                mask = eroded
+        else:
+            mask = np.zeros((h, w), np.uint8)
+
+        if self.feature_source in (self.SURROUND, self.BOTH):
+            band = quad_to_mask(self._scaled_quad(self.surround_scale), w, h)
+            # Punch out the region itself, plus a small margin, so the band
+            # holds only what surrounds it.
+            cv2.fillPoly(band, [self._scaled_quad(1.08).astype(np.int32)], 0)
+            mask = cv2.bitwise_or(mask, band)
+
         mask[mask > 0] = 255
+        return mask
 
+    def _seed_features(self):
+        """Detect trackable features in whichever area is rigid."""
+        mask = self._feature_mask()
         pts = cv2.goodFeaturesToTrack(self.prev_gray, mask=mask, **self.feature_params)
         self.features = pts if pts is not None else np.empty((0, 1, 2), np.float32)
 
@@ -1210,6 +1272,141 @@ class ReferenceMatcher:
             return best
         finally:
             cap.release()
+
+
+# --------------------------------------------------------------------------
+# Occlusion: letting people pass in front of the insert
+# --------------------------------------------------------------------------
+
+MODEL_DIR_NAME = "models"
+_MODEL_SEARCH_DIRS = []
+
+
+def register_model_dir(path: str) -> None:
+    """Add a directory to search for bundled model files."""
+    if path and os.path.isdir(path) and path not in _MODEL_SEARCH_DIRS:
+        _MODEL_SEARCH_DIRS.insert(0, path)
+
+
+def find_model(filename: str) -> str:
+    """Locate a model file beside the app, in ./models, or next to this file."""
+    candidates = list(_MODEL_SEARCH_DIRS)
+    here = os.path.dirname(os.path.abspath(__file__))
+    candidates += [os.path.join(here, MODEL_DIR_NAME), here, os.getcwd(),
+                   os.path.join(os.getcwd(), MODEL_DIR_NAME)]
+    for directory in candidates:
+        full = os.path.join(directory, filename)
+        if os.path.isfile(full):
+            return full
+    return None
+
+
+class PersonSegmenter:
+    """Finds the people in a frame, so an insert can be drawn behind them.
+
+    In the environments this tool is pointed at -- airports, malls, high
+    streets -- somebody is forever walking between the camera and the screen.
+    Painting the creative straight over them is the single most obvious tell
+    that a shot has been altered, which matters rather a lot when the footage
+    is a research stimulus.
+
+    Motion-based approaches cannot help here: a digital screen's own picture
+    also moves independently of the panel, so anything keyed on "this does not
+    move with the surface" flags the advert being replaced as though it were a
+    passer-by. Segmenting people directly sidesteps that.
+
+    Runs a PP-HumanSeg ONNX model through OpenCV's own DNN module, so no extra
+    runtime is needed and the model is a single 6 MB file. See fetch_model.py.
+    """
+
+    MODEL_FILENAME = "human_segmentation_pphumanseg_2023mar.onnx"
+    INPUT_SIZE = (192, 192)
+    PERSON_CHANNEL = 1
+
+    def __init__(self, model_path: str = None, threshold: float = 0.5,
+                 dilate: int = 3, feather: float = 2.0, pad: float = 0.35):
+        """
+        Args:
+            model_path: the ONNX file; discovered automatically when omitted.
+            threshold: probability above which a pixel counts as a person.
+            dilate: grow the mask by this many pixels, covering the soft
+                boundary the network leaves around hair and shoulders.
+            feather: blur the mask edge by this sigma so the insert does not
+                cut against a person with a hard, obviously-composited line.
+            pad: how far beyond the region to run the model, as a fraction of
+                the region's size.
+        """
+        path = model_path or find_model(self.MODEL_FILENAME)
+        if not path:
+            raise FileNotFoundError(
+                f"Could not find {self.MODEL_FILENAME}. Run fetch_model.py to "
+                "download it, or place it in a 'models' folder beside the "
+                "application.")
+        try:
+            self.net = cv2.dnn.readNetFromONNX(path)
+        except cv2.error as exc:
+            raise IOError(f"Could not load the segmentation model: {exc}") from exc
+
+        self.model_path = path
+        self.threshold = threshold
+        self.dilate = dilate
+        self.feather = feather
+        self.pad = pad
+
+    @classmethod
+    def is_available(cls) -> bool:
+        """True if the model file can be found."""
+        return find_model(cls.MODEL_FILENAME) is not None
+
+    def _infer(self, patch_bgr: np.ndarray) -> np.ndarray:
+        """Person probability for one patch, at the patch's own size."""
+        blob = cv2.dnn.blobFromImage(
+            patch_bgr, scalefactor=1 / 127.5, size=self.INPUT_SIZE,
+            mean=(127.5, 127.5, 127.5), swapRB=True)
+        self.net.setInput(blob)
+        output = self.net.forward()
+        probability = output[0, self.PERSON_CHANNEL]
+        return cv2.resize(probability, (patch_bgr.shape[1], patch_bgr.shape[0]),
+                          interpolation=cv2.INTER_LINEAR)
+
+    def mask(self, frame_bgr: np.ndarray, quad=None) -> np.ndarray:
+        """A frame-sized mask, 255 where a person is.
+
+        When ``quad`` is given the model is run on a padded crop around it
+        rather than the whole frame. The network's input is a fixed 192x192,
+        so cropping first is what keeps a distant pedestrian large enough to
+        be segmented at all in high-resolution footage.
+        """
+        height, width = frame_bgr.shape[:2]
+        mask = np.zeros((height, width), np.uint8)
+
+        if quad is not None:
+            corners = as_quad(quad)
+            centre = corners.mean(axis=0)
+            grown = (corners - centre) * (1.0 + 2.0 * self.pad) + centre
+            box = quad_bounds(grown, width, height, pad=0)
+            if box is None:
+                return mask
+        else:
+            box = (0, 0, width, height)
+
+        x0, y0, x1, y1 = box
+        patch = frame_bgr[y0:y1, x0:x1]
+        if patch.size == 0:
+            return mask
+
+        probability = self._infer(patch)
+        patch_mask = (probability > self.threshold).astype(np.uint8) * 255
+
+        if self.dilate > 0:
+            kernel = np.ones((self.dilate * 2 + 1,) * 2, np.uint8)
+            patch_mask = cv2.dilate(patch_mask, kernel)
+        if self.feather > 0:
+            ksize = max(3, int(self.feather * 4) | 1)
+            patch_mask = cv2.GaussianBlur(patch_mask, (ksize, ksize), self.feather)
+
+        mask[y0:y1, x0:x1] = patch_mask
+        return mask
 
 
 # --------------------------------------------------------------------------

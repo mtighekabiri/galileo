@@ -271,6 +271,79 @@ class TestPreviewMatchesRender:
         assert np.array_equal(preview, rendered)
 
 
+class TestScreenAndOcclusionToggles:
+    def test_digital_screen_switches_the_feature_source(self, loaded, monkeypatch):
+        window, path, truth = loaded
+        panel = window.central_panel
+        monkeypatch.setattr(lumen_app.QMessageBox, "information",
+                            staticmethod(lambda *a, **k: None))
+
+        assert panel.feature_source == core.PlanarTracker.INTERIOR
+        window.toggle_digital_screen(True)
+        assert panel.feature_source == core.PlanarTracker.SURROUND
+        window.toggle_digital_screen(False)
+        assert panel.feature_source == core.PlanarTracker.INTERIOR
+
+    def test_switching_mode_reanchors_the_tracker(self, loaded, monkeypatch):
+        window, path, truth = loaded
+        panel = window.central_panel
+        monkeypatch.setattr(lumen_app.QMessageBox, "information",
+                            staticmethod(lambda *a, **k: None))
+
+        panel.tracking_overlay.points = [tuple(map(float, p)) for p in truth[0]]
+        panel.tracking_mode = True
+        panel.read_frame()
+        assert panel.tracker is not None
+
+        window.toggle_digital_screen(True)
+        assert panel.tracker is None
+
+    def test_the_tracker_is_built_with_the_chosen_source(self, loaded, monkeypatch):
+        window, path, truth = loaded
+        panel = window.central_panel
+        monkeypatch.setattr(lumen_app.QMessageBox, "information",
+                            staticmethod(lambda *a, **k: None))
+        window.toggle_digital_screen(True)
+
+        panel.tracking_overlay.points = [tuple(map(float, p)) for p in truth[0]]
+        panel.tracking_mode = True
+        panel.read_frame()
+        assert panel.tracker.feature_source == core.PlanarTracker.SURROUND
+
+    def test_occlusion_off_produces_no_mask(self, loaded):
+        window, path, truth = loaded
+        panel = window.central_panel
+        assert panel.occlusion_enabled is False
+        assert panel.occlusion_mask(panel.prev_frame, truth[0]) is None
+
+    def test_occlusion_without_the_model_warns_and_stays_off(self, loaded, monkeypatch):
+        window, path, truth = loaded
+        monkeypatch.setattr(core.PersonSegmenter, "is_available",
+                            classmethod(lambda cls: False))
+        warned = []
+        monkeypatch.setattr(lumen_app.QMessageBox, "warning",
+                            staticmethod(lambda *a, **k: warned.append(a)))
+
+        window.toggle_occlusion(True)
+        assert warned, "no warning shown for the missing model"
+        assert window.central_panel.occlusion_enabled is False
+
+    def test_render_settings_carry_a_flag_not_a_net(self, loaded, logo_bgra,
+                                                    tmp_path):
+        """A cv2.dnn.Net cannot cross threads, so only a flag may travel."""
+        window, path, truth = loaded
+        overlay = window.central_panel.tracking_overlay
+        overlay.overlay_bgra = logo_bgra
+        overlay.tracking_history = {0: [tuple(map(float, p)) for p in truth[0]]}
+        window.central_panel.occlusion_enabled = True
+
+        settings = window.build_render_settings(0, 2, 1.0, str(tmp_path / "o.mp4"))
+        assert settings.occlusion is True
+        assert not hasattr(settings, "segmenter")
+        for value in vars(settings).values():
+            assert not isinstance(value, cv2.dnn.Net)
+
+
 class TestAoiExport:
     """The AOI CSV is what the eye-tracking analysis is run against."""
 

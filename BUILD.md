@@ -6,6 +6,17 @@ double-clicks `LUMEN.exe`. Nothing is installed, nothing touches the registry,
 and no administrator is involved. Python, PyQt5, OpenCV and NumPy all travel
 inside the folder.
 
+## Before you build
+
+```bash
+python fetch_model.py
+```
+
+Downloads the person-segmentation model (about 6 MB) into `models/`, which the
+spec then bundles so occlusion works for whoever receives the build. Skip it and
+everything else still works, but **Draw behind people** will be unavailable to
+them with no way to switch it on.
+
 ## Build it
 
 Build **on the operating system you are shipping to**. PyInstaller cannot
@@ -67,6 +78,15 @@ The app looks for `ffmpeg` **next to its own executable** before checking
 
 Renders then keep their audio, still with nothing installed. Without it,
 rendering succeeds and the completion message says the file is silent.
+
+## Occlusion in the packaged build
+
+`models/` is bundled into the application automatically when present at build
+time; the app finds it whether it was shipped inside the bundle or dropped into
+a `models` folder beside the executable afterwards.
+
+To check what a build picked up, look at the first lines of its log — they
+record whether the model and ffmpeg were found.
 
 ## Windows warnings on first run
 
