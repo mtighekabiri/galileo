@@ -2069,9 +2069,24 @@ def interpolate_tracking(history: dict, start: int = None, end: int = None) -> d
 
 
 def history_to_lists(history: dict) -> dict:
-    """Convert a history of arrays to JSON-serialisable nested lists."""
-    return {int(k): [[float(x), float(y)] for x, y in as_quad(v)]
-            for k, v in history.items() if v is not None and len(v) == 4}
+    """Convert a history of arrays to JSON-serialisable nested lists.
+
+    Deliberately *not* through :func:`as_quad`, which coerces to float32 for
+    the geometry to work in. Saving is not the place to lose precision the
+    caller took the trouble to have: a hand-nudged corner is held at full
+    precision in memory, and going out through float32 rounded it before it
+    ever reached the file. Writing what is actually there costs nothing and
+    makes saving and reloading exact.
+    """
+    out = {}
+    for key, value in history.items():
+        if value is None or len(value) != 4:
+            continue
+        quad = np.asarray(value, dtype=np.float64).reshape(-1, 2)
+        if quad.shape[0] != 4:
+            continue
+        out[int(key)] = [[float(x), float(y)] for x, y in quad]
+    return out
 
 
 # --------------------------------------------------------------------------

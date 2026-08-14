@@ -173,7 +173,11 @@ counts than either. Coasting through a dropout, which is what the filter is
 genuinely for, is unchanged.
 
 Results accumulate in `tracking_history`, a `{frame_index: [4 corners]}` map
-that drives both the preview and the render.
+that drives both the preview and the render. It saves and reloads **bit for
+bit** — corners, curvature and every per-placement setting come back exactly as
+they went in, and repeated save-edit-save cycles do not drift. Tracking a clip
+is the expensive part of using this tool, and a save that quietly rounds is the
+worst kind of fault: the file looks fine and nothing ever reports a problem.
 
 ### Footage whose brightness will not sit still
 
