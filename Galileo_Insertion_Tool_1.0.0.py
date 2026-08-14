@@ -2257,12 +2257,17 @@ class TitleBar(QWidget):
         self.title_label.setAlignment(Qt.AlignCenter)
         
         self.logo_label = QLabel()
-        try:
-            self.logo_label.setPixmap(QPixmap("logo.png").scaled(40, 40, Qt.KeepAspectRatio, Qt.SmoothTransformation))
-        except:
-            logging.warning("logo.png not found. Skipping logo display.")
+        # A missing file gives a null pixmap rather than raising, so the
+        # except this used to sit behind could never fire: every build without
+        # a logo.png beside it drew an empty gap where the fallback should be.
+        logo = QPixmap(os.path.join(resource_directory(), "logo.png"))
+        if logo.isNull():
+            logging.debug("no logo.png alongside the application")
             self.logo_label.setText("Logo")
             self.logo_label.setStyleSheet("color: white; font-size: 14px;")
+        else:
+            self.logo_label.setPixmap(logo.scaled(40, 40, Qt.KeepAspectRatio,
+                                                  Qt.SmoothTransformation))
         self.logo_label.setAlignment(Qt.AlignCenter)
         
         self.center_layout.addWidget(self.title_label)
@@ -3882,6 +3887,11 @@ class RenderWorker(QObject):
         """The main rendering loop."""
         settings = self.settings
         base_cap = overlay_cap = out_writer = None
+        # Bound before the try so the cleanup below can always run. It used to
+        # be assigned inside, where a failure opening the base video left the
+        # name unbound and the cleanup raised on its way out, hiding whatever
+        # had actually gone wrong.
+        placements = []
         try:
             base_cap = cv2.VideoCapture(settings.base_video_path)
             if not base_cap.isOpened():
@@ -3965,10 +3975,6 @@ class RenderWorker(QObject):
 
             base_cap.release()
             base_cap = None
-            for placement in placements:
-                if placement.capture is not None:
-                    placement.capture.release()
-                    placement.capture = None
 
             if self.is_canceled:
                 out_writer.abort()
@@ -3991,6 +3997,15 @@ class RenderWorker(QObject):
             logging.exception("Render worker failed")
             self.finished.emit(f"Error: {e}")
         finally:
+            # Every placement carrying a creative video holds a capture of its
+            # own. These were released on the way out of a successful render
+            # only, so a render that failed part-way -- the case most likely to
+            # be retried, and retried again -- leaked one open file per
+            # placement each time.
+            for placement in placements:
+                if getattr(placement, "capture", None) is not None:
+                    placement.capture.release()
+                    placement.capture = None
             for handle in (base_cap, overlay_cap):
                 if handle is not None:
                     handle.release()
@@ -4935,15 +4950,25 @@ class MainWindow(QMainWindow):
         QMessageBox.information(self, "Loaded", f"Tracking loaded from:\n{path}")
 
     def _write_aoi_file(self, path, placement, fps, video_w, video_h,
-                        first_frame, last_frame, scale) -> int:
-        """Write one placement's AOI geometry. Returns the row count."""
+                        first_frame, last_frame, scale):
+        """Write one placement's AOI geometry.
+
+        Returns ``(rows written, frames skipped)``. This is the only writer of
+        the format: the single-placement case used to have a second copy of
+        the whole thing, which had already drifted -- it labelled every file
+        "aoi1" instead of naming the placement, so which advert a file
+        described depended on how many there had been.
+        """
         frame_dict = core.interpolate_tracking(placement.tracking_history,
                                                first_frame, last_frame)
         origin = first_frame if first_frame is not None else 0
-        rows = []
+        rows, skipped = [], 0
         for frame_idx in sorted(frame_dict):
             corners = frame_dict[frame_idx]
+            # An unrenderable shape draws no advert, so it must not claim an
+            # area of interest either.
             if not core.is_valid_quad(corners):
+                skipped += 1
                 continue
             scaled = [(float(x) * scale, float(y) * scale) for x, y in corners]
             rows.append([
@@ -4967,7 +4992,7 @@ class MainWindow(QMainWindow):
                 "disc_viewable_anagle", "disc_deflection_angle", "disc_diam",
                 "points"])
             writer.writerows(rows)
-        return len(rows)
+        return len(rows), skipped
 
     def save_aoi_geometry(self):
         import csv
@@ -5014,35 +5039,6 @@ class MainWindow(QMainWindow):
         if not save_path:
             return
 
-        # Row 1 (optional)
-        row1 = [
-            f"name:aoi1",
-            "csv_type_3",
-            "width:None",
-            "height:None",
-            f"stim_width:{video_w}",
-            f"stim_height:{video_h}",
-        ]
-
-        # Row 2 (the requested header)
-        row2 = [
-            "START",
-            "END",
-            "topleft_coords_XYZ_m",
-            "topright_coords_XYZ_m",
-            "bottomleft_coords_XYZ_m",
-            "bottomright_coords_XYZ_m",
-            "top_angle_deg",
-            "left_angle_deg",
-            "bottom_angle_deg",
-            "right_angle_deg",
-            "average_dist_from_corners",
-            "disc_viewable_anagle",
-            "disc_deflection_angle",
-            "disc_diam",
-            "points"
-        ]
-
         # One AOI file per placement: an eye-tracking analysis needs to tell
         # the adverts apart, so they cannot share a single area of interest.
         placements = [pl for pl in self.central_panel.tracking_overlay.placements
@@ -5054,75 +5050,29 @@ class MainWindow(QMainWindow):
                 safe = "".join(c if c.isalnum() or c in "-_ " else "_"
                                for c in placement.name).strip().replace(" ", "_")
                 target = f"{stem}_{safe}{ext or '.csv'}"
-                rows = self._write_aoi_file(
+                rows, dropped = self._write_aoi_file(
                     target, placement, fps, video_w, video_h,
                     first_frame, last_frame, scale)
-                written.append(f"{os.path.basename(target)}  ({rows} frames)")
+                note = f"  ({rows} frames" + (f", {dropped} skipped)" if dropped
+                                              else ")")
+                written.append(os.path.basename(target) + note)
             QMessageBox.information(
                 self, "Export Complete",
                 "AOI geometry written, one file per placement:\n\n"
                 + "\n".join(written))
             return
 
-        geometry_data = []
+        # And one placement through the same writer, rather than a second copy
+        # of the format. Keeping two is how they drifted apart: the copy here
+        # headed every file "aoi1" instead of naming the placement, so which
+        # advert a file described depended on how many there had been.
+        only = (placements[0] if placements
+                else self.central_panel.tracking_overlay.active)
+        written, skipped = self._write_aoi_file(
+            save_path, only, fps, video_w, video_h,
+            first_frame, last_frame, scale)
 
-        # Interpolate exactly as the renderer does. Exporting only the frames
-        # that happen to be keyed would leave holes in the AOI wherever the
-        # user scrubbed or re-adjusted, so a fixation landing on the ad during
-        # a gap would not be attributed to it -- quietly under-counting dwell
-        # time and fixation counts. It would also disagree with the rendered
-        # video, which draws the ad on every frame in the range.
-        frame_dict = core.interpolate_tracking(
-            self.central_panel.tracking_overlay.tracking_history,
-            first_frame, last_frame)
-
-        origin = first_frame if first_frame is not None else 0
-        skipped = 0
-
-        # Sort the frame numbers so CSV rows are in ascending order
-        for frame_idx in sorted(frame_dict.keys()):
-            corners = frame_dict[frame_idx]
-
-            # An unrenderable shape draws no advert, so it must not claim an
-            # area of interest either.
-            if not core.is_valid_quad(corners):
-                skipped += 1
-                continue
-
-            # Times are relative to the start of the rendered file.
-            start_time = (frame_idx - origin) / fps
-            end_time = (frame_idx - origin + 1) / fps
-
-            # Coordinates must be in the rendered file's pixel space.
-            scaled = [(float(x) * scale, float(y) * scale) for x, y in corners]
-            points_str = ";".join(f"{v:.4f}" for point in scaled for v in point)
-
-            row_out = [
-                f"{start_time:.3f}",
-                f"{end_time:.3f}",
-                "0; 0; 0",
-                "0; 0; 0",
-                "0; 0; 0",
-                "0; 0; 0",
-                "None",
-                "None",
-                "None",
-                "None",
-                "0",
-                "None",
-                "None",
-                "None",
-                points_str
-            ]
-            geometry_data.append(row_out)
-
-        with open(save_path, "w", newline='', encoding="utf-8") as csvfile:
-            writer = csv.writer(csvfile, delimiter=',')  # or delimiter=';'
-            writer.writerow(row1)
-            writer.writerow(row2)
-            writer.writerows(geometry_data)
-
-        if not geometry_data:
+        if not written:
             QMessageBox.warning(
                 self, "Nothing Exported",
                 "No usable tracking data, so an empty AOI file was written.\n\n"
@@ -5130,19 +5080,17 @@ class MainWindow(QMainWindow):
                 "exporting.")
             return
 
-        detail = (f"{len(geometry_data)} frames, "
-                  f"{geometry_data[0][0]}s–{geometry_data[-1][1]}s, "
-                  f"{video_w}×{video_h}")
+        detail = f"{written} frames, {video_w}\u00d7{video_h}"
         if render:
             detail += f"\nMatched to: {os.path.basename(render['out_path'])}"
         else:
-            detail += "\n\n⚠  Describes the full-resolution source video."
+            detail += "\n\n\u26a0  Describes the full-resolution source video."
         if skipped:
             detail += f"\n{skipped} frame(s) skipped: the shape was unrenderable."
 
         QMessageBox.information(self, "Export Complete",
-                                f"AOI geometry saved to:\n{save_path}\n\n{detail}")
-
+                                f"AOI geometry written to:\n{save_path}\n\n{detail}")
+        return
 
     def upload_base_video(self):
         if not self.confirm_discard("Loading another video will replace it."):
