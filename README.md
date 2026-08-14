@@ -68,6 +68,8 @@ macOS, `~/.local/share/Galileo` on Linux).
 | `D` / `C` | Delete this frame's shape / copy it from the previous frame |
 | Tracking switch | Enable/disable tracking during playback |
 | Magnifier switch | Show/hide the magnifier (it also appears while dragging) |
+| Double-click the magnifier | Fill the video stage with it, or put it back |
+| Scroll on the magnifier | Set its magnification by hand |
 
 Brightness, contrast and colourise adjustments for the inserted creative are
 available from the left toolbar, and all three apply to the render as well as
@@ -237,14 +239,24 @@ its switch.
   corner and its two bend handles.
 * **Dragging one gives it the whole widget.** That is the moment precision is
   wanted, and four thumbnails serve it worse than one clear view.
-* **It shows true pixels.** Past 6× it stops interpolating and past 12× it
+* **Double-click, or press the corner button, to fill the video stage.**
+  Twelve handles in a floating box a couple of hundred pixels wide leaves each
+  one smaller than the thumbnail it replaced; filling the stage is what makes
+  the crowded layouts usable. Double-click again to put it back.
+* **Each view picks its own magnification** from how much room it has, so it
+  always shows about 28 pixels of footage across its shorter side. A fixed
+  number cannot work: a tile is anywhere from 50 to 500 pixels across, and 8×
+  put *nine* pixels of footage in a default-sized tile — nothing to align
+  against, and blocks so large the picture read as mush. Scroll to override
+  it, and click the magnification badge to hand the choice back.
+* **It shows true pixels.** Past 4× it stops interpolating and past 12× it
   rules off the source grid, because the question being asked is which pixel
   the edge falls on, and a blurred answer is no answer.
+* **Drag the bottom-right corner** to resize it.
 * **The area's outline is drawn through each view.** This is what makes the
   bend handles judgeable at all: a handle is placed correctly when the *curve*
   it produces sits on the screen's edge, and the curve is often nowhere near
   the handle itself.
-* **Scroll to zoom**, from 2× to 32×.
 
 > **The crosshair marks the true position.** The view is centred exactly on the
 > handle and never slid back inside the frame. It used to be clamped to the
