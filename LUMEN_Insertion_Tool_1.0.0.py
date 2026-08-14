@@ -1957,6 +1957,11 @@ class CentralPanel(QWidget):
         self.main_layout.addWidget(self.status_bar)
         self.setLayout(self.main_layout)
 
+        self.slider.valueChanged.connect(self.on_slider_scrub)
+        self.slider.sliderPressed.connect(self.on_slider_pressed)
+        self.slider.sliderReleased.connect(self.on_slider_released)
+        self.slider.valueChanged.connect(self.on_slider_value_changed)
+
         # Timers
         self.timer = QTimer()
         self.timer.timeout.connect(self.read_frame)
@@ -2213,7 +2218,15 @@ class CentralPanel(QWidget):
         current_frame_index = int(self.cap.get(cv2.CAP_PROP_POS_FRAMES)) - 1
         self.current_frame_index = current_frame_index
         if not self.slider.isSliderDown():
+            # Moving the slider to follow playback must not be mistaken for the
+            # user scrubbing. Without this, setValue fired valueChanged, which
+            # seeked back to this same frame and called read_frame again: every
+            # frame was decoded and tracked twice, and the Kalman filters got
+            # two predict steps for one frame of real motion, so the shape ran
+            # steadily ahead of the surface during a camera move.
+            self.slider.blockSignals(True)
             self.slider.setValue(current_frame_index)
+            self.slider.blockSignals(False)
 
         overlay = self.tracking_overlay
 
@@ -2573,11 +2586,11 @@ class CentralPanel(QWidget):
             total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
             self.slider.setEnabled(True)
             self.slider.setRange(0, total_frames - 1)
+            # Connections are made once, in __init__. Making them here meant
+            # loading a second video doubled every one of them.
+            self.slider.blockSignals(True)
             self.slider.setValue(0)
-            self.slider.valueChanged.connect(self.on_slider_scrub)
-            self.slider.sliderPressed.connect(self.on_slider_pressed)
-            self.slider.sliderReleased.connect(self.on_slider_released)
-            self.slider.valueChanged.connect(self.on_slider_value_changed)
+            self.slider.blockSignals(False)
         else:
             logging.error(f"Could not open video: {file_path}")
             return

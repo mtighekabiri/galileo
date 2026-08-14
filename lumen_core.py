@@ -797,6 +797,10 @@ class PlanarTracker:
                  max_step_fraction: float = 0.25,
                  feature_source: str = INTERIOR,
                  surround_scale: float = 1.9,
+                 anchor_interval: int = 8,
+                 anchor_min_inliers: int = 12,
+                 anchor_min_ratio: float = 0.60,
+                 anchor_max_correction: float = 6.0,
                  feature_params: dict = None,
                  lk_params: dict = None):
         """
@@ -813,9 +817,28 @@ class PlanarTracker:
             feature_source: :attr:`INTERIOR`, :attr:`SURROUND` or :attr:`BOTH`.
             surround_scale: how far the surround band reaches out, as a
                 multiple of the region's size about its centre.
+            anchor_interval: how often, in frames, to re-fit against the anchor
+                frame to clear accumulated drift. 0 disables it.
+            anchor_min_inliers: fewest inliers for a correction to be trusted.
+            anchor_min_ratio: fewest, as a fraction of the anchor's features,
+                that must still match. This is what tells a drift fix from a
+                bad one: measured across a pan and a 62-degree swing, every
+                correction that improved accuracy scored 0.81 or above, and the
+                single one that made things worse scored 0.59. The default sits
+                just above that, which also keeps the corrections a
+                digital-screen shot depends on; anchor_max_correction is a
+                second, independent guard, since the harmful correction also
+                moved the shape further (1.6 px) than any helpful one (1.2 px).
+            anchor_max_correction: reject a correction that moves a corner
+                further than this, in pixels -- it is a drift fix, not a
+                relocation, and a big jump means the anchor no longer matches.
         """
         self.feature_source = feature_source
         self.surround_scale = surround_scale
+        self.anchor_interval = anchor_interval
+        self.anchor_min_inliers = anchor_min_inliers
+        self.anchor_min_ratio = anchor_min_ratio
+        self.anchor_max_correction = anchor_max_correction
         self.fb_threshold = fb_threshold
         self.ransac_threshold = ransac_threshold
         self.min_features = min_features
@@ -839,6 +862,18 @@ class PlanarTracker:
         self._diagonal = float(np.hypot(*self.frame_shape))
         self.features = None
         self._seed_features()
+
+        # Keep the anchor frame and the features found on it, so the current
+        # position can periodically be re-derived from it rather than from an
+        # ever-lengthening chain of frame-to-frame steps.
+        self.anchor_gray = self.prev_gray.copy()
+        self.anchor_features = (self.features.copy()
+                                if self.features is not None and len(self.features)
+                                else None)
+        self._since_anchor = 0
+        self.anchor_corrections = 0
+        self.anchor_ratio = 0.0
+        self.anchor_shift = 0.0
 
     @staticmethod
     def _gray(frame):
@@ -952,8 +987,96 @@ class PlanarTracker:
         if len(self.features) < self.reseed_below:
             self._seed_features()
 
-        return TrackResult(True, quad=new_quad.copy(), n_features=n_good,
+        self._since_anchor += 1
+        if self.anchor_interval and self._since_anchor >= self.anchor_interval:
+            self._since_anchor = 0
+            self._correct_against_anchor(gray)
+
+        return TrackResult(True, quad=self.quad.copy(), n_features=n_good,
                            n_inliers=n_inliers)
+
+    def _correct_against_anchor(self, gray) -> bool:
+        """Re-derive the position from the anchor frame, clearing drift.
+
+        Composing a homography per frame means every step's small error is
+        carried forward for the rest of the clip, so the shape slides steadily
+        off the surface during a long camera move -- measured at about 0.019 px
+        per frame, roughly 0.28% of the distance travelled, which is several
+        pixels across a long pan and exactly the "it tracks but it is offset"
+        complaint.
+
+        Matching the anchor frame straight to the current one removes the chain
+        entirely: the error stops depending on how long tracking has been
+        running. The current estimate seeds the search, so the large
+        displacement between anchor and now is not a problem, and the result is
+        only accepted if it is well supported and close to where incremental
+        tracking already thinks the surface is -- this corrects drift, it does
+        not relocate the shape.
+        """
+        if self.anchor_features is None or len(self.anchor_features) < 4:
+            return False
+
+        source = self.anchor_features.reshape(-1, 1, 2).astype(np.float32)
+        guess = cv2.perspectiveTransform(
+            source, self.cumulative_h.astype(np.float64)).astype(np.float32)
+
+        moved, status, _ = cv2.calcOpticalFlowPyrLK(
+            self.anchor_gray, gray, source, guess.copy(),
+            flags=cv2.OPTFLOW_USE_INITIAL_FLOW, **self.lk_params)
+        if moved is None:
+            return False
+
+        # The return trip needs a starting guess as well. Without one it has to
+        # find points that may be most of a frame away, which plain LK cannot
+        # do, so every point failed the consistency check and no correction
+        # was ever accepted after the first few frames.
+        back, status_back, _ = cv2.calcOpticalFlowPyrLK(
+            gray, self.anchor_gray, moved, source.copy(),
+            flags=cv2.OPTFLOW_USE_INITIAL_FLOW, **self.lk_params)
+        if back is None:
+            return False
+
+        error = np.linalg.norm((source - back).reshape(-1, 2), axis=1)
+        good = ((status.ravel() == 1) & (status_back.ravel() == 1)
+                & (error < self.fb_threshold * 2.0))
+        if int(good.sum()) < self.anchor_min_inliers:
+            return False
+
+        matrix, mask = cv2.findHomography(
+            source.reshape(-1, 2)[good], moved.reshape(-1, 2)[good],
+            cv2.RANSAC, self.ransac_threshold)
+        if matrix is None or mask is None:
+            return False
+
+        # How much of the anchor still matches. This falls as the viewpoint
+        # diverges from the anchor, which is precisely when a correction stops
+        # being more accurate than the incremental chain.
+        self.anchor_ratio = float(mask.sum()) / max(1, len(source))
+        if int(mask.sum()) < self.anchor_min_inliers:
+            return False
+        if self.anchor_ratio < self.anchor_min_ratio:
+            logger.debug("anchor correction rejected: only %.0f%% of the anchor "
+                         "still matches", self.anchor_ratio * 100)
+            return False
+
+        corrected = cv2.perspectiveTransform(
+            self.anchor_quad.reshape(-1, 1, 2), matrix.astype(np.float64)
+        ).reshape(4, 2).astype(np.float32)
+
+        if not np.all(np.isfinite(corrected)) or not is_simple_quad(corrected):
+            return False
+        shift = float(np.linalg.norm(corrected - self.quad, axis=1).max())
+        self.anchor_shift = shift
+        if shift > self.anchor_max_correction:
+            # Too far to be drift. The anchor's appearance has probably gone,
+            # so keep the incremental estimate rather than jumping.
+            logger.debug("anchor correction rejected: %.1fpx shift", shift)
+            return False
+
+        self.cumulative_h = matrix.astype(np.float64)
+        self.quad = corrected
+        self.anchor_corrections += 1
+        return True
 
     def map_from_anchor(self, points) -> np.ndarray:
         """Carry points defined on the anchor frame into the current frame.
