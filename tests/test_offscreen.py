@@ -14,7 +14,7 @@ import cv2
 import numpy as np
 import pytest
 
-import lumen_core as core
+import galileo_core as core
 from conftest import make_background, make_texture
 
 

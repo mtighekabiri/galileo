@@ -16,8 +16,8 @@ import cv2
 import numpy as np
 import pytest
 
-import lumen_core as core
-import lumen_blend as blend
+import galileo_core as core
+import galileo_blend as blend
 from conftest import quad_path
 
 pytest.importorskip("PyQt5.QtWidgets")
@@ -26,11 +26,11 @@ from PyQt5.QtWidgets import QApplication
 from PyQt5.QtCore import Qt
 
 _spec = importlib.util.spec_from_file_location(
-    "lumen_app",
+    "galileo_app",
     os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                 "LUMEN_Insertion_Tool_1.0.0.py"))
-lumen_app = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(lumen_app)
+                 "Galileo_Insertion_Tool_1.0.0.py"))
+galileo_app = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(galileo_app)
 
 
 def creative(colour):
@@ -46,7 +46,7 @@ def qapp():
 @pytest.fixture
 def app(qapp, clip_video):
     path, truth = clip_video
-    window = lumen_app.MainWindow()
+    window = galileo_app.MainWindow()
     window.show()
     window.central_panel.load_video(path)
     yield window, window.central_panel, window.central_panel.tracking_overlay, truth
@@ -157,7 +157,7 @@ class TestDelegation:
     def test_feature_source_is_per_placement(self, two, monkeypatch):
         """One shot can hold a printed poster and a digital screen."""
         window, panel, overlay, truth, first, second = two
-        monkeypatch.setattr(lumen_app.QMessageBox, "information",
+        monkeypatch.setattr(galileo_app.QMessageBox, "information",
                             staticmethod(lambda *a, **k: None))
         overlay.set_active(1)
         window.toggle_digital_screen(True)
@@ -194,7 +194,7 @@ class TestRendering:
         settings = window.build_render_settings(0, 9, 1.0, out)
         assert [p.name for p in settings.placements] == ["Left", "Right"]
 
-        worker = lumen_app.RenderWorker(settings)
+        worker = galileo_app.RenderWorker(settings)
         statuses = []
         worker.finished.connect(statuses.append)
         worker.run()
@@ -231,7 +231,7 @@ class TestRendering:
         second.tracking_history = {}
         out = str(tmp_path / "skip.mp4")
         settings = window.build_render_settings(0, 5, 1.0, out)
-        worker = lumen_app.RenderWorker(settings)
+        worker = galileo_app.RenderWorker(settings)
         statuses = []
         worker.finished.connect(statuses.append)
         worker.run()
@@ -245,12 +245,12 @@ class TestProjectRoundTrip:
         second.brightness = 33
 
         project = str(tmp_path / "multi.json")
-        monkeypatch.setattr(lumen_app.QFileDialog, "getSaveFileName",
+        monkeypatch.setattr(galileo_app.QFileDialog, "getSaveFileName",
                             staticmethod(lambda *a, **k: (project, "")))
-        monkeypatch.setattr(lumen_app.QFileDialog, "getOpenFileName",
+        monkeypatch.setattr(galileo_app.QFileDialog, "getOpenFileName",
                             staticmethod(lambda *a, **k: (project, "")))
         for name in ("information", "warning"):
-            monkeypatch.setattr(lumen_app.QMessageBox, name,
+            monkeypatch.setattr(galileo_app.QMessageBox, name,
                                 staticmethod(lambda *a, **k: None))
         window.save_project()
 
@@ -277,9 +277,9 @@ class TestAoiPerPlacement:
             "out_path": str(tmp_path / "stim.mp4"), "start_frame": 0,
             "end_frame": 9, "scale_factor": 1.0, "fps": 25.0,
             "width": 640, "height": 480}
-        monkeypatch.setattr(lumen_app.QFileDialog, "getSaveFileName",
+        monkeypatch.setattr(galileo_app.QFileDialog, "getSaveFileName",
                             staticmethod(lambda *a, **k: (str(out), "")))
-        monkeypatch.setattr(lumen_app.QMessageBox, "information",
+        monkeypatch.setattr(galileo_app.QMessageBox, "information",
                             staticmethod(lambda *a, **k: None))
         window.save_aoi_geometry()
 
@@ -294,9 +294,9 @@ class TestAoiPerPlacement:
             "out_path": str(tmp_path / "stim.mp4"), "start_frame": 0,
             "end_frame": 9, "scale_factor": 1.0, "fps": 25.0,
             "width": 640, "height": 480}
-        monkeypatch.setattr(lumen_app.QFileDialog, "getSaveFileName",
+        monkeypatch.setattr(galileo_app.QFileDialog, "getSaveFileName",
                             staticmethod(lambda *a, **k: (str(out), "")))
-        monkeypatch.setattr(lumen_app.QMessageBox, "information",
+        monkeypatch.setattr(galileo_app.QMessageBox, "information",
                             staticmethod(lambda *a, **k: None))
         window.save_aoi_geometry()
 

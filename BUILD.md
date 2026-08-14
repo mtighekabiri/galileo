@@ -1,8 +1,8 @@
-# Packaging LUMEN so it runs without Python
+# Packaging Galileo so it runs without Python
 
 The tool ships as a **self-contained folder**. A user unzips it somewhere they
 can write — Desktop, Documents, a USB stick, a network share — and
-double-clicks `LUMEN.exe`. Nothing is installed, nothing touches the registry,
+double-clicks `Galileo.exe`. Nothing is installed, nothing touches the registry,
 and no administrator is involved. Python, PyQt5, OpenCV and NumPy all travel
 inside the folder.
 
@@ -28,7 +28,7 @@ python build.py
 ```
 
 That creates a clean virtual environment, installs the dependencies into it,
-runs PyInstaller, and zips the result to `dist/LUMEN-<platform>.zip`.
+runs PyInstaller, and zips the result to `dist/Galileo-<platform>.zip`.
 
 To drive PyInstaller yourself:
 
@@ -36,10 +36,10 @@ To drive PyInstaller yourself:
 python -m venv .buildenv
 .buildenv/Scripts/activate        # Windows;  source .buildenv/bin/activate elsewhere
 pip install -r requirements-build.txt
-pyinstaller LUMEN.spec
+pyinstaller Galileo.spec
 ```
 
-The result is `dist/LUMEN/`, with `LUMEN.exe` at the top.
+The result is `dist/Galileo/`, with `Galileo.exe` at the top.
 
 ### Build in a clean environment — this one matters
 
@@ -52,12 +52,12 @@ hardest to diagnose.
 
 `build.py` uses a fresh virtual environment for this reason. If you build by
 hand, do the same, and check afterwards that
-`dist/LUMEN/_internal/opencv_python.libs` does **not** exist; only
+`dist/Galileo/_internal/opencv_python.libs` does **not** exist; only
 `opencv_python_headless.libs` should be there.
 
 ## Hand it over
 
-Zip `dist/LUMEN/` and distribute the zip.
+Zip `dist/Galileo/` and distribute the zip.
 
 Tell users to **unzip before running**. Launching the `.exe` from inside
 Windows' built-in zip viewer appears to work, but the supporting libraries are
@@ -73,8 +73,8 @@ OpenCV cannot write audio, so renders are silent unless `ffmpeg` is available.
 The app looks for `ffmpeg` **next to its own executable** before checking
 `PATH`, so:
 
-> Download a static `ffmpeg.exe` and drop it into `dist/LUMEN/` beside
-> `LUMEN.exe` before zipping.
+> Download a static `ffmpeg.exe` and drop it into `dist/Galileo/` beside
+> `Galileo.exe` before zipping.
 
 Renders then keep their audio, still with nothing installed. Without it,
 rendering succeeds and the completion message says the file is silent.
@@ -113,9 +113,9 @@ the app still starts from a read-only share:
 
 | Platform | Location |
 | --- | --- |
-| Windows | `%LOCALAPPDATA%\LUMEN\app_debug.log` |
-| macOS | `~/Library/Application Support/LUMEN/app_debug.log` |
-| Linux | `~/.local/share/LUMEN/app_debug.log` |
+| Windows | `%LOCALAPPDATA%\Galileo\app_debug.log` |
+| macOS | `~/Library/Application Support/Galileo/app_debug.log` |
+| Linux | `~/.local/share/Galileo/app_debug.log` |
 
 Ask for that file when a user reports a problem.
 

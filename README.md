@@ -1,4 +1,4 @@
-# rembrand — LUMEN Insertion Tool
+# rembrand — Galileo Insertion Tool
 
 A PyQt5 desktop tool for inserting a creative (image or video) into a base
 video so that it sticks to a surface in the scene as the camera moves.
@@ -13,7 +13,7 @@ the rendered video.
 
 ```bash
 pip install -r requirements.txt
-python LUMEN_Insertion_Tool_1.0.0.py
+python Galileo_Insertion_Tool_1.0.0.py
 ```
 
 Requires a desktop session — it is a windowed Qt application, not a CLI.
@@ -26,8 +26,8 @@ package it into a self-contained folder they can unzip and double-click. No
 install, no admin rights. See [BUILD.md](BUILD.md).
 
 Debug output goes to `app_debug.log` in a per-user folder
-(`%LOCALAPPDATA%\LUMEN` on Windows, `~/Library/Application Support/LUMEN` on
-macOS, `~/.local/share/LUMEN` on Linux).
+(`%LOCALAPPDATA%\Galileo` on Windows, `~/Library/Application Support/Galileo` on
+macOS, `~/.local/share/Galileo` on Linux).
 
 ## Workflow
 
@@ -35,8 +35,9 @@ macOS, `~/.local/share/LUMEN` on Linux).
    (`.mp4`, `.avi`, `.mkv`).
 2. **Mark the area**, either way round:
    - *By hand*: select the *Draw* tool and click four times to place the
-     corners. Drag a corner to move it. The magnifier shows a zoomed view of
-     each corner in its own quadrant for precise placement.
+     corners. Drag a corner to move it. The magnifier gives each handle a
+     zoomed view for precise placement — see
+     [The magnifier](#the-magnifier).
    - *From a picture*: hamburger menu → *Find Target from Image…*, then upload a
      photo of the billboard, screen or poster. The tool searches the footage for
      it and drops the quad on its actual corners. See
@@ -66,7 +67,7 @@ macOS, `~/.local/share/LUMEN` on Linux).
 | Arrow keys | Nudge the selection by 1 px |
 | `D` / `C` | Delete this frame's shape / copy it from the previous frame |
 | Tracking switch | Enable/disable tracking during playback |
-| Magnifier switch | Show/hide the corner magnifier |
+| Magnifier switch | Show/hide the magnifier (it also appears while dragging) |
 
 Brightness, contrast and colourise adjustments for the inserted creative are
 available from the left toolbar, and all three apply to the render as well as
@@ -219,6 +220,38 @@ A clip lands close but not as exactly as a cropped still — around 11 px on a
 270 px panel in testing — because a handheld view is never framed to the pixel.
 Treat it as a starting point and nudge the corners.
 
+## The magnifier
+
+Marking the area is the one part of the job where single pixels decide the
+outcome. The tracker seeds its features from whatever is enclosed, so a corner
+left a little *inside* a screen throws away the bezel detail that tracks best,
+and one left a little *outside* picks up the wall behind and drags the insert
+off during a pan. Neither is visible at video scale.
+
+The magnifier appears whenever a handle is dragged, and can be pinned on with
+its switch.
+
+* **Every handle gets a view.** Four corners keep the familiar two-by-two, each
+  corner in the part of the box where it actually sits on the video. Switch
+  curved edges on and all twelve appear — a row per edge, holding that edge's
+  corner and its two bend handles.
+* **Dragging one gives it the whole widget.** That is the moment precision is
+  wanted, and four thumbnails serve it worse than one clear view.
+* **It shows true pixels.** Past 6× it stops interpolating and past 12× it
+  rules off the source grid, because the question being asked is which pixel
+  the edge falls on, and a blurred answer is no answer.
+* **The area's outline is drawn through each view.** This is what makes the
+  bend handles judgeable at all: a handle is placed correctly when the *curve*
+  it produces sits on the screen's edge, and the curve is often nowhere near
+  the handle itself.
+* **Scroll to zoom**, from 2× to 32×.
+
+> **The crosshair marks the true position.** The view is centred exactly on the
+> handle and never slid back inside the frame. It used to be clamped to the
+> frame while the crosshair stayed at the middle of its quadrant, so anywhere
+> within half a view of a border — and for any handle carried off screen by
+> tracking — it pointed at the wrong pixel.
+
 ## Curved edges
 
 Each edge of the area carries two cubic Bezier control points. Their default
@@ -356,25 +389,25 @@ stored only a single quad.
 
 ## Layout
 
-`lumen_core.py` holds the algorithms as plain NumPy/OpenCV with no Qt imports.
-`LUMEN_Insertion_Tool_1.0.0.py` is the application on top of it. The split
+`galileo_core.py` holds the algorithms as plain NumPy/OpenCV with no Qt imports.
+`Galileo_Insertion_Tool_1.0.0.py` is the application on top of it. The split
 matters for more than tidiness: the preview and the renderer call the *same*
 compositing function, so what you approve on screen is what gets written to the
 file, and the algorithms can be tested without a display.
 
 | Component | Role |
 | --- | --- |
-| `lumen_core.PlanarTracker` | Feature-based planar tracking with RANSAC and sanity checks |
-| `lumen_core.ReferenceMatcher` | Locates a target in the footage from a reference image |
-| `lumen_core.PersonSegmenter` | Segments people so the insert can go behind them |
-| `lumen_core.Region` | Four corners plus per-edge curvature |
-| `lumen_core.composite_region` | Alpha-correct perspective/curved warp and blend |
-| `lumen_core.interpolate_tracking` | Fills the gaps between tracked frames |
-| `lumen_core.remux_audio` | Copies the source audio onto a finished render |
+| `galileo_core.PlanarTracker` | Feature-based planar tracking with RANSAC and sanity checks |
+| `galileo_core.ReferenceMatcher` | Locates a target in the footage from a reference image |
+| `galileo_core.PersonSegmenter` | Segments people so the insert can go behind them |
+| `galileo_core.Region` | Four corners plus per-edge curvature |
+| `galileo_core.composite_region` | Alpha-correct perspective/curved warp and blend |
+| `galileo_core.interpolate_tracking` | Fills the gaps between tracked frames |
+| `galileo_core.remux_audio` | Copies the source audio onto a finished render |
 | `MainWindow` | Frameless main window, menus, load/save/render actions |
 | `CentralPanel` | Video playback, frame stepping, the tracking loop |
 | `TrackingOverlay` | The area, corner and curve handles, live preview |
-| `MagnifierWidget` | Four-quadrant zoomed view of the corners |
+| `MagnifierWidget` | Zoomed views of every handle, for exact placement |
 | `RenderSettings` / `RenderWorker` | Off-thread compositing and MP4 export |
 
 ## Tests

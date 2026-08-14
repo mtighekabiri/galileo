@@ -4,7 +4,7 @@ import cv2
 import numpy as np
 import pytest
 
-import lumen_core as core
+import galileo_core as core
 
 
 QUAD = np.float32([[100, 80], [400, 90], [390, 300], [110, 290]])

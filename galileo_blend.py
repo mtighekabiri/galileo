@@ -19,7 +19,7 @@ import logging
 import cv2
 import numpy as np
 
-from lumen_core import as_quad, quad_bounds, to_bgra
+from galileo_core import as_quad, quad_bounds, to_bgra
 
 logger = logging.getLogger(__name__)
 

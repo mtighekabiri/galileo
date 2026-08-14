@@ -1,15 +1,15 @@
-# PyInstaller build for the LUMEN Insertion Tool.
+# PyInstaller build for the Galileo Insertion Tool.
 #
 # Produces a self-contained folder that runs on a machine with no Python and no
 # admin rights: the user unzips it and double-clicks the executable.
 #
 #     pip install -r requirements-build.txt
-#     pyinstaller LUMEN.spec
+#     pyinstaller Galileo.spec
 #
 # Build on the platform you are shipping to -- PyInstaller cannot cross-compile,
 # so a Windows .exe has to be built on Windows.
 #
-# Drop an ffmpeg binary next to the executable in dist/LUMEN/ to give renders
+# Drop an ffmpeg binary next to the executable in dist/Galileo/ to give renders
 # their audio; the app looks there before it looks at PATH.
 
 import os
@@ -43,14 +43,15 @@ EXCLUDES = [
 ]
 
 analysis = Analysis(
-    ["LUMEN_Insertion_Tool_1.0.0.py"],
+    ["Galileo_Insertion_Tool_1.0.0.py"],
     pathex=[],
     binaries=[],
-    # lumen_core is imported normally and picked up automatically; listed here
-    # so the build fails loudly if it ever goes missing rather than shipping a
-    # broken executable.
+    # These are imported normally and picked up automatically; listed here so
+    # the build fails loudly if one ever goes missing rather than shipping a
+    # broken executable. galileo_blend and galileo_morph arrived after the
+    # list was written and were never added to it.
     datas=DATAS,
-    hiddenimports=["lumen_core"],
+    hiddenimports=["galileo_core", "galileo_blend", "galileo_morph"],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -68,7 +69,7 @@ exe = EXE(
     analysis.scripts,
     [],
     exclude_binaries=True,
-    name="LUMEN",
+    name="Galileo",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -92,16 +93,16 @@ collect = COLLECT(
     strip=False,
     upx=False,
     upx_exclude=[],
-    name="LUMEN",
+    name="Galileo",
 )
 
 # On macOS, wrap the result in a .app so it behaves like a normal application.
 if sys.platform == "darwin":
     app = BUNDLE(
         collect,
-        name="LUMEN.app",
+        name="Galileo.app",
         icon=None,
-        bundle_identifier="com.kabiri.lumen",
+        bundle_identifier="com.kabiri.galileo",
         info_plist={
             "NSHighResolutionCapable": True,
             "NSCameraUsageDescription": "Not used.",

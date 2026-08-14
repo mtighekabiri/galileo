@@ -1,4 +1,4 @@
-# LUMEN Insertion Tool runtime dependencies.
+# Galileo Insertion Tool runtime dependencies.
 #
 # opencv-python-headless rather than opencv-python: the full build ships its
 # own Qt platform plugin (libqxcb.so) which clashes with PyQt5's on Linux and
