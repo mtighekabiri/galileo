@@ -127,6 +127,97 @@ class TestBow:
         assert morph.apply_bow(poster, 0.9, 0.4).shape == poster.shape
 
 
+class TestShadingIsWhatSellsTheCurve:
+    """Moving the texture about is a weak cue on its own -- a compressed edge
+    looks much like a squashed flat sheet. Light falling away as the surface
+    turns is what reads immediately as roundness."""
+
+    def flat_panel(self, width=400, height=200):
+        panel = np.zeros((height, width, 4), np.uint8)
+        panel[:, :, :3] = (200, 90, 40)
+        panel[:, :, 3] = 255
+        return panel
+
+    def brightness(self, image, x0, x1):
+        return float(image[:, x0:x1, :3].mean())
+
+    def test_the_edges_darken_as_they_turn_away(self):
+        panel = self.flat_panel()
+        curved = morph.apply_bow(panel, bow_h=0.8, shading=0.6)
+        middle = self.brightness(curved, 180, 220)
+        edge = self.brightness(curved, 0, 10)
+        assert edge < middle * 0.85, f"middle {middle:.0f}, edge {edge:.0f}"
+
+    def test_the_falloff_is_the_one_the_geometry_asks_for(self):
+        """A surface turned by an angle catches light by its cosine. Pinning
+        the number keeps the shading tied to the bow it is describing rather
+        than being a gradient that merely looks about right."""
+        shading, bow = 0.6, 0.8
+        panel = self.flat_panel()
+        curved = morph.apply_bow(panel, bow_h=bow, shading=shading)
+        expected = 1.0 - shading * (1.0 - np.cos(bow * 1.15))
+        measured = self.brightness(curved, 0, 1) / self.brightness(curved, 180, 220)
+        assert measured == pytest.approx(expected, abs=0.02)
+
+    def test_without_it_a_flat_colour_stays_perfectly_flat(self):
+        """The old behaviour, and why a bow used to be nearly invisible."""
+        panel = self.flat_panel()
+        unshaded = morph.apply_bow(panel, bow_h=0.8, shading=0.0)
+        assert self.brightness(unshaded, 0, 40) == \
+            pytest.approx(self.brightness(unshaded, 180, 220), abs=1.0)
+
+    def test_more_shading_means_more_falloff(self):
+        panel = self.flat_panel()
+        measured = [self.brightness(morph.apply_bow(panel, bow_h=0.8, shading=s),
+                                    0, 40)
+                    for s in (0.0, 0.25, 0.5, 0.75, 1.0)]
+        assert measured == sorted(measured, reverse=True), measured
+
+    def test_a_harder_bow_shades_harder(self):
+        panel = self.flat_panel()
+        measured = [self.brightness(morph.apply_bow(panel, bow_h=b, shading=0.6),
+                                    0, 40)
+                    for b in (0.2, 0.5, 0.8, 1.0)]
+        assert measured == sorted(measured, reverse=True), measured
+
+    def test_the_middle_is_left_at_full_strength(self):
+        """Shading a curve should dim what turns away, not the whole creative."""
+        panel = self.flat_panel()
+        flat = self.brightness(panel, 190, 210)
+        curved = self.brightness(morph.apply_bow(panel, bow_h=0.9, shading=1.0),
+                                 190, 210)
+        assert curved == pytest.approx(flat, rel=0.02)
+
+    def test_it_does_not_eat_into_the_alpha(self):
+        """Dimming the alpha would erode the creative's edges rather than
+        shade them, and the footage would show through where it should not."""
+        panel = self.flat_panel()
+        curved = morph.apply_bow(panel, bow_h=0.9, shading=1.0)
+        assert curved[:, :, 3].min() == 255
+
+    def test_it_only_applies_where_there_is_a_bow(self):
+        panel = self.flat_panel()
+        assert np.array_equal(morph.apply_bow(panel, bow_h=0.0, shading=1.0),
+                              panel)
+
+    def test_both_axes_shade_together(self):
+        panel = self.flat_panel()
+        both = morph.apply_bow(panel, bow_h=0.7, bow_v=0.7, shading=0.6)
+        corner = float(both[:8, :8, :3].mean())
+        middle = float(both[90:110, 190:210, :3].mean())
+        across = morph.apply_bow(panel, bow_h=0.7, shading=0.6)
+        one_axis = float(across[:8, :8, :3].mean()) / self.brightness(across, 180, 220)
+        assert corner / middle < one_axis, "a corner turned twice over should be darker"
+
+    def test_it_is_on_by_default(self):
+        """A bow that does nothing visible is a control users will not find."""
+        assert morph.Morph().shading > 0.3
+
+    def test_shading_alone_is_still_an_untouched_creative(self, poster):
+        assert morph.Morph(shading=1.0).is_identity()
+        assert morph.apply_morph(poster, morph.Morph(shading=1.0)) is poster
+
+
 class TestTilt:
     def test_turning_the_right_edge_away_makes_it_shorter(self):
         corners = morph.tilt_corners(400, 200, pitch=0, yaw=30, roll=0,

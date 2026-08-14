@@ -42,10 +42,10 @@ class Morph:
     """How much to bend and tilt a creative. All zero means leave it alone."""
 
     __slots__ = ("pitch", "yaw", "roll", "bow_h", "bow_v", "perspective",
-                 "enabled")
+                 "shading", "enabled")
 
     def __init__(self, pitch=0.0, yaw=0.0, roll=0.0, bow_h=0.0, bow_v=0.0,
-                 perspective=0.5, enabled=True):
+                 perspective=0.5, shading=0.55, enabled=True):
         """
         Args:
             pitch: degrees to tip the top away from the viewer.
@@ -57,6 +57,10 @@ class Morph:
             perspective: 0..1, how much foreshortening a tilt produces. At 0 a
                 tilt is an orthographic squash; at 1 the near edge grows and the
                 far edge shrinks noticeably.
+            shading: 0..1, how much a bowed surface darkens as it turns away
+                from the viewer. This is what makes a bow read as a curve
+                rather than as a squashed flat sheet, so it is on by default;
+                drop it to 0 to leave the creative's own colours untouched.
         """
         self.pitch = pitch
         self.yaw = yaw
@@ -64,6 +68,7 @@ class Morph:
         self.bow_h = bow_h
         self.bow_v = bow_v
         self.perspective = perspective
+        self.shading = shading
         self.enabled = enabled
 
     def is_identity(self, tolerance: float = 1e-4) -> bool:
@@ -129,8 +134,30 @@ def _bow_profile(count: int, amount: float, samples: int = 2048):
     return ((found + 1.0) * 0.5 * (count - 1.0)).astype(np.float32)
 
 
-def apply_bow(image: np.ndarray, bow_h: float = 0.0, bow_v: float = 0.0) -> np.ndarray:
-    """Curve the creative as though wrapped on a cylinder."""
+def _bow_facing(count: int, amount: float, profile: np.ndarray) -> np.ndarray:
+    """How squarely each output position faces the viewer, from 1 down to
+    ``cos(angle)`` at the ends.
+
+    This is what actually makes a bow read as a curve. Moving the texture
+    about is a weak cue on its own -- a compressed edge looks much like a
+    squashed flat sheet -- but light falling away as the surface turns is
+    immediately legible as roundness.
+    """
+    if abs(amount) < 1e-6:
+        return np.ones(count, np.float32)
+    angle = np.clip(abs(amount), 0.0, 1.0) * 1.15
+    source = profile / max(count - 1.0, 1.0) * 2.0 - 1.0
+    return np.cos(source * angle).astype(np.float32)
+
+
+def apply_bow(image: np.ndarray, bow_h: float = 0.0, bow_v: float = 0.0,
+              shading: float = 0.0) -> np.ndarray:
+    """Curve the creative as though wrapped on a cylinder.
+
+    Args:
+        shading: 0..1, how much the surface darkens as it turns away from the
+            viewer. 0 moves the texture and nothing else.
+    """
     if image is None or (abs(bow_h) < 1e-6 and abs(bow_v) < 1e-6):
         return image
 
@@ -140,9 +167,23 @@ def apply_bow(image: np.ndarray, bow_h: float = 0.0, bow_v: float = 0.0) -> np.n
     map_x = np.tile(columns, (height, 1))
     map_y = np.repeat(rows[:, None], width, axis=1)
 
-    return cv2.remap(image, map_x, map_y.astype(np.float32),
-                     interpolation=cv2.INTER_LINEAR,
-                     borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0, 0))
+    bowed = cv2.remap(image, map_x, map_y.astype(np.float32),
+                      interpolation=cv2.INTER_LINEAR,
+                      borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0, 0))
+
+    strength = float(np.clip(shading, 0.0, 1.0))
+    if strength <= 0.0:
+        return bowed
+
+    facing = (_bow_facing(width, bow_h, columns)[None, :]
+              * _bow_facing(height, bow_v, rows)[:, None])
+    gain = (1.0 - strength * (1.0 - facing))[:, :, None]
+
+    shaded = bowed.astype(np.float32)
+    # Colour only. Shading the alpha channel would eat away the creative's
+    # edges instead of dimming them.
+    shaded[:, :, :3] *= gain
+    return np.clip(shaded, 0, 255).astype(bowed.dtype)
 
 
 # --------------------------------------------------------------------------
@@ -227,7 +268,7 @@ def apply_morph(creative, morph: Morph) -> np.ndarray:
         return creative
 
     result = to_bgra(creative)
-    result = apply_bow(result, morph.bow_h, morph.bow_v)
+    result = apply_bow(result, morph.bow_h, morph.bow_v, morph.shading)
     result = apply_tilt(result, morph.pitch, morph.yaw, morph.roll,
                         morph.perspective)
     return result

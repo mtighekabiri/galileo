@@ -317,11 +317,17 @@ class MorphDialog(QDialog):
          "Curve about the vertical axis, as on a convex panel.\n"
          "Positive bulges the middle towards the viewer."),
         ("bow_v", "Bow down", -100, 100, "Curve about the horizontal axis."),
+        ("shading", "Curve shading", 0, 100,
+         "How much a bowed surface darkens as it turns away.\n"
+         "This is what makes a bow read as a curve rather than as a\n"
+         "squashed flat sheet. Drop it to 0 to leave the creative's\n"
+         "own colours untouched."),
         ("perspective", "Perspective", 0, 100,
          "How strongly a turn foreshortens.\nLow is nearly a flat squash; "
          "high exaggerates depth."),
     ]
-    SCALED = {"bow_h", "bow_v", "perspective"}     # stored 0..1, shown 0..100
+    # Stored 0..1, shown 0..100.
+    SCALED = {"bow_h", "bow_v", "perspective", "shading"}
 
     def __init__(self, morph, creative, on_change, parent=None):
         super().__init__(parent)

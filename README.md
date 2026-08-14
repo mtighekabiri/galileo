@@ -292,12 +292,36 @@ honest, and the same shape can be carried to a different placement or clip.
   sets how strongly: low is nearly a flat squash, high exaggerates depth.
 * **Bow across** and **Bow down** wrap it on a cylinder. Positive bulges the
   middle towards the viewer.
+* **Curve shading** darkens the surface as it turns away, by the cosine of the
+  angle it has turned through.
+
+> **Shading is what makes a bow read as a curve.** Moving the texture about is
+> a weak cue on its own — a compressed edge looks much like a squashed flat
+> sheet, and without shading a bowed creative is very nearly indistinguishable
+> from a flat one. It is therefore on by default. Drop it to 0 if the
+> creative's own colours are what the test is measuring.
 
 > **The two bow directions look more alike than you might expect.** Both
 > curvatures turn their ends away by the same angle, so both crowd the artwork
 > towards its edges; what separates them is only which part is nearer the
 > camera and so magnified. That is the geometry, not a limitation — a convex
 > panel and a hollow one really do read similarly head-on.
+
+### A curved screen needs both controls
+
+The two halves of a curved screen are set separately, because they are
+separate things:
+
+| What you are describing | Control |
+|---|---|
+| The screen's **outline** — its edges bow on the footage | **Curved edges** on the tracked area |
+| The **artwork** on it — texture crowding towards the edges, light falling away | **Shape → Bow** on the creative |
+
+Bow alone leaves a rectangular silhouette, which is right for a curved panel
+seen straight on but not for one seen from above or to the side. Use curved
+edges to bend the outline to the screen in the footage, and bow to make the
+artwork sit on that curve. Together they read as a barrel-fronted panel;
+either alone falls short of it.
 
 Shaping is applied before brightness, contrast and blending, so what is
 matched to the shot is the shape that will actually be laid down. Whatever a
