@@ -746,18 +746,25 @@ FEATURE_PARAMS = dict(
 class TrackResult:
     """Outcome of a single tracking step."""
 
-    __slots__ = ("ok", "quad", "n_features", "n_inliers", "reason")
+    __slots__ = ("ok", "quad", "n_features", "n_inliers", "reason",
+                 "following_camera")
 
-    def __init__(self, ok, quad=None, n_features=0, n_inliers=0, reason=""):
+    def __init__(self, ok, quad=None, n_features=0, n_inliers=0, reason="",
+                 following_camera=False):
         self.ok = ok
         self.quad = quad
         self.n_features = n_features
         self.n_inliers = n_inliers
         self.reason = reason
+        #: True when the region is out of shot and this step came from the
+        #: camera's own motion rather than from the region's texture.
+        self.following_camera = following_camera
 
     def __repr__(self):
         return (f"TrackResult(ok={self.ok}, n_features={self.n_features}, "
-                f"n_inliers={self.n_inliers}, reason={self.reason!r})")
+                f"n_inliers={self.n_inliers}, "
+                f"following_camera={self.following_camera}, "
+                f"reason={self.reason!r})")
 
 
 class PlanarTracker:
@@ -801,6 +808,7 @@ class PlanarTracker:
                  anchor_min_inliers: int = 12,
                  anchor_min_ratio: float = 0.60,
                  anchor_max_correction: float = 6.0,
+                 offscreen_below: float = 0.30,
                  feature_params: dict = None,
                  lk_params: dict = None):
         """
@@ -832,6 +840,9 @@ class PlanarTracker:
             anchor_max_correction: reject a correction that moves a corner
                 further than this, in pixels -- it is a drift fix, not a
                 relocation, and a big jump means the anchor no longer matches.
+            offscreen_below: how much of the region must still be in shot for
+                its own texture to drive the tracking. Under this fraction the
+                camera's motion is followed instead. 0 disables that.
         """
         self.feature_source = feature_source
         self.surround_scale = surround_scale
@@ -839,6 +850,7 @@ class PlanarTracker:
         self.anchor_min_inliers = anchor_min_inliers
         self.anchor_min_ratio = anchor_min_ratio
         self.anchor_max_correction = anchor_max_correction
+        self.offscreen_below = offscreen_below
         self.fb_threshold = fb_threshold
         self.ransac_threshold = ransac_threshold
         self.min_features = min_features
@@ -861,6 +873,15 @@ class PlanarTracker:
         self.frame_shape = self.prev_gray.shape[:2]
         self._diagonal = float(np.hypot(*self.frame_shape))
         self.features = None
+        # Set once the region has left the shot and the camera is being
+        # followed in its place; see :meth:`track`.
+        self.following_camera = False
+        self.camera_frames = 0
+        # Recent centroids, for how fast the region was moving across the
+        # frame just before it left it, and what is left of that motion once
+        # the camera's own is taken out.
+        self._centroids = []
+        self._offscreen_drift = None
         self._seed_features()
 
         # Keep the anchor frame and the features found on it, so the current
@@ -889,9 +910,55 @@ class PlanarTracker:
         centre = self.quad.mean(axis=0)
         return ((self.quad - centre) * factor + centre).astype(np.float32)
 
+    #: How many recent frames to average the region's speed over. Long enough
+    #: to shrug off per-frame noise, short enough to still describe what it was
+    #: doing at the moment it left rather than earlier in the shot.
+    VELOCITY_FRAMES = 6
+
+    #: Below this, in pixels per frame, a region is taken to be fixed to the
+    #: scene rather than moving through it. What is left over for a billboard
+    #: after the camera is accounted for is measurement noise, well under a
+    #: pixel, and carrying that for a long stretch off screen walks the shape
+    #: away from where it belongs -- measured at 29px across fifty frames.
+    #: Anything genuinely moving on its own runs to many pixels a frame, so the
+    #: two are never close.
+    OFFSCREEN_DRIFT_FLOOR = 2.0
+
+    def _region_velocity(self) -> np.ndarray:
+        """How far the region moved across the frame per frame, lately."""
+        if len(self._centroids) < 2:
+            return np.zeros(2, np.float32)
+        span = self._centroids[-1] - self._centroids[0]
+        return (span / (len(self._centroids) - 1)).astype(np.float32)
+
+    def visible_fraction(self) -> float:
+        """How much of the region is inside the frame, from 0 to 1."""
+        h, w = self.frame_shape
+        area = quad_area(self.quad)
+        if area <= 0:
+            return 0.0
+        frame_rect = np.float32([[0, 0], [w, 0], [w, h], [0, h]])
+        try:
+            overlap, _ = cv2.intersectConvexConvex(
+                self.quad.astype(np.float32), frame_rect)
+        except cv2.error:
+            return 0.0
+        return float(np.clip(overlap / area, 0.0, 1.0))
+
     def _feature_mask(self) -> np.ndarray:
         """Where to look for features, according to ``feature_source``."""
         h, w = self.prev_gray.shape[:2]
+
+        if self.following_camera:
+            # Anything that moves with the camera will do, except the region
+            # itself: a screen or billboard is usually the strongest texture in
+            # shot, so left in it takes most of the detector's budget, and then
+            # every one of those points leaves the frame together a moment
+            # later. RANSAC throws out whatever else is moving on its own --
+            # traffic, pedestrians, other screens.
+            mask = np.full((h, w), 255, np.uint8)
+            cv2.fillPoly(mask, [self._scaled_quad(1.15).astype(np.int32)], 0)
+            return mask
 
         if self.feature_source in (self.INTERIOR, self.BOTH):
             mask = quad_to_mask(self.quad, w, h)
@@ -930,30 +997,50 @@ class PlanarTracker:
         """
         gray = self._gray(frame)
 
+        # Once the surface has left the shot there is nothing of it left to
+        # measure, and following the region alone simply stops: the quad
+        # freezes against the edge of frame and the insert bunches up there
+        # instead of carrying on out of shot. During a pan the rest of the
+        # scene is still moving with the camera, so that is followed instead,
+        # which keeps the region moving at the right rate, turns it round when
+        # the camera does, and leaves it in the right place to be picked up
+        # again when it comes back into view.
+        following = (self.offscreen_below > 0
+                     and self.visible_fraction() < self.offscreen_below)
+        if following != self.following_camera:
+            self.following_camera = following
+            self._offscreen_drift = None    # re-measured on the first step
+            self._seed_features()
+        if following:
+            self.camera_frames += 1
+
         if self.features is None or len(self.features) < self.min_features:
             self._seed_features()
         if len(self.features) < self.min_features:
-            return TrackResult(False, reason="no trackable features in region")
+            return TrackResult(False, following_camera=following,
+                               reason="no trackable features in region")
 
         p0 = self.features.reshape(-1, 1, 2).astype(np.float32)
 
         p1, st_fwd, _ = cv2.calcOpticalFlowPyrLK(self.prev_gray, gray, p0, None,
                                                  **self.lk_params)
         if p1 is None:
-            return TrackResult(False, reason="optical flow returned nothing")
+            return TrackResult(False, following_camera=following,
+                               reason="optical flow returned nothing")
 
         # Track back again: a point that does not return to where it started
         # was not really tracked, whatever its reported error.
         p0r, st_bwd, _ = cv2.calcOpticalFlowPyrLK(gray, self.prev_gray, p1, None,
                                                   **self.lk_params)
         if p0r is None:
-            return TrackResult(False, reason="reverse optical flow returned nothing")
+            return TrackResult(False, following_camera=following,
+                               reason="reverse optical flow returned nothing")
 
         fb_error = np.linalg.norm((p0 - p0r).reshape(-1, 2), axis=1)
         good = (st_fwd.ravel() == 1) & (st_bwd.ravel() == 1) & (fb_error < self.fb_threshold)
         n_good = int(good.sum())
         if n_good < 3:
-            return TrackResult(False, n_features=n_good,
+            return TrackResult(False, n_features=n_good, following_camera=following,
                                reason=f"only {n_good} points survived the flow check")
 
         src = p0.reshape(-1, 2)[good]
@@ -961,11 +1048,13 @@ class PlanarTracker:
 
         matrix, inlier_mask = self._fit_transform(src, dst)
         if matrix is None:
-            return TrackResult(False, n_features=n_good, reason="could not fit a transform")
+            return TrackResult(False, n_features=n_good, following_camera=following,
+                               reason="could not fit a transform")
 
         n_inliers = int(inlier_mask.sum()) if inlier_mask is not None else n_good
         if n_inliers < 3:
             return TrackResult(False, n_features=n_good, n_inliers=n_inliers,
+                               following_camera=following,
                                reason="too few inliers")
 
         cumulative = matrix @ self.cumulative_h
@@ -973,27 +1062,59 @@ class PlanarTracker:
             self.anchor_quad.reshape(-1, 1, 2), cumulative.astype(np.float64)
         ).reshape(4, 2).astype(np.float32)
 
+        if following:
+            # The camera's motion is not always the whole story. An advert on
+            # the side of a bus is leaving the shot under its own steam, and
+            # following the camera alone would park it where it was last seen
+            # while the bus drives off. Whatever the region was doing over and
+            # above the camera before it left is carried on at the same rate --
+            # the only honest guess about something that cannot be seen.
+            if self._offscreen_drift is None:
+                camera_step = new_quad.mean(axis=0) - self.quad.mean(axis=0)
+                drift = self._region_velocity() - camera_step
+                if np.linalg.norm(drift) < self.OFFSCREEN_DRIFT_FLOOR:
+                    drift = np.zeros(2, np.float32)
+                self._offscreen_drift = drift
+            shift = np.eye(3, dtype=np.float64)
+            shift[0, 2], shift[1, 2] = self._offscreen_drift
+            cumulative = shift @ cumulative
+            new_quad = cv2.perspectiveTransform(
+                self.anchor_quad.reshape(-1, 1, 2), cumulative
+            ).reshape(4, 2).astype(np.float32)
+
         rejection = self._reject_reason(new_quad)
         if rejection:
             return TrackResult(False, n_features=n_good, n_inliers=n_inliers,
-                               reason=rejection)
+                               following_camera=following, reason=rejection)
 
         # Commit.
         self.cumulative_h = cumulative
         self.quad = new_quad
         self.prev_gray = gray
+        if not following:
+            # Only positions measured from the region itself are worth
+            # averaging: once the camera is being followed the centroid moves
+            # by construction, and feeding that back would compound its own
+            # guess.
+            self._centroids.append(new_quad.mean(axis=0))
+            del self._centroids[:-self.VELOCITY_FRAMES]
         kept = dst[inlier_mask.ravel().astype(bool)] if inlier_mask is not None else dst
         self.features = kept.reshape(-1, 1, 2).astype(np.float32)
         if len(self.features) < self.reseed_below:
             self._seed_features()
 
         self._since_anchor += 1
-        if self.anchor_interval and self._since_anchor >= self.anchor_interval:
+        # The anchor is a view of the region, so there is nothing for it to
+        # match against while the region is out of shot. Its guards would
+        # refuse the result anyway; skipping saves the work and removes any
+        # chance of a fluke match relocating the shape while it is off screen.
+        if (self.anchor_interval and not following
+                and self._since_anchor >= self.anchor_interval):
             self._since_anchor = 0
             self._correct_against_anchor(gray)
 
         return TrackResult(True, quad=self.quad.copy(), n_features=n_good,
-                           n_inliers=n_inliers)
+                           n_inliers=n_inliers, following_camera=following)
 
     def _correct_against_anchor(self, gray) -> bool:
         """Re-derive the position from the anchor frame, clearing drift.
