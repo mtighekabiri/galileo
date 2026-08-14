@@ -64,6 +64,7 @@ macOS, `~/.local/share/Galileo` on Linux).
 | Drag a square handle (Curve mode) | Bend that edge |
 | `1`–`4` | Select the corresponding corner |
 | `5` | Select the whole shape |
+| `T` / `R` / `B` / `L` | Select that edge's bend handles; press again for the second |
 | Arrow keys | Nudge the selection by 1 px |
 | `D` / `C` | Delete this frame's shape / copy it from the previous frame |
 | Tracking switch | Enable/disable tracking during playback |

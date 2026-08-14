@@ -591,3 +591,158 @@ class TestWiredIntoThePanel:
         panel.update_magnifier(force=True)
         assert panel.magnifier.region is not None
         assert len(panel.magnifier.points) == 4
+
+
+class TestTheBendHandlesAreDrawnOnTheCurve:
+    """A bend handle is placed correctly when the curve it produces sits on
+    the screen's edge. Showing the curve without what is pulling it leaves
+    that unjudgeable."""
+
+    def test_a_neighbouring_handle_appears_in_the_view(self, magnifier):
+        region = curved_region(40)
+        centre = Point(*region.controls[0, 0], "T1", Point.HANDLE)
+        # Wide enough for the next handle along to fall inside the view: they
+        # sit a third of an edge apart, which is 213px once magnified.
+        magnifier.resize(700, 500)
+        magnifier.setData(screen_frame(), [centre], region=region,
+                          focus_index=0, zoom_factor=2)
+        shown = grab(magnifier)
+
+        rect, _ = magnifier.tiles()[0]
+        scale, offset_x, offset_y = magnifier.tile_mapping(rect, centre)
+        other = region.controls[0, 1]
+        x = int(other[0] * scale + offset_x)
+        y = int(other[1] * scale + offset_y)
+        assert rect.contains(x, y), "fixture should put the other handle in view"
+
+        patch = shown[y - 8:y + 8, x - 8:x + 8].astype(int)
+        bluish = (patch[:, :, 0] > patch[:, :, 2] + 25).sum()
+        assert bluish > 12, "no handle drawn where the other bend sits"
+
+    def test_the_corners_are_drawn_too(self, magnifier):
+        region = core.Region(np.float32(CORNERS))
+        centre = Point(*CORNERS[0], "1", Point.CORNER)
+        magnifier.resize(500, 900)          # tall enough to reach corner 4
+        magnifier.setData(screen_frame(), [centre], region=region,
+                          focus_index=0, zoom_factor=2)
+        shown = grab(magnifier)
+        rect, _ = magnifier.tiles()[0]
+        scale, offset_x, offset_y = magnifier.tile_mapping(rect, centre)
+        x = int(CORNERS[3][0] * scale + offset_x)
+        y = int(CORNERS[3][1] * scale + offset_y)
+        assert rect.contains(x, y), "fixture should put corner 4 in view"
+        patch = shown[y - 8:y + 8, x - 8:x + 8].astype(int)
+        assert (patch[:, :, 2] > patch[:, :, 0] + 25).sum() > 12
+
+    def test_the_picked_handle_is_marked_out(self, magnifier):
+        region = curved_region(40)
+        centre = Point(*region.controls[0, 0], "T1", Point.HANDLE)
+        magnifier.resize(700, 500)
+        magnifier.setData(screen_frame(), [centre], region=region,
+                          focus_index=0, zoom_factor=2, selected_control=None)
+        plain = grab(magnifier)
+        magnifier.setData(screen_frame(), [centre], region=region,
+                          focus_index=0, zoom_factor=2, selected_control=(0, 1))
+        picked = grab(magnifier)
+        assert not np.array_equal(plain, picked)
+
+    def test_a_straight_area_draws_no_bend_handles(self, magnifier):
+        """They do not exist until curving is switched on."""
+        straight = core.Region(np.float32(CORNERS))
+        centre = Point(*CORNERS[0], "1", Point.CORNER)
+        magnifier.setData(screen_frame(), [centre], region=straight,
+                          focus_index=0, zoom_factor=2)
+        shown = grab(magnifier).astype(int)
+        bluish = ((shown[:, :, 0] > shown[:, :, 2] + 40)
+                  & (shown[:, :, 0] > 150)).sum()
+        assert bluish < 200, "something blue is drawn on a straight area"
+
+
+class TestPickingABendHandleWithTheKeys:
+    """Keys 1-4 have always picked the corners. The eight bend handles could
+    only ever be dragged, so there was no way to nudge one by a pixel -- which
+    matters more there than on a corner, a handle being a lever."""
+
+    @pytest.fixture
+    def app(self, qapp, clip_video):
+        path, truth = clip_video
+        window = galileo_app.MainWindow()
+        panel = window.central_panel
+        panel.load_video(path)
+        overlay = panel.tracking_overlay
+        overlay.points = [tuple(map(float, p)) for p in truth[0]]
+        overlay.curved_enabled = True
+        yield window, panel, overlay
+        window.dirty = False
+        window.close()
+
+    def press(self, overlay, key, modifier=Qt.NoModifier):
+        from PyQt5.QtGui import QKeyEvent
+        overlay.keyPressEvent(QKeyEvent(QEvent.KeyPress, key, modifier))
+
+    def test_each_edge_key_picks_that_edges_bend(self, app):
+        window, panel, overlay = app
+        for key, edge in ((Qt.Key_T, 0), (Qt.Key_R, 1),
+                          (Qt.Key_B, 2), (Qt.Key_L, 3)):
+            overlay.selected_control = None
+            self.press(overlay, key)
+            assert overlay.selected_control == (edge, 0)
+
+    def test_pressing_it_again_steps_to_the_other_one(self, app):
+        window, panel, overlay = app
+        self.press(overlay, Qt.Key_T)
+        assert overlay.selected_control == (0, 0)
+        self.press(overlay, Qt.Key_T)
+        assert overlay.selected_control == (0, 1)
+        self.press(overlay, Qt.Key_T)
+        assert overlay.selected_control == (0, 0)
+
+    def test_the_arrow_keys_move_it(self, app):
+        window, panel, overlay = app
+        self.press(overlay, Qt.Key_T)
+        before = np.array(overlay.current_region().controls[0, 0])
+        self.press(overlay, Qt.Key_Right)
+        after = np.array(overlay.current_region().controls[0, 0])
+        assert after[0] == pytest.approx(before[0] + 1.0, abs=0.01)
+        assert after[1] == pytest.approx(before[1], abs=0.01)
+
+    def test_the_modifiers_work_the_same_as_on_a_corner(self, app):
+        window, panel, overlay = app
+        self.press(overlay, Qt.Key_T)
+        before = np.array(overlay.current_region().controls[0, 0])
+        self.press(overlay, Qt.Key_Right, Qt.ShiftModifier)
+        assert overlay.current_region().controls[0, 0][0] == \
+            pytest.approx(before[0] + 10.0, abs=0.01)
+        self.press(overlay, Qt.Key_Left, Qt.ControlModifier)
+        assert overlay.current_region().controls[0, 0][0] == \
+            pytest.approx(before[0] + 9.75, abs=0.01)
+
+    def test_picking_a_corner_lets_the_bend_go(self, app):
+        window, panel, overlay = app
+        self.press(overlay, Qt.Key_T)
+        self.press(overlay, Qt.Key_2)
+        assert overlay.selected_control is None
+        assert overlay.selected_point_index == 1
+
+    def test_the_keys_do_nothing_until_curving_is_on(self, app):
+        window, panel, overlay = app
+        overlay.curved_enabled = False
+        self.press(overlay, Qt.Key_T)
+        assert overlay.selected_control is None
+
+    def test_the_magnifier_follows_the_pick(self, app):
+        window, panel, overlay = app
+        self.press(overlay, Qt.Key_B)
+        self.press(overlay, Qt.Key_B)
+        points, selected, focus = panel.magnifier_points()
+        assert points[selected].label == "B2"
+        assert focus is None, "picking with a key should not hide the others"
+
+    def test_a_nudge_is_recorded_for_the_frame(self, app):
+        """An edit that is drawn but never stored is the fault this whole
+        path was written to avoid."""
+        window, panel, overlay = app
+        self.press(overlay, Qt.Key_T)
+        before = np.array(overlay.curvature).copy()
+        self.press(overlay, Qt.Key_Up)
+        assert not np.array_equal(before, np.array(overlay.curvature))
