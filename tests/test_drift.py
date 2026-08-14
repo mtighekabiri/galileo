@@ -112,12 +112,29 @@ class TestDriftDuringAPan:
 class TestCorrectionIsGated:
     def test_a_diverging_viewpoint_does_not_make_things_worse(self, swing):
         """Under a big orbit the anchor stops matching; corrections must not
-        drag the shape off a chain that is doing better without them."""
+        drag the shape off a chain that is doing better without them.
+
+        Levelling each frame for exposure costs a little here, and only here.
+        The anchor and the current frame are levelled by their own statistics,
+        and 62 degrees apart those describe genuinely different content, so the
+        two are no longer quite like for like: measured at 0.33px against
+        0.21px before. It buys 10.5px on a clip whose exposure is hunting,
+        which is the trade this takes. Both stay comfortably sub-pixel, which
+        is the property that actually matters and is asserted below.
+        """
         frames, quads = swing
         without, _ = track_errors(frames, quads, anchor_interval=0)
         with_anchor, _ = track_errors(frames, quads)
-        assert with_anchor.mean() <= without.mean() + 0.05, (
+        assert with_anchor.mean() < 1.0, f"{with_anchor.mean():.2f}px"
+        assert with_anchor.mean() <= without.mean() + 0.1, (
             f"anchored {with_anchor.mean():.2f}px vs incremental {without.mean():.2f}px")
+
+    def test_levelling_is_what_costs_it(self, swing):
+        """Pins the cause, so a future change to either is not mistaken for
+        the other coming back."""
+        frames, quads = swing
+        plain, _ = track_errors(frames, quads, normalise_illumination=False)
+        assert plain.mean() < 0.3
 
     def test_a_poorly_matched_anchor_is_refused(self, swing):
         """Demanding a near-perfect match should block nearly everything here."""

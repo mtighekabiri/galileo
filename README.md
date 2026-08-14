@@ -97,6 +97,24 @@ genuinely rigid. On the same clip that gives **1.0 px** average error.
 > When using this mode, leave some room around the screen as you mark it —
 > the surrounding detail is what the tracking now depends on.
 
+**You should not have to know any of that**, so as soon as an area is marked
+the tool reads the next dozen frames and checks. It reads the motion twice,
+once from inside the area and once from the surface around it. Markings fixed
+to a panel give two readings that agree to a hundredth of a pixel; a picture
+running on its own does not. If they disagree, it explains what it found and
+offers the change.
+
+The worst disagreement decides it, not the average — a screen changing slides
+every few seconds agrees perfectly in between and wildly at each change, so an
+average buries exactly the frames that matter. Measured across an ordinary
+poster, one under a hunting exposure, one with a person crossing it, one shot
+on a fast pan, a screen scrolling an advert, a screen changing slides, and a
+screen changing slides with a person in front, it is right about all seven.
+
+> A screen showing one **still** picture is deliberately *not* flagged. Nothing
+> is moving independently, so tracking its inside works perfectly well, and
+> there is nothing to warn about.
+
 ## Occlusion — people walking in front
 
 In airports, malls and high streets somebody is constantly crossing between the
@@ -142,6 +160,30 @@ smooths the result and coasts the shape through brief occlusions.
 
 Results accumulate in `tracking_history`, a `{frame_index: [4 corners]}` map
 that drives both the preview and the render.
+
+### Footage whose brightness will not sit still
+
+Optical flow rests on one assumption: that a point keeps its brightness from
+one frame to the next. A camera panning across a dim concourse onto a bright
+screen breaks it on every frame, because its automatic exposure is hunting the
+whole time — not an edge case for this tool but the ordinary condition of the
+footage it is given.
+
+Every frame therefore has its own brightness and contrast taken out before
+anything is followed. On a pan with the exposure swinging by 40% the shape ends
+**10.5 px** off its surface without this and **0.11 px** with it; at 70% it is
+**21.1 px** against **0.13 px**. A steady shot pays about three hundredths of a
+pixel for it.
+
+Both statistics are the median and the spread about the median, rather than the
+mean and standard deviation, because they have to describe the *lighting* and
+not the contents. A large bright object crossing the frame — or the tracked
+panel itself sliding out of it — moves a mean and a standard deviation enough
+to fake an exposure change and undo the whole point: on a clip that pans a panel
+out of shot and back, mean and standard deviation cost 7.6 px where the median
+leaves the result untouched. They are computed from a 256-bin histogram, which
+makes them exact over the whole frame for one pass, and applied through a lookup
+table: 0.76 ms on a 1080p frame, against 14 ms doing the arithmetic per pixel.
 
 ### When the surface leaves the shot
 

@@ -1693,6 +1693,7 @@ class TrackingOverlay(QWidget):
         if mw and mw.central_panel:
             # The shape is now valid, so tracking becomes available.
             mw.central_panel.update_tracking_availability()
+            mw.check_for_a_playing_screen()
 
     def get_main_window(self):
         w = self.parentWidget()
@@ -4586,6 +4587,74 @@ class MainWindow(QMainWindow):
             f"Found {len(chosen)} on frame {frame_index}:\n\n{summary}\n\n"
             "Give each one a creative, adjust corners if needed, then turn "
             "tracking on.")
+
+    def read_ahead(self, count: int = 14):
+        """A short run of frames from where playback is, for inspection.
+
+        Read through a capture of its own so the one driving playback is left
+        exactly where the user left it.
+        """
+        panel = self.central_panel
+        path = getattr(panel, "current_video_path", None)
+        if not path:
+            return []
+        capture = cv2.VideoCapture(path)
+        if not capture.isOpened():
+            return []
+        try:
+            capture.set(cv2.CAP_PROP_POS_FRAMES, panel.get_current_frame_index())
+            frames = []
+            for _ in range(count):
+                ok, frame = capture.read()
+                if not ok:
+                    break
+                frames.append(frame)
+            return frames
+        finally:
+            capture.release()
+
+    def check_for_a_playing_screen(self):
+        """Warn if the area just marked is a screen showing its own picture.
+
+        This is the one mistake that ruins an export without ever looking like
+        a mistake: the tracker follows the advert being played instead of the
+        panel playing it, and ends hundreds of pixels off with barely a
+        complaint. The setting that avoids it has always been there, under
+        Options, but only helps someone who already knows to look for it.
+        """
+        panel = self.central_panel
+        overlay = panel.tracking_overlay
+        if (len(overlay.points) != 4
+                or panel.feature_source != core.PlanarTracker.INTERIOR):
+            return                      # nothing marked, or already switched
+
+        frames = self.read_ahead()
+        if len(frames) < 4:
+            return                      # too near the end of the clip to judge
+        quads = [overlay.points] * len(frames)
+        try:
+            verdict = core.looks_like_a_playing_screen(frames, quads)
+        except cv2.error as exc:        # never block marking an area over this
+            logging.debug("screen check skipped: %s", exc)
+            return
+
+        logging.debug("screen check: %r", verdict)
+        if not verdict.independent:
+            return
+
+        answer = QMessageBox.question(
+            self, "This Looks Like a Playing Screen",
+            "The picture inside the area you marked is moving independently "
+            "of the panel it is on, by up to "
+            f"{verdict.worst_gap:.0f} pixels a frame.\n\n"
+            "That is what a digital screen looks like: the advert it is "
+            "playing changes, so following the picture follows the advert "
+            "rather than the screen, and the insert wanders off the panel "
+            "without the tracking reporting anything wrong.\n\n"
+            "Track the bezel and wall around it instead?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
+        if answer == QMessageBox.Yes:
+            self.title_bar.digital_screen_action.setChecked(True)
 
     def toggle_digital_screen(self, enabled: bool):
         """Choose where the tracker looks for the features it follows.
