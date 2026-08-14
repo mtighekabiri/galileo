@@ -293,6 +293,7 @@ class BlendDialog(QDialog):
         for name, _, _ in self.EFFECTS:
             self.sliders[name].setValue(int(getattr(fresh, name) * 100))
         self.enabled_box.setChecked(True)
+        self.fill_box.setChecked(morphlib.Morph().fill)
 
     def _revert_and_reject(self):
         for key, value in self.original.items():
@@ -365,10 +366,23 @@ class MorphDialog(QDialog):
         layout = QVBoxLayout(self)
         layout.setSpacing(9)
 
+        switches = QHBoxLayout()
         self.enabled_box = QCheckBox("Shape this creative")
         self.enabled_box.setChecked(morph.enabled)
         self.enabled_box.toggled.connect(self._on_enabled)
-        layout.addWidget(self.enabled_box)
+        switches.addWidget(self.enabled_box)
+
+        self.fill_box = QCheckBox("Fill the area")
+        self.fill_box.setChecked(morph.fill)
+        self.fill_box.setToolTip(
+            "Keep the creative covering every pixel of the tracked area,\n"
+            "cropping whatever a turn pushes outside it.\n\n"
+            "Turned off, a turn leaves transparent wedges at the corners --\n"
+            "and those wedges are the tracked surface showing through.")
+        self.fill_box.toggled.connect(self._on_fill)
+        switches.addWidget(self.fill_box)
+        switches.addStretch()
+        layout.addLayout(switches)
 
         self.thumbnail = QLabel()
         self.thumbnail.setFixedHeight(210 if preview is not None else 150)
@@ -420,6 +434,10 @@ class MorphDialog(QDialog):
         self._sync_enabled()
         self._refresh()
 
+    def _on_fill(self, checked):
+        self.morph.fill = checked
+        self._refresh()
+
     def _sync_enabled(self):
         for slider in self.sliders.values():
             slider.setEnabled(self.morph.enabled)
@@ -435,6 +453,7 @@ class MorphDialog(QDialog):
                 int(round(getattr(fresh, name) * 100)) if name in self.SCALED
                 else int(round(getattr(fresh, name))))
         self.enabled_box.setChecked(True)
+        self.fill_box.setChecked(morphlib.Morph().fill)
 
     def _revert_and_reject(self):
         for key, value in self.original.items():
@@ -1372,6 +1391,10 @@ class Placement:
         # describes where the surface is and must not be nudged to fake the
         # look of the artwork on it.
         self.morph = morphlib.Morph()
+        # Shaping a 1080p creative costs tens of milliseconds, and for a still
+        # creative with settings nobody is dragging the answer is the same on
+        # every frame of playback and of a render.
+        self.shape_cache = morphlib.ShapeCache()
 
         # Tracking state, rebuilt whenever the shape is edited.
         self.feature_source = core.PlanarTracker.INTERIOR
@@ -1932,7 +1955,8 @@ class TrackingOverlay(QWidget):
         """One placement's creative, adapted to the frame it is going into."""
         if placement.overlay_bgra is None:
             return None
-        styled = morphlib.apply_morph(placement.overlay_bgra, placement.morph)
+        styled = placement.shape_cache.apply(placement.overlay_bgra,
+                                             placement.morph)
         styled = core.apply_brightness_contrast(
             styled, placement.brightness, placement.contrast)
         if placement.colourise_enabled and base_frame is not None:
@@ -1961,7 +1985,7 @@ class TrackingOverlay(QWidget):
         """
         if self.overlay_bgra is None:
             return None
-        styled = morphlib.apply_morph(self.overlay_bgra, self.morph)
+        styled = self.active.shape_cache.apply(self.overlay_bgra, self.morph)
         styled = core.apply_brightness_contrast(
             styled, self.brightness, self.contrast)
         if self.colourise_enabled and base_frame is not None and quad is not None:
@@ -3728,6 +3752,7 @@ class PlacementSnapshot:
         self.colourise = placement.colourise_enabled
         self.blend = blend.BlendSettings.from_dict(placement.blend.to_dict())
         self.morph = morphlib.Morph.from_dict(placement.morph.to_dict())
+        self.shape_cache = morphlib.ShapeCache()
         self.scale = scale
         # Per-placement decode state, filled in by the worker.
         self.capture = None
@@ -3854,7 +3879,7 @@ class RenderWorker(QObject):
         if not core.is_valid_region(region):
             return base_frame
 
-        styled = morphlib.apply_morph(creative, placement.morph)
+        styled = placement.shape_cache.apply(creative, placement.morph)
         styled = core.apply_brightness_contrast(
             styled, placement.brightness, placement.contrast)
         if placement.colourise:

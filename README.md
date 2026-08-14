@@ -428,10 +428,26 @@ edges to bend the outline to the screen in the footage, and bow to make the
 artwork sit on that curve. Together they read as a barrel-fronted panel;
 either alone falls short of it.
 
-Shaping is applied before brightness, contrast and blending, so what is
-matched to the shot is the shape that will actually be laid down. Whatever a
-tilt pushes outside the canvas becomes transparent rather than black, so the
-footage shows through exactly as it does around a creative's own transparency.
+**Fill the area** keeps the creative covering every pixel of the tracked area,
+which is on by default. A turn shrinks the artwork inside its own canvas, and
+what is left over is not empty — it is the tracked surface showing through,
+which is the one thing an insert must never do. Filling grows the artwork until
+the area is entirely inside it and crops the overhang instead. Measured across
+turns, tips, rotations and combinations of all three, that takes the gap from
+as much as 72% of the area down to none of it. The cost is the edges of the
+artwork, so it can be turned off where those matter more than the seal.
+
+Shaping is applied before brightness, contrast and blending, so what is matched
+to the shot is the shape that will actually be laid down.
+
+> **Shaping is not redone frame by frame.** A 1080p creative took 98 ms to
+> shape, which capped preview playback at ten frames a second and added the
+> same to every frame of a render. Most of that was the curve shading widening
+> the whole image to floating point; done a channel at a time through OpenCV's
+> saturating multiply it is 47 ms. And for a still creative with settings
+> nobody is dragging, the answer is identical every frame, so it is kept — the
+> repeat costs 0.002 ms. A creative *video* hands over a new picture each frame
+> and so is redone, which is correct: there is genuinely new work to do.
 
 ## Audio and output quality
 
