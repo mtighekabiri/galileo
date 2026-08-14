@@ -17,10 +17,17 @@ python LUMEN_Insertion_Tool_1.0.0.py
 ```
 
 Requires a desktop session — it is a windowed Qt application, not a CLI.
-Debug output is written to `app_debug.log` in the working directory.
 
 Install `ffmpeg` too if you want the rendered video to keep its audio; see
 [Audio](#audio) below.
+
+**To give it to someone who does not have Python**, run `python build.py` to
+package it into a self-contained folder they can unzip and double-click. No
+install, no admin rights. See [BUILD.md](BUILD.md).
+
+Debug output goes to `app_debug.log` in a per-user folder
+(`%LOCALAPPDATA%\LUMEN` on Windows, `~/Library/Application Support/LUMEN` on
+macOS, `~/.local/share/LUMEN` on Linux).
 
 ## Workflow
 

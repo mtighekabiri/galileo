@@ -21,12 +21,49 @@ from PyQt5.QtGui import (
 from PyQt5.QtMultimedia import QMediaPlayer, QMediaContent
 from PyQt5.QtMultimediaWidgets import QVideoWidget
 
+def app_directory() -> str:
+    """Where the application lives — the bundle folder when packaged."""
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def user_data_directory() -> str:
+    """A per-user, definitely-writable folder for logs and settings.
+
+    A packaged build may be launched from a read-only folder, a network share
+    or a memory stick, so the log cannot simply go in the working directory:
+    that would fail at import time, before there is any window to report it in.
+    """
+    if sys.platform == "win32":
+        root = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+    elif sys.platform == "darwin":
+        root = os.path.join(os.path.expanduser("~"), "Library", "Application Support")
+    else:
+        root = os.environ.get("XDG_DATA_HOME") or os.path.join(
+            os.path.expanduser("~"), ".local", "share")
+
+    directory = os.path.join(root, "LUMEN")
+    try:
+        os.makedirs(directory, exist_ok=True)
+        return directory
+    except OSError:
+        import tempfile
+        return tempfile.gettempdir()
+
+
+LOG_PATH = os.path.join(user_data_directory(), "app_debug.log")
+
 logging.basicConfig(
-    filename='app_debug.log',
+    filename=LOG_PATH,
     filemode='w',
     level=logging.DEBUG,
     format='%(asctime)s - %(levelname)s - %(message)s')
-logging.debug("Application start")
+logging.debug("Application start; log at %s", LOG_PATH)
+
+# Let a bundled ffmpeg sitting beside the application be found, so audio works
+# without anything being installed.
+core.register_binary_dir(app_directory())
 
 def log_uncaught_exceptions(exctype, value, tb):
     import traceback
@@ -2694,7 +2731,7 @@ class MainWindow(QMainWindow):
             "width:None",
             "height:None",
             f"stim_width:{video_w}",
-            f"stim_height:{video_h}.0",
+            f"stim_height:{video_h}",
         ]
 
         # Row 2 (the requested header)
@@ -2718,8 +2755,14 @@ class MainWindow(QMainWindow):
 
         geometry_data = []
 
-        # Get the dictionary of frames -> corners
-        frame_dict = self.central_panel.tracking_overlay.tracking_history
+        # Interpolate exactly as the renderer does. Exporting only the frames
+        # that happen to be keyed would leave holes in the AOI wherever the
+        # user scrubbed or re-adjusted, so a fixation landing on the ad during
+        # a gap would not be attributed to it -- quietly under-counting dwell
+        # time and fixation counts. It would also disagree with the rendered
+        # video, which draws the ad on every frame in the range.
+        frame_dict = core.interpolate_tracking(
+            self.central_panel.tracking_overlay.tracking_history)
 
         # Sort the frame numbers so CSV rows are in ascending order
         for frame_idx in sorted(frame_dict.keys()):

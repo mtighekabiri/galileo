@@ -1,0 +1,4 @@
+-r requirements.txt
+
+# Packaging into a standalone application that needs no Python installed.
+pyinstaller>=6.0

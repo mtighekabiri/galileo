@@ -1262,9 +1262,31 @@ def history_to_lists(history: dict) -> dict:
 # Video output
 # --------------------------------------------------------------------------
 
+# Extra directories to search for ffmpeg before falling back to PATH. A
+# packaged build registers its own folder here, so dropping ffmpeg.exe next to
+# the application is enough to get audio -- no install, no admin rights.
+_BINARY_SEARCH_DIRS = []
+
+
+def register_binary_dir(path: str) -> None:
+    """Add a directory to search for bundled helper binaries."""
+    if path and os.path.isdir(path) and path not in _BINARY_SEARCH_DIRS:
+        _BINARY_SEARCH_DIRS.insert(0, path)
+
+
+def find_binary(name: str) -> str:
+    """Locate a helper binary next to the app, else on PATH."""
+    for directory in _BINARY_SEARCH_DIRS:
+        for candidate in (name, f"{name}.exe"):
+            full = os.path.join(directory, candidate)
+            if os.path.isfile(full) and os.access(full, os.X_OK):
+                return full
+    return shutil.which(name)
+
+
 def has_ffmpeg() -> bool:
-    """True if an ``ffmpeg`` binary is on PATH."""
-    return shutil.which("ffmpeg") is not None
+    """True if an ``ffmpeg`` binary is available."""
+    return find_binary("ffmpeg") is not None
 
 
 def remux_audio(video_path: str, source_path: str, out_path: str,
@@ -1277,11 +1299,12 @@ def remux_audio(video_path: str, source_path: str, out_path: str,
     offset to match the rendered frame range. Returns True if ``out_path`` was
     written; on any failure the caller keeps the silent render.
     """
-    if not has_ffmpeg():
+    ffmpeg = find_binary("ffmpeg")
+    if not ffmpeg:
         logger.info("ffmpeg not found; leaving the render silent")
         return False
 
-    cmd = ["ffmpeg", "-y", "-loglevel", "error", "-i", video_path]
+    cmd = [ffmpeg, "-y", "-loglevel", "error", "-i", video_path]
     if start_time:
         cmd += ["-ss", f"{start_time:.6f}"]
     cmd += ["-i", source_path]
@@ -1311,11 +1334,12 @@ def remux_audio(video_path: str, source_path: str, out_path: str,
 
 def source_has_audio(path: str) -> bool:
     """True if ffprobe reports an audio stream (False if ffprobe is absent)."""
-    if shutil.which("ffprobe") is None:
+    ffprobe = find_binary("ffprobe")
+    if ffprobe is None:
         return False
     try:
         result = subprocess.run(
-            ["ffprobe", "-loglevel", "error", "-select_streams", "a",
+            [ffprobe, "-loglevel", "error", "-select_streams", "a",
              "-show_entries", "stream=index", "-of", "csv=p=0", path],
             capture_output=True, timeout=30)
     except (subprocess.SubprocessError, OSError):
