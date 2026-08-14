@@ -617,11 +617,15 @@ class TrackingOverlay(QWidget):
             if not found_drag:
                 if len(self.points) < 4:
                     self.points.append((rx, ry))
+                    self.selected_point_index = len(self.points) - 1
                     self.update()
                     if len(self.points) == 4:
-                        self.auto_disable_tracking()
-            if self.points:
-                self.selected_point_index = len(self.points) - 1
+                        self.on_fourth_corner_placed()
+            elif self.drag_index != -1:
+                # Select what was actually grabbed. This used to snap the
+                # selection to the last corner on every click, so pressing "1"
+                # and then an arrow key moved corner 4 instead.
+                self.selected_point_index = self.drag_index
 
             self.shape_changed.emit()
 
@@ -686,23 +690,34 @@ class TrackingOverlay(QWidget):
         region.set_control_point(edge, slot, point)
         self.curvature = region.curvature
 
+    def commit_shape(self):
+        """Record the current shape against the frame on screen.
+
+        Every edit has to come through here. Previously only a mouse release
+        did, so an arrow-key nudge -- the tool documented for precise corner
+        placement -- changed what was drawn without ever changing what would be
+        rendered.
+        """
+        mw = self.get_main_window()
+        if not mw or not mw.central_panel:
+            return
+        panel = mw.central_panel
+        if not panel.cap or not panel.cap.isOpened():
+            return
+
+        frame_index = panel.get_current_frame_index()
+        if len(self.points) == 4:
+            self.tracking_history[frame_index] = self.points[:]
+        elif frame_index in self.tracking_history:
+            del self.tracking_history[frame_index]
+        mw.mark_dirty()
+
     def mouseReleaseEvent(self, event):
         was_dragging = (self.drag_index != -1 or self.drag_control is not None)
         self.drag_index = -1
         self.drag_control = None
 
-        mw = self.get_main_window()
-        if mw:
-            cpanel = mw.central_panel
-            if cpanel and cpanel.cap and cpanel.cap.isOpened():
-                current_frame_index = cpanel.get_current_frame_index()
-                if len(self.points) == 4:
-                    self.tracking_history[current_frame_index] = self.points[:]
-                else:
-                    if current_frame_index in self.tracking_history:
-                        del self.tracking_history[current_frame_index]
-
-        # shape changed
+        self.commit_shape()
         self.shape_changed.emit()
         super(TrackingOverlay, self).mouseReleaseEvent(event)
 
@@ -722,37 +737,35 @@ class TrackingOverlay(QWidget):
             event.accept()
             return
 
-        if self.selected_point_index < 0:
+        # Anything not handled here must fall through to the parent, or
+        # CentralPanel's D (delete shape) and C (copy from previous frame)
+        # shortcuts never fire: this widget holds focus almost permanently, and
+        # a bare return leaves the event marked accepted.
+        arrows = {Qt.Key_Left: (-1, 0), Qt.Key_Right: (1, 0),
+                  Qt.Key_Up: (0, -1), Qt.Key_Down: (0, 1)}
+        if key not in arrows or self.selected_point_index < 0:
+            event.ignore()
+            super(TrackingOverlay, self).keyPressEvent(event)
             return
 
-        step = 1
-        dx, dy = 0, 0
-        if key == Qt.Key_Left:
-            dx = -step
-        elif key == Qt.Key_Right:
-            dx = step
-        elif key == Qt.Key_Up:
-            dy = -step
-        elif key == Qt.Key_Down:
-            dy = step
+        # Shift for a coarse jump, Ctrl for sub-pixel: corner placement on a
+        # distant billboard needs finer than one pixel per press.
+        step = 1.0
+        if event.modifiers() & Qt.ShiftModifier:
+            step = 10.0
+        elif event.modifiers() & Qt.ControlModifier:
+            step = 0.25
+        dx, dy = (v * step for v in arrows[key])
 
-        if dx == 0 and dy == 0:
-            # No arrow key => do nothing
-            return
-
-        if self.selected_point_index < 4:
-            # move just that corner
-            if len(self.points) == 4:
+        if len(self.points) == 4:
+            if self.selected_point_index < 4:
                 px, py = self.points[self.selected_point_index]
                 self.points[self.selected_point_index] = (px + dx, py + dy)
-        else:
-            # move entire shape
-            if len(self.points) == 4:
-                for i in range(4):
-                    px, py = self.points[i]
-                    self.points[i] = (px + dx, py + dy)
+            else:
+                self.points = [(px + dx, py + dy) for px, py in self.points]
 
         self.update()
+        self.commit_shape()
         self.shape_changed.emit()
         event.accept()
 
@@ -773,16 +786,19 @@ class TrackingOverlay(QWidget):
         self.contrast = contrast
         self.update()
 
-    def auto_disable_tracking(self):
-        mw = self.get_main_window()
-        if mw:
-            for icon_widget in mw.left_col.icons:
-                if icon_widget.meaning_label.text() == "Draw":
-                    icon_widget.set_selected(False)
+    def on_fourth_corner_placed(self):
+        """Called once the shape is complete.
 
-            mw.central_panel.switch.setChecked(True)
-            mw.central_panel.magnifier_switch.setChecked(True)
-            self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        It used to make the overlay transparent to the mouse the instant the
+        fourth corner landed, so the corners became undraggable exactly when
+        the user wanted to nudge them, with no visible reason. Placement
+        already stops at four points, so the overlay stays live.
+        """
+        self.commit_shape()
+        mw = self.get_main_window()
+        if mw and mw.central_panel:
+            # The shape is now valid, so tracking becomes available.
+            mw.central_panel.update_tracking_availability()
 
     def get_main_window(self):
         w = self.parentWidget()
@@ -1341,7 +1357,6 @@ class CentralPanel(QWidget):
         self.playing = False
         self.prev_frame = None
         self.fps = 30
-        self.tracking_history = {}  # optional mirror of tracking_overlay
         self.kalman_filters = []
 
         # The single source of truth for "which frame is on screen". Deriving
@@ -1638,11 +1653,10 @@ class CentralPanel(QWidget):
 
         self.read_frame()
 
-        # If there is tracking history for this frame, load it; otherwise clear.
+        # Show this frame's shape if it has one, otherwise keep what is on
+        # screen so the user can carry it to a frame that needs marking.
         if frame_index in self.tracking_history:
             self.tracking_overlay.points = self.tracking_history[frame_index][:]
-        else:
-            self.tracking_overlay.points.clear()
 
         self.tracking_overlay.update()
 
@@ -1715,6 +1729,23 @@ class CentralPanel(QWidget):
         q_img = QImage(frame_rgb.data, w, h, ch * w, QImage.Format_RGB888)
         self.video_label.setPixmap(QPixmap.fromImage(q_img))
 
+    @property
+    def tracking_history(self):
+        """The one and only store of tracked shapes.
+
+        This used to be a second dict kept "as a mirror" of the overlay's, and
+        the two drifted apart: the preview read this one while the render, the
+        project file and the AOI export read the overlay's. A shape drawn by
+        hand was therefore invisible when you navigated back to its frame, yet
+        still present in the exported video. Aliasing the property removes the
+        possibility rather than relying on both being updated.
+        """
+        return self.tracking_overlay.tracking_history
+
+    @tracking_history.setter
+    def tracking_history(self, value):
+        self.tracking_overlay.tracking_history = value
+
     def get_current_frame_index(self):
         """The index of the frame currently on screen."""
         return self.current_frame_index
@@ -1769,8 +1800,6 @@ class CentralPanel(QWidget):
             self.tracker = None
             if current_frame_index in self.tracking_history:
                 overlay.points = self.tracking_history[current_frame_index][:]
-            else:
-                overlay.points = []
 
         # If an overlay video is inserted, advance it to the matching frame.
         if overlay.inserted_overlay_is_video:
@@ -1855,20 +1884,31 @@ class CentralPanel(QWidget):
         self.controls_frame.setGeometry(controls_x, controls_y, controls_width, self.controls_frame.height())
         self.controls_frame.raise_()
 
-    def toggle_tracking(self, checked: bool):
-        if checked:
-            if len(self.tracking_overlay.points) == 4:
-                self.tracking_mode = True
-            else:
-                self.switch.setChecked(False)
-                QMessageBox.information(
-                    self, "Cannot Enable Tracking",
-                    "Draw all four corners of the area before turning tracking on."
-                )
-        else:
-            self.tracking_mode = False
+    def update_tracking_availability(self):
+        """Only offer tracking once there is a shape to track.
+
+        The switch used to accept a click with no shape drawn: it would turn
+        green, say "Tracking Enabled", and record nothing for the whole clip,
+        because read_frame gates on having four corners. The guard for this
+        existed but was never connected to anything.
+        """
+        ready = (len(self.tracking_overlay.points) == 4
+                 and self.cap is not None and self.cap.isOpened())
+        self.switch.setEnabled(ready)
+        self.switch.setToolTip(
+            "Follow the marked area through the clip" if ready
+            else "Mark all four corners of the area first")
+        if not ready and self.switch.isChecked():
+            self.switch.setChecked(False)
 
     def on_tracking_toggled(self, on: bool):
+        if on and len(self.tracking_overlay.points) != 4:
+            self.switch.setChecked(False)
+            QMessageBox.information(
+                self, "Cannot Enable Tracking",
+                "Mark all four corners of the area before turning tracking on.")
+            return
+
         self.tracking_mode = on
         if on:
             self.tracking_label.setText("Tracking Enabled")
@@ -1892,32 +1932,12 @@ class CentralPanel(QWidget):
                     min-width: 150px;
                 }
             """)
-            self.tracking_overlay.points.clear()
+            # The shape deliberately survives. Turning tracking off means "stop
+            # following the surface", not "throw away what I marked" -- and
+            # rewinding, scrubbing backwards and Go-to-Frame all switch tracking
+            # off for you, so clearing here destroyed work without any warning
+            # and with no undo.
             self.tracking_overlay.update()
-
-    def set_tracking_toggle_state(self, on: bool):
-        if on:
-            self.tracking_toggle.setCheckState(Qt.Checked)
-            self.tracking_status_label.setText("Tracking Enabled")
-            self.tracking_status_label.setStyleSheet("""
-                QLabel {
-                    color: limegreen;
-                    font-size: 14px;
-                    background-color: #1A1A1A;
-                    padding: 5px;
-                }
-            """)
-        else:
-            self.tracking_toggle.setCheckState(Qt.Unchecked)
-            self.tracking_status_label.setText("Tracking Disabled")
-            self.tracking_status_label.setStyleSheet("""
-                QLabel {
-                    color: red;
-                    font-size: 14px;
-                    background-color: #1A1A1A;
-                    padding: 5px;
-                }
-            """)
 
     def track_with_optical_flow(self, old_frame, new_frame, old_points):
         """Advance a quad by one frame.
@@ -2055,6 +2075,10 @@ class CentralPanel(QWidget):
         logging.debug(f"Loaded {file_path}, FPS={self.fps}")
 
         self.tracking_overlay.reset()
+        self.update_tracking_availability()
+        mw = self.window()
+        if isinstance(mw, QMainWindow) and hasattr(mw, "refresh_title"):
+            mw.refresh_title()
 
     def enable_tracking_mode(self):
         """
@@ -2104,20 +2128,6 @@ class CentralPanel(QWidget):
 
         if self.tracking_mode:
             self.tracking_overlay.setFocus()
-
-    def auto_enable_tracking_if_shape_ready(self):
-        if len(self.tracking_overlay.points) == 4:
-            self.set_tracking_toggle_state(True)
-            self.tracking_mode = True
-
-    def save_tracking_points_for_frame(self, frame_index, points):
-        try:
-            with open('tracking_history.json', 'a') as f:
-                data = {'frame': frame_index, 'points': points}
-                f.write(json.dumps(data) + '\n')
-            logging.debug(f"Saved tracking points for frame {frame_index}")
-        except Exception as e:
-            logging.error(f"Failed to save tracking points for frame {frame_index}: {e}")
 
     def on_slider_pressed(self):
         self.playing = False
@@ -2423,6 +2433,56 @@ class MainWindow(QMainWindow):
         logging.debug("MainWindow shown maximized")
 
         self.inserted_overlay_widget = None
+        self.dirty = False
+
+    # -- unsaved work ------------------------------------------------------
+
+    def mark_dirty(self):
+        """Note that there is tracking work which is not on disk."""
+        if not self.dirty:
+            self.dirty = True
+            self.refresh_title()
+
+    def mark_clean(self):
+        self.dirty = False
+        self.refresh_title()
+
+    def refresh_title(self):
+        name = os.path.basename(getattr(self.central_panel, "current_video_path", "")
+                                or "")
+        parts = ["LUMEN"]
+        if name:
+            parts.append(name)
+        title = "  —  ".join(parts) + (" *" if self.dirty else "")
+        self.title_bar.title_label.setText(title)
+        self.setWindowTitle(title)
+
+    def confirm_discard(self, action: str) -> bool:
+        """Ask before throwing away tracking work. True means carry on.
+
+        Tracking a clip is the expensive part of using this tool, and it was
+        previously discarded without a word by loading another video, loading a
+        project, or closing the window.
+        """
+        if not self.dirty:
+            return True
+        reply = QMessageBox.warning(
+            self, "Unsaved Tracking",
+            f"You have tracking work that has not been saved.\n\n{action}",
+            QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel,
+            QMessageBox.Save)
+        if reply == QMessageBox.Cancel:
+            return False
+        if reply == QMessageBox.Save:
+            self.save_project()
+            return not self.dirty
+        return True
+
+    def closeEvent(self, event):
+        if self.confirm_discard("Close anyway?"):
+            event.accept()
+        else:
+            event.ignore()
 
     def _connect_signals(self):
         """Connects signals from child widgets to main window slots."""
@@ -2493,7 +2553,7 @@ class MainWindow(QMainWindow):
         )
         if reply == QMessageBox.Yes:
             self.central_panel.tracking_overlay.reset()
-            self.central_panel.tracking_history.clear()
+            self.mark_dirty()
             QMessageBox.information(
                 self,
                 "Tracking Cleared",
@@ -2621,9 +2681,12 @@ class MainWindow(QMainWindow):
         }
         with open(path, "w") as f:
             json.dump(data, f, indent=2)
+        self.mark_clean()
         QMessageBox.information(self, "Saved", f"Project saved to:\n{path}")
 
     def load_project(self):
+        if not self.confirm_discard("Loading a project will replace it."):
+            return
         path, _ = QFileDialog.getOpenFileName(self, "Load Project", "", "JSON Files (*.json)")
         if not path:
             return
@@ -2662,8 +2725,10 @@ class MainWindow(QMainWindow):
         points = overlay.tracking_history.get(current) or data.get("tracking_points", [])
         overlay.points = [tuple(p) for p in points]
         self.central_panel.reset_tracker()
+        self.central_panel.update_tracking_availability()
         self.central_panel.refresh_display()
         overlay.update()
+        self.mark_clean()
 
     def detect_from_reference(self):
         """Locate the insertion area from an uploaded picture of the target.
@@ -2815,6 +2880,8 @@ class MainWindow(QMainWindow):
 
     def load_tracking_points(self):
         import json
+        if not self.confirm_discard("Loading tracking points will replace it."):
+            return
         path, _ = QFileDialog.getOpenFileName(self, "Load Tracking", "", "JSON Files (*.json)")
         if not path:
             return
@@ -2955,6 +3022,8 @@ class MainWindow(QMainWindow):
             self.resize(width, height)
 
     def upload_base_video(self):
+        if not self.confirm_discard("Loading another video will replace it."):
+            return
         file_path, _ = QFileDialog.getOpenFileName(
             self, "Select Base Video", "", "Video Files (*.mp4 *.avi *.mkv)"
         )
