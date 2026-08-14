@@ -329,11 +329,20 @@ class MorphDialog(QDialog):
     # Stored 0..1, shown 0..100.
     SCALED = {"bow_h", "bow_v", "perspective", "shading"}
 
-    def __init__(self, morph, creative, on_change, parent=None):
+    def __init__(self, morph, creative, on_change, parent=None, preview=None):
+        """
+        Args:
+            preview: called for a BGR picture of the creative as it currently
+                sits on the footage, cropped to the area. Without one the
+                artwork is shown on its own against a checkerboard, which says
+                what the shape is but not whether it suits the surface -- and
+                the surface is the only thing that can answer that.
+        """
         super().__init__(parent)
         self.morph = morph
         self.creative = creative
         self.on_change = on_change
+        self.preview = preview
         self.original = morph.to_dict()
 
         self.setWindowTitle("Shape the Creative")
@@ -362,7 +371,7 @@ class MorphDialog(QDialog):
         layout.addWidget(self.enabled_box)
 
         self.thumbnail = QLabel()
-        self.thumbnail.setFixedHeight(150)
+        self.thumbnail.setFixedHeight(210 if preview is not None else 150)
         self.thumbnail.setAlignment(Qt.AlignCenter)
         self.thumbnail.setStyleSheet("background-color: #141414; border-radius: 6px;")
         layout.addWidget(self.thumbnail)
@@ -441,7 +450,30 @@ class MorphDialog(QDialog):
         self._draw_thumbnail()
         self.on_change()
 
+    def _draw_on_the_footage(self) -> bool:
+        """Show the creative where it will actually be, on the shot itself."""
+        try:
+            picture = self.preview()
+        except Exception:                      # never let a preview stop an edit
+            logging.debug("shape preview failed", exc_info=True)
+            return False
+        if picture is None or picture.size == 0:
+            return False
+
+        height = self.thumbnail.height()
+        width = max(1, int(picture.shape[1] * height / picture.shape[0]))
+        limit = max(1, self.thumbnail.width() or 480)
+        if width > limit:
+            width, height = limit, max(1, int(picture.shape[0] * limit / picture.shape[1]))
+        small = cv2.resize(picture, (width, height), interpolation=cv2.INTER_AREA)
+        rgb = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
+        image = QImage(rgb.data, width, height, 3 * width, QImage.Format_RGB888)
+        self.thumbnail.setPixmap(QPixmap.fromImage(image.copy()))
+        return True
+
     def _draw_thumbnail(self):
+        if self.preview is not None and self._draw_on_the_footage():
+            return
         if self.creative is None:
             return
         shaped = morphlib.apply_morph(self.creative, self.morph)
@@ -750,6 +782,8 @@ class MagnifierWidget(QWidget):
         self.points = []
         #: The region, so its outline can be drawn through each view.
         self.region = None
+        #: Which bend handle the keys are pointing at, as (edge, slot).
+        self.selected_control = None
 
         self.zoom_factor = 8.0
         #: Let each tile pick its own magnification from its size. Scrolling
@@ -800,6 +834,7 @@ class MagnifierWidget(QWidget):
         selected_index: int = None,
         region=None,
         focus_index=-1,
+        selected_control=-1,
     ):
         """
         Update the magnifier data and refresh.
@@ -812,6 +847,7 @@ class MagnifierWidget(QWidget):
         :param region:         a ``core.Region`` whose outline to draw
         :param focus_index:    show this handle alone; None for all of them.
                                Left at -1 to mean "unchanged".
+        :param selected_control: which bend handle is picked, as (edge, slot).
         """
         self.base_frame = base_frame
         self.points = [MagnifierPoint.coerce(p, i)
@@ -828,6 +864,8 @@ class MagnifierWidget(QWidget):
             self.selected_index = selected_index
         if focus_index != -1:
             self.focus_index = focus_index
+        if selected_control != -1:
+            self.selected_control = selected_control
 
         self.update()
 
@@ -1141,17 +1179,41 @@ class MagnifierWidget(QWidget):
             x2, y2 = mapped[(i + 1) % len(mapped)]
             painter.drawLine(int(x1), int(y1), int(x2), int(y2))
 
+        corners = self.region.corners
+        # The corners themselves, so a tile shows its neighbours as well as
+        # the handle it is centred on.
+        painter.setBrush(Qt.NoBrush)
+        painter.setPen(QPen(QColor(255, 90, 90, 210), 2))
+        for corner in corners:
+            x, y = to_tile(*corner)
+            painter.drawEllipse(int(x) - 4, int(y) - 4, 8, 8)
+
         if not self.region.curved:
             return
-        painter.setPen(QPen(QColor(120, 180, 255, 150), 1, Qt.DashLine))
-        corners = self.region.corners
+
         controls = self.region.controls
+        painter.setPen(QPen(QColor(120, 180, 255, 150), 1, Qt.DashLine))
         for edge in range(4):
             for slot in range(2):
                 anchor = corners[edge] if slot == 0 else corners[(edge + 1) % 4]
                 ax, ay = to_tile(*anchor)
                 cx, cy = to_tile(*controls[edge, slot])
                 painter.drawLine(int(ax), int(ay), int(cx), int(cy))
+
+        # And the bend handles themselves, on the curve they are bending. A
+        # handle is placed correctly when the curve it produces sits on the
+        # screen's edge, which cannot be judged from a view that shows the
+        # curve but not what is pulling it.
+        for edge in range(4):
+            for slot in range(2):
+                x, y = to_tile(*controls[edge, slot])
+                chosen = (edge, slot) == self.selected_control
+                painter.setPen(QPen(QColor(0, 255, 255) if chosen
+                                    else QColor(120, 180, 255), 2))
+                painter.setBrush(QBrush(QColor(120, 180, 255, 110)))
+                size = 5 if chosen else 4
+                painter.drawRect(int(x) - size, int(y) - size, size * 2, size * 2)
+        painter.setBrush(Qt.NoBrush)
 
     def _draw_crosshair(self, painter, rect, point, index):
         """The mark is always the true position of the handle.
@@ -1406,6 +1468,10 @@ class TrackingOverlay(QWidget):
         self.drag_index = -1  # index of corner being dragged, or -1 if none
         self.selected_point_index = -1  # which corner is selected (via keys, etc.)
         self.drag_control = None      # (edge_index, control_index) while dragging
+        # Which bend handle the keys are pointing at, as (edge, slot), or None
+        # for one of the corners. Kept beside selected_point_index rather than
+        # folded into it, the same way drag_control sits beside drag_index.
+        self.selected_control = None
 
         # For hovering
         self.active_point_index = -1
@@ -1436,6 +1502,7 @@ class TrackingOverlay(QWidget):
         self.placements.append(placement)
         self.active_index = len(self.placements) - 1
         self.selected_point_index = -1
+        self.selected_control = None
         self.update()
         return placement
 
@@ -1450,6 +1517,7 @@ class TrackingOverlay(QWidget):
         if 0 <= index < len(self.placements):
             self.active_index = index
             self.selected_point_index = -1
+            self.selected_control = None
             self.shape_changed.emit()
             self.update()
 
@@ -1495,6 +1563,8 @@ class TrackingOverlay(QWidget):
                 hit = self.control_at(disp_x, disp_y)
                 if hit is not None:
                     self.drag_control = hit
+                    self.selected_control = hit
+                    self.selected_point_index = -1
                     found_drag = True
 
             if found_drag:
@@ -1508,6 +1578,7 @@ class TrackingOverlay(QWidget):
                     if len(self.points) == 4:
                         self.on_fourth_corner_placed()
             elif self.drag_index != -1:
+                self.selected_control = None
                 # Select what was actually grabbed. This used to snap the
                 # selection to the last corner on every click, so pressing "1"
                 # and then an arrow key moved corner 4 instead.
@@ -1615,6 +1686,11 @@ class TrackingOverlay(QWidget):
         self.shape_changed.emit()
         super(TrackingOverlay, self).mouseReleaseEvent(event)
 
+    #: Which edge each key picks the bend handles of. The letters match the
+    #: names the magnifier puts on them, so T goes to the tiles marked T1 and
+    #: T2 without anything to learn.
+    EDGE_KEYS = {Qt.Key_T: 0, Qt.Key_R: 1, Qt.Key_B: 2, Qt.Key_L: 3}
+
     def keyPressEvent(self, event):
         key = event.key()
         if key in [Qt.Key_1, Qt.Key_2, Qt.Key_3, Qt.Key_4, Qt.Key_5]:
@@ -1623,8 +1699,25 @@ class TrackingOverlay(QWidget):
                 self.selected_point_index = num - 1
             else:
                 self.selected_point_index = 4
+            self.selected_control = None
 
             # Immediately redraw so the newly selected corner turns green
+            self.update()
+            self.shape_changed.emit()
+            self.selection_changed.emit()
+            event.accept()
+            return
+
+        if key in self.EDGE_KEYS and self.curved_enabled and len(self.points) == 4:
+            # Pressing the same edge again steps to its other handle, so four
+            # keys reach all eight without a modifier to remember.
+            edge = self.EDGE_KEYS[key]
+            if self.selected_control and self.selected_control[0] == edge:
+                slot = 1 - self.selected_control[1]
+            else:
+                slot = 0
+            self.selected_control = (edge, slot)
+            self.selected_point_index = -1
             self.update()
             self.shape_changed.emit()
             self.selection_changed.emit()
@@ -1637,7 +1730,9 @@ class TrackingOverlay(QWidget):
         # a bare return leaves the event marked accepted.
         arrows = {Qt.Key_Left: (-1, 0), Qt.Key_Right: (1, 0),
                   Qt.Key_Up: (0, -1), Qt.Key_Down: (0, 1)}
-        if key not in arrows or self.selected_point_index < 0:
+        nothing_selected = (self.selected_point_index < 0
+                            and self.selected_control is None)
+        if key not in arrows or nothing_selected:
             event.ignore()
             super(TrackingOverlay, self).keyPressEvent(event)
             return
@@ -1652,7 +1747,14 @@ class TrackingOverlay(QWidget):
         dx, dy = (v * step for v in arrows[key])
 
         if len(self.points) == 4:
-            if self.selected_point_index < 4:
+            if self.selected_control is not None:
+                # Nudging matters more here than on a corner: a bend handle is
+                # a lever, so its effect along the curve is larger than the
+                # distance it moves.
+                edge, slot = self.selected_control
+                cx, cy = self.current_region().controls[edge, slot]
+                self.set_control_point(edge, slot, (cx + dx, cy + dy))
+            elif self.selected_point_index < 4:
                 px, py = self.points[self.selected_point_index]
                 self.points[self.selected_point_index] = (px + dx, py + dy)
             else:
@@ -1672,13 +1774,28 @@ class TrackingOverlay(QWidget):
             self.drag_index = -1
             self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
 
+    def refresh_preview(self):
+        """Redraw the outline *and* the picture underneath it.
+
+        update() repaints this widget, which carries the outline and the
+        handles and nothing else; the creative is composited into the frame by
+        the panel. Anything changing how the creative looks has to ask for
+        both. Asking only for this one is why inserting a creative, or
+        adjusting its brightness, appeared to do nothing until the video
+        happened to decode another frame.
+        """
+        self.update()
+        mw = self.get_main_window()
+        if mw and mw.central_panel:
+            mw.central_panel.refresh_display()
+
     def set_brightness(self, brightness: int):
         self.brightness = brightness
-        self.update()
+        self.refresh_preview()
 
     def set_contrast(self, contrast: float):
         self.contrast = contrast
-        self.update()
+        self.refresh_preview()
 
     def on_fourth_corner_placed(self):
         """Called once the shape is complete.
@@ -1754,7 +1871,7 @@ class TrackingOverlay(QWidget):
         self.overlay_video_cap = None
         self.overlay_video_path = None
         self.inserted_overlay_start_frame = start_frame_index
-        self.update()
+        self.refresh_preview()
 
     def insert_video_overlay(self, start_frame_index: int, video_path: str):
         self.overlay_bgra = None
@@ -1774,7 +1891,7 @@ class TrackingOverlay(QWidget):
             self.overlay_video_cap = None
             return
 
-        self.update()
+        self.refresh_preview()
 
     def remove_inserted_overlay(self):
         self.overlay_bgra = None
@@ -1785,7 +1902,7 @@ class TrackingOverlay(QWidget):
             self.overlay_video_cap = None
         self.overlay_video_path = None
         self.inserted_overlay_start_frame = 0
-        self.update()
+        self.refresh_preview()
 
         mw = self.get_main_window()
         if mw and mw.central_panel and mw.central_panel.tracking_mode:
@@ -1940,11 +2057,14 @@ class TrackingOverlay(QWidget):
             for edge in range(4):
                 for slot in range(2):
                     cx, cy = self.raw_to_display(*region.controls[edge, slot])
-                    active = self.drag_control == (edge, slot)
+                    active = ((edge, slot) in (self.drag_control,
+                                               self.selected_control))
                     painter.setPen(QPen(QColor(0, 255, 255) if active
                                         else QColor(120, 180, 255), 2))
                     painter.setBrush(QBrush(QColor(120, 180, 255, 150)))
-                    painter.drawRect(int(cx) - 4, int(cy) - 4, 8, 8)
+                    size = 6 if active else 4
+                    painter.drawRect(int(cx) - size, int(cy) - size,
+                                     size * 2, size * 2)
 
         # Corner handles last so they sit above everything.
         for i, (rx, ry) in enumerate(self.points):
@@ -2024,7 +2144,7 @@ class TrackingOverlay(QWidget):
 
     def toggle_colourise(self, enable: bool):
         self.colourise_enabled = enable
-        self.update()  # force repaint 
+        self.refresh_preview()
 
     def add_fifth_node(self):
         if len(self.points) == 4:
@@ -3207,6 +3327,7 @@ class CentralPanel(QWidget):
             selected_index=selected,
             region=overlay.current_region() if len(overlay.points) == 4 else None,
             focus_index=focus,
+            selected_control=overlay.drag_control or overlay.selected_control,
         )
 
     def magnifier_points(self):
@@ -3247,9 +3368,14 @@ class CentralPanel(QWidget):
         # Corner i moved from position i to position 3i once the bend handles
         # were interleaved, so every index has to be carried across with it.
         ordered = [p for row in rows for p in row]
-        if dragged is not None:
-            edge, slot = dragged
-            focus = selected = edge * 3 + slot + 1
+        chosen = dragged or overlay.selected_control
+        if chosen is not None:
+            edge, slot = chosen
+            selected = edge * 3 + slot + 1
+            # Filling the widget with it is right while it is being dragged.
+            # Picking it with a key is how someone lines a handle up against
+            # the rest of the shape, so the other views stay put.
+            focus = selected if dragged is not None else focus
         else:
             if overlay.drag_index != -1:
                 focus = overlay.drag_index * 3
@@ -4733,8 +4859,24 @@ class MainWindow(QMainWindow):
                 "Insert a creative first -- there is nothing to shape yet.")
             return
 
+        def on_the_footage():
+            """The creative as it currently sits on the shot, cropped to it."""
+            frame = panel.prev_frame
+            if frame is None or len(overlay.points) != 4:
+                return None
+            composited = panel.composite_placements(frame)
+            height, width = composited.shape[:2]
+            # A generous margin: how a shape suits a panel is partly a
+            # question about what surrounds the panel.
+            bounds = core.quad_bounds(overlay.points, width, height, pad=60)
+            if bounds is None:
+                return None
+            x0, y0, x1, y1 = bounds
+            return composited[y0:y1, x0:x1]
+
         dialog = MorphDialog(overlay.morph, overlay.overlay_bgra,
-                             panel.refresh_display, parent=self)
+                             panel.refresh_display, parent=self,
+                             preview=on_the_footage)
         dialog.exec_()
         panel.refresh_display()
         self.mark_dirty()

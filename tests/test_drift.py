@@ -173,3 +173,75 @@ class TestBackwardFlowNeedsAGuess:
         expected = (len(frames) - 1) // tracker.anchor_interval
         assert tracker.anchor_corrections >= expected - 1, (
             f"only {tracker.anchor_corrections} of about {expected} fired")
+
+
+class TestTheSmoothingDoesNotFightTheTracker:
+    """A many-point RANSAC homography is a good measurement. Weighting the
+    filter against it turned a 0.57px reading into 2.94px on a handheld pan --
+    the insert visibly swimming against the surface whenever the camera moved.
+    """
+
+    @staticmethod
+    @pytest.fixture(scope="class")
+    def handheld():
+        """A pan with a human hand on the camera: never quite constant."""
+        width, height, count = 1100, 520, 50
+        quads, offsets = [], [8.0 * i + 9 * np.sin(i * 0.55) for i in range(count)]
+        base = np.float32([[520, 150], [820, 142], [828, 362], [528, 370]])
+        for offset in offsets:
+            quads.append(base - np.float32([offset, 0]))
+        frames = render_on(quads, make_texture(300, 220, seed=11), (width, height),
+                           make_background(width, height, seed=6))
+        return frames, quads
+
+    def _measure(self, frames, quads):
+        tracker = core.PlanarTracker(frames[0], quads[0])
+        out = []
+        for frame in frames[1:]:
+            tracker.track(frame)
+            out.append(tracker.quad.copy())
+        return out
+
+    def error(self, measured, quads, **kwargs):
+        filters = core.make_filters(quads[0], **kwargs)
+        return float(np.mean([
+            np.linalg.norm(core.smooth_quad(filters, m) - q, axis=1).mean()
+            for m, q in zip(measured, quads[1:])]))
+
+    def test_smoothing_keeps_the_reading_sub_pixel(self, handheld):
+        frames, quads = handheld
+        measured = self._measure(frames, quads)
+        raw = float(np.mean([np.linalg.norm(m - q, axis=1).mean()
+                             for m, q in zip(measured, quads[1:])]))
+        smoothed = self.error(measured, quads)
+        assert smoothed < 1.0, f"smoothed {smoothed:.2f}px vs raw {raw:.2f}px"
+
+    def test_the_old_weighting_was_several_times_worse(self, handheld):
+        frames, quads = handheld
+        measured = self._measure(frames, quads)
+        assert self.error(measured, quads, measurement_noise=1.0) > \
+            self.error(measured, quads) * 3
+
+    def test_it_was_worse_than_no_filter_at_all(self, handheld):
+        """Smoothing is meant to buy steadiness in exchange for lag. The old
+        weighting lagged by more than the jitter it removed, so it lost on
+        both counts -- which is why this is a fix and not a preference."""
+        frames, quads = handheld
+        rng = np.random.default_rng(4)
+        measured = self._measure(frames, quads)
+        noisy = [m + rng.normal(0, 1.5, (4, 2)).astype(np.float32)
+                 for m in measured]
+        unfiltered = float(np.mean([np.linalg.norm(m - q, axis=1).mean()
+                                    for m, q in zip(noisy, quads[1:])]))
+        assert self.error(noisy, quads, measurement_noise=1.0) > unfiltered
+        assert self.error(noisy, quads) < unfiltered
+
+    def test_it_still_coasts_when_there_is_no_measurement(self, handheld):
+        """The thing the filter is genuinely for has to survive the change."""
+        frames, quads = handheld
+        filters = core.make_filters(quads[0])
+        for quad in quads[1:6]:
+            core.smooth_quad(filters, quad)
+        coasted = core.smooth_quad(filters, None)
+        assert np.all(np.isfinite(coasted))
+        assert np.linalg.norm(coasted - quads[6], axis=1).mean() < 12
