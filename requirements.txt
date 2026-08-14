@@ -1,0 +1,8 @@
+# LUMEN Insertion Tool runtime dependencies.
+#
+# PyQt5 supplies the GUI plus QtMultimedia (used for the overlay preview
+# players). On Linux you may also need the system GStreamer plugins for
+# QMediaPlayer to decode video previews.
+PyQt5>=5.15,<6
+opencv-python>=4.8
+numpy>=1.24
