@@ -157,6 +157,39 @@ you would paste a billboard onto. That needs a dedicated detector, not this.
 For the best hit rate, use a sharp, roughly straight-on picture cropped to just
 the target.
 
+### Several matches at once
+
+The same poster often appears on more than one panel. The search finds **every**
+instance rather than only the strongest: it fits a homography, removes the
+keypoints that instance consumed, and fits again until nothing further stands
+up. You are shown what was found with the evidence for each, and every one you
+tick becomes its own placement.
+
+The bar for the additional instances is set a little lower than for the first,
+because the further ones are usually smaller and carry fewer keypoints.
+Measured on a frame holding the same poster at three sizes, a threshold of 12
+found two of them and 8 found all three, with no false positives on unrelated
+footage or against a different reference.
+
+### Using a clip as the reference
+
+*Find Target from Image…* also accepts a **video**. A short handheld clip of a
+billboard carries several angles and exposures, and a better chance that one of
+them resembles the shot being searched. Frames are sampled across it, each
+becomes a reference view, and the strongest result wins.
+
+> **Frame the clip on the target**, exactly as a reference photo has to be
+> cropped to it. Each sampled frame is taken to *be* the target, so its whole
+> rectangle is what gets mapped into the footage. Hand over a wide shot in
+> which the billboard sits in one corner and the match will succeed while the
+> quad describes the entire scene — measured at 234 px off the panel despite a
+> confident fit. The tool checks how much of the picture a match covers and
+> warns when it looks like this happened.
+
+A clip lands close but not as exactly as a cropped still — around 11 px on a
+270 px panel in testing — because a handheld view is never framed to the pixel.
+Treat it as a starting point and nudge the corners.
+
 ## Curved edges
 
 Each edge of the area carries two cubic Bezier control points. Their default

@@ -2803,6 +2803,61 @@ class RenderDialog(QDialog):
                 self.scale_combo.currentData(), self.path_edit.text().strip())
 
 
+class MatchChoiceDialog(QDialog):
+    """Pick which of several found instances to turn into placements.
+
+    The same poster often appears on more than one panel in a concourse shot.
+    Rather than silently taking the strongest, all of them are offered, ticked
+    by default, with the evidence for each so a marginal one can be dropped.
+    """
+
+    def __init__(self, detections, parent=None):
+        super().__init__(parent)
+        self.detections = detections
+        self.setWindowTitle("Several Matches Found")
+        self.setMinimumWidth(460)
+        self.setStyleSheet("""
+            QDialog { background-color: #2A2A2A; }
+            QLabel { color: #E8E8E8; font-size: 13px; }
+            QCheckBox { color: #E8E8E8; font-size: 12px; }
+            QPushButton { background-color: #3C3C3C; color: white; border: none;
+                          border-radius: 6px; padding: 7px 16px; }
+            QPushButton:hover { background-color: #505050; }
+        """)
+
+        layout = QVBoxLayout(self)
+        layout.setSpacing(10)
+        layout.addWidget(QLabel(
+            f"<b>{len(detections)} instances of that target were found.</b>"))
+        note = QLabel("Each ticked one becomes its own placement, with its own "
+                      "tracking and creative.")
+        note.setWordWrap(True)
+        note.setStyleSheet("color: #9A9A9A; font-size: 11px;")
+        layout.addWidget(note)
+
+        self.boxes = []
+        for index, detection in enumerate(detections, start=1):
+            centre = np.float32(detection.quad).mean(axis=0)
+            area = core.quad_area(detection.quad)
+            box = QCheckBox(
+                f"{index}.  {detection.n_inliers} features, "
+                f"{detection.confidence:.0%} confidence  —  "
+                f"{int(area):,} px at ({int(centre[0])}, {int(centre[1])})")
+            box.setChecked(True)
+            layout.addWidget(box)
+            self.boxes.append(box)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.button(QDialogButtonBox.Ok).setText("Create placements")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons, alignment=Qt.AlignRight)
+
+    def selected(self):
+        return [detection for detection, box in zip(self.detections, self.boxes)
+                if box.isChecked()]
+
+
 class PlacementSnapshot:
     """One placement, detached from the GUI for the render thread."""
 
@@ -3701,13 +3756,17 @@ class MainWindow(QMainWindow):
             return
 
         ref_path, _ = QFileDialog.getOpenFileName(
-            self, "Select an image of the target", "",
-            "Images (*.png *.jpg *.jpeg *.bmp *.webp)")
+            self, "Select a picture or clip of the target", "",
+            "Images and video (*.png *.jpg *.jpeg *.bmp *.webp *.mp4 *.avi "
+            "*.mkv *.mov *.m4v);;Images (*.png *.jpg *.jpeg *.bmp *.webp);;"
+            "Video (*.mp4 *.avi *.mkv *.mov *.m4v)")
         if not ref_path:
             return
 
         try:
-            matcher = core.ReferenceMatcher(ref_path)
+            # A clip of the target carries several angles and exposures, so it
+            # is sampled into a handful of reference views rather than one.
+            matcher = core.open_reference(ref_path)
         except (IOError, ValueError) as exc:
             QMessageBox.warning(self, "Detect Error", str(exc))
             return
@@ -3724,15 +3783,26 @@ class MainWindow(QMainWindow):
             if progress.wasCanceled():
                 canceled["value"] = True
 
-        detection = None
+        detections = []
         try:
             # Try the frame on screen first; it is what the user is looking at.
             if panel.prev_frame is not None:
-                detection = matcher.locate(panel.prev_frame,
-                                           frame_index=panel.get_current_frame_index())
-            if detection is None and not canceled["value"]:
-                detection = matcher.scan_video(panel.current_video_path,
-                                               step=5, progress=report)
+                detections = matcher.locate_all(
+                    panel.prev_frame,
+                    frame_index=panel.get_current_frame_index())
+            if not detections and not canceled["value"]:
+                found = matcher.scan_video(panel.current_video_path,
+                                           step=5, progress=report)
+                if found is not None:
+                    # Re-examine that frame properly: the scan stops at the
+                    # first sighting, but the panel it found may not be alone.
+                    capture = cv2.VideoCapture(panel.current_video_path)
+                    capture.set(cv2.CAP_PROP_POS_FRAMES, found.frame_index or 0)
+                    ok, hit_frame = capture.read()
+                    capture.release()
+                    detections = (matcher.locate_all(
+                        hit_frame, frame_index=found.frame_index)
+                        if ok else [found])
         except (IOError, cv2.error) as exc:
             progress.close()
             QMessageBox.warning(self, "Detect Error", str(exc))
@@ -3741,7 +3811,7 @@ class MainWindow(QMainWindow):
 
         if canceled["value"]:
             return
-        if detection is None:
+        if not detections:
             QMessageBox.information(
                 self, "Not Found",
                 "Could not find that target in the video.\n\n"
@@ -3750,25 +3820,70 @@ class MainWindow(QMainWindow):
                 "just the target.")
             return
 
-        if detection.frame_index is not None and \
-                detection.frame_index != panel.get_current_frame_index():
-            panel.jump_to_frame(detection.frame_index)
+        # A reference that was a wide shot rather than a crop of the target
+        # matches confidently and returns the corners of the whole scene. Say
+        # so, rather than dropping a scene-sized quad on the user.
+        reference_frame = panel.prev_frame
+        if reference_frame is not None and detections:
+            coverage = core.frame_coverage(detections[0], reference_frame.shape)
+            if coverage > 0.5:
+                if QMessageBox.question(
+                        self, "Check the Reference",
+                        f"The match covers {coverage:.0%} of the picture, which "
+                        "usually means the reference was a wide shot rather "
+                        "than a crop of the target.\n\n"
+                        "Crop the image, or film the clip framed on the screen "
+                        "or billboard itself, and try again.\n\n"
+                        "Use this match anyway?",
+                        QMessageBox.Yes | QMessageBox.No,
+                        QMessageBox.No) != QMessageBox.Yes:
+                    return
+
+        chosen = detections
+        if len(detections) > 1:
+            dialog = MatchChoiceDialog(detections, parent=self)
+            if dialog.exec_() != QDialog.Accepted:
+                return
+            chosen = dialog.selected()
+            if not chosen:
+                return
+
+        frame_index = chosen[0].frame_index
+        if frame_index is not None and frame_index != panel.get_current_frame_index():
+            panel.jump_to_frame(frame_index)
 
         overlay = panel.tracking_overlay
-        overlay.points = [(float(x), float(y)) for x, y in detection.quad]
-        overlay.tracking_history[panel.get_current_frame_index()] = overlay.points[:]
-        panel.tracking_history[panel.get_current_frame_index()] = overlay.points[:]
-        panel.reset_tracker()
+        current = panel.get_current_frame_index()
+        created = []
+        for index, detection in enumerate(chosen):
+            # The first match fills the active placement if it is still blank,
+            # so the common single-target case does not leave an empty one
+            # behind; the rest each get their own.
+            if index == 0 and not overlay.active.points:
+                placement = overlay.active
+            else:
+                placement = overlay.add_placement()
+            placement.points = [(float(x), float(y)) for x, y in detection.quad]
+            placement.tracking_history[current] = placement.points[:]
+            placement.reset_tracker()
+            created.append(placement.name)
+
+        overlay.set_active(overlay.placements.index(
+            next(p for p in overlay.placements if p.name == created[0])))
         panel.enable_tracking_mode()
         panel.refresh_display()
         overlay.update()
+        self.refresh_placement_list()
+        self.mark_dirty()
 
+        summary = "\n".join(
+            f"  {name}: {d.n_inliers} matching features, {d.confidence:.0%} confidence"
+            for name, d in zip(created, chosen))
         QMessageBox.information(
             self, "Target Found",
-            f"Found on frame {detection.frame_index} "
-            f"({detection.n_inliers} matching features, "
-            f"{detection.confidence:.0%} confidence).\n\n"
-            "Adjust the corners if you need to, then turn tracking on.")
+            f"Found {len(chosen)} on frame {frame_index}:\n\n{summary}\n\n"
+            "Give each one a creative, adjust corners if needed, then turn "
+            "tracking on.")
 
     def toggle_digital_screen(self, enabled: bool):
         """Choose where the tracker looks for the features it follows.
