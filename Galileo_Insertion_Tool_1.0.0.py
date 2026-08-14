@@ -329,11 +329,20 @@ class MorphDialog(QDialog):
     # Stored 0..1, shown 0..100.
     SCALED = {"bow_h", "bow_v", "perspective", "shading"}
 
-    def __init__(self, morph, creative, on_change, parent=None):
+    def __init__(self, morph, creative, on_change, parent=None, preview=None):
+        """
+        Args:
+            preview: called for a BGR picture of the creative as it currently
+                sits on the footage, cropped to the area. Without one the
+                artwork is shown on its own against a checkerboard, which says
+                what the shape is but not whether it suits the surface -- and
+                the surface is the only thing that can answer that.
+        """
         super().__init__(parent)
         self.morph = morph
         self.creative = creative
         self.on_change = on_change
+        self.preview = preview
         self.original = morph.to_dict()
 
         self.setWindowTitle("Shape the Creative")
@@ -362,7 +371,7 @@ class MorphDialog(QDialog):
         layout.addWidget(self.enabled_box)
 
         self.thumbnail = QLabel()
-        self.thumbnail.setFixedHeight(150)
+        self.thumbnail.setFixedHeight(210 if preview is not None else 150)
         self.thumbnail.setAlignment(Qt.AlignCenter)
         self.thumbnail.setStyleSheet("background-color: #141414; border-radius: 6px;")
         layout.addWidget(self.thumbnail)
@@ -441,7 +450,30 @@ class MorphDialog(QDialog):
         self._draw_thumbnail()
         self.on_change()
 
+    def _draw_on_the_footage(self) -> bool:
+        """Show the creative where it will actually be, on the shot itself."""
+        try:
+            picture = self.preview()
+        except Exception:                      # never let a preview stop an edit
+            logging.debug("shape preview failed", exc_info=True)
+            return False
+        if picture is None or picture.size == 0:
+            return False
+
+        height = self.thumbnail.height()
+        width = max(1, int(picture.shape[1] * height / picture.shape[0]))
+        limit = max(1, self.thumbnail.width() or 480)
+        if width > limit:
+            width, height = limit, max(1, int(picture.shape[0] * limit / picture.shape[1]))
+        small = cv2.resize(picture, (width, height), interpolation=cv2.INTER_AREA)
+        rgb = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
+        image = QImage(rgb.data, width, height, 3 * width, QImage.Format_RGB888)
+        self.thumbnail.setPixmap(QPixmap.fromImage(image.copy()))
+        return True
+
     def _draw_thumbnail(self):
+        if self.preview is not None and self._draw_on_the_footage():
+            return
         if self.creative is None:
             return
         shaped = morphlib.apply_morph(self.creative, self.morph)
@@ -1742,13 +1774,28 @@ class TrackingOverlay(QWidget):
             self.drag_index = -1
             self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
 
+    def refresh_preview(self):
+        """Redraw the outline *and* the picture underneath it.
+
+        update() repaints this widget, which carries the outline and the
+        handles and nothing else; the creative is composited into the frame by
+        the panel. Anything changing how the creative looks has to ask for
+        both. Asking only for this one is why inserting a creative, or
+        adjusting its brightness, appeared to do nothing until the video
+        happened to decode another frame.
+        """
+        self.update()
+        mw = self.get_main_window()
+        if mw and mw.central_panel:
+            mw.central_panel.refresh_display()
+
     def set_brightness(self, brightness: int):
         self.brightness = brightness
-        self.update()
+        self.refresh_preview()
 
     def set_contrast(self, contrast: float):
         self.contrast = contrast
-        self.update()
+        self.refresh_preview()
 
     def on_fourth_corner_placed(self):
         """Called once the shape is complete.
@@ -1824,7 +1871,7 @@ class TrackingOverlay(QWidget):
         self.overlay_video_cap = None
         self.overlay_video_path = None
         self.inserted_overlay_start_frame = start_frame_index
-        self.update()
+        self.refresh_preview()
 
     def insert_video_overlay(self, start_frame_index: int, video_path: str):
         self.overlay_bgra = None
@@ -1844,7 +1891,7 @@ class TrackingOverlay(QWidget):
             self.overlay_video_cap = None
             return
 
-        self.update()
+        self.refresh_preview()
 
     def remove_inserted_overlay(self):
         self.overlay_bgra = None
@@ -1855,7 +1902,7 @@ class TrackingOverlay(QWidget):
             self.overlay_video_cap = None
         self.overlay_video_path = None
         self.inserted_overlay_start_frame = 0
-        self.update()
+        self.refresh_preview()
 
         mw = self.get_main_window()
         if mw and mw.central_panel and mw.central_panel.tracking_mode:
@@ -2097,7 +2144,7 @@ class TrackingOverlay(QWidget):
 
     def toggle_colourise(self, enable: bool):
         self.colourise_enabled = enable
-        self.update()  # force repaint 
+        self.refresh_preview()
 
     def add_fifth_node(self):
         if len(self.points) == 4:
@@ -4812,8 +4859,24 @@ class MainWindow(QMainWindow):
                 "Insert a creative first -- there is nothing to shape yet.")
             return
 
+        def on_the_footage():
+            """The creative as it currently sits on the shot, cropped to it."""
+            frame = panel.prev_frame
+            if frame is None or len(overlay.points) != 4:
+                return None
+            composited = panel.composite_placements(frame)
+            height, width = composited.shape[:2]
+            # A generous margin: how a shape suits a panel is partly a
+            # question about what surrounds the panel.
+            bounds = core.quad_bounds(overlay.points, width, height, pad=60)
+            if bounds is None:
+                return None
+            x0, y0, x1, y1 = bounds
+            return composited[y0:y1, x0:x1]
+
         dialog = MorphDialog(overlay.morph, overlay.overlay_bgra,
-                             panel.refresh_display, parent=self)
+                             panel.refresh_display, parent=self,
+                             preview=on_the_footage)
         dialog.exec_()
         panel.refresh_display()
         self.mark_dirty()
