@@ -7,6 +7,7 @@ import numpy as np
 import json
 
 import lumen_core as core
+import lumen_blend as blend
 
 from PyQt5.QtCore import (
     QObject, QThread, pyqtSignal, Qt, QSize, QUrl, QEvent, QTimer, QPoint, QRect,
@@ -177,6 +178,126 @@ class AdjustmentDialog(QDialog):
 
     def get_value(self):
         return self.value
+
+class BlendDialog(QDialog):
+    """Live controls for how hard the creative is matched to the footage.
+
+    Non-modal in effect: every slider updates the preview as it moves, because
+    judging a blend from a number is impossible and the whole point is how it
+    looks against the shot.
+    """
+
+    EFFECTS = [
+        ("lighting", "Lighting",
+         "Carry the surface's uneven light and shadow onto the creative."),
+        ("colour", "Colour cast",
+         "Tint towards the ambient light. Kept low by default: this is the one\n"
+         "control that alters the creative's own colours, which an ad test is\n"
+         "often measuring."),
+        ("sharpness", "Softness",
+         "Soften a too-crisp creative to match the focus of the surface."),
+        ("grain", "Grain",
+         "Add sensor noise matching the footage, so the insert is not\n"
+         "conspicuously clean."),
+        ("motion", "Motion blur",
+         "Smear the creative when the camera pans, as the rest of the shot is."),
+        ("highlights", "Keep highlights",
+         "Let reflections on glass show through. Off for matte billboards."),
+    ]
+
+    def __init__(self, settings, on_change, parent=None):
+        super().__init__(parent)
+        self.settings = settings
+        self.on_change = on_change
+        self.original = settings.to_dict()
+
+        self.setWindowTitle("Blend into Footage")
+        self.setMinimumWidth(460)
+        self.setStyleSheet("""
+            QDialog { background-color: #2A2A2A; }
+            QLabel { color: #E8E8E8; font-size: 13px; }
+            QCheckBox { color: #E8E8E8; font-size: 13px; }
+            QSlider::groove:horizontal { background: #444; height: 5px;
+                                         border-radius: 2px; }
+            QSlider::handle:horizontal { background: #DDD; width: 14px;
+                                         margin: -5px 0; border-radius: 7px; }
+            QSlider::sub-page:horizontal { background: #00A000;
+                                           border-radius: 2px; }
+            QPushButton { background-color: #3C3C3C; color: white; border: none;
+                          border-radius: 6px; padding: 7px 16px; }
+            QPushButton:hover { background-color: #505050; }
+        """)
+
+        layout = QVBoxLayout(self)
+        layout.setSpacing(10)
+
+        self.enabled_box = QCheckBox("Match the creative to the footage")
+        self.enabled_box.setChecked(settings.enabled)
+        self.enabled_box.toggled.connect(self._on_enabled)
+        layout.addWidget(self.enabled_box)
+
+        note = QLabel("Measured from the pixels the creative covers.")
+        note.setStyleSheet("color: #9A9A9A; font-size: 11px;")
+        layout.addWidget(note)
+
+        self.sliders = {}
+        self.value_labels = {}
+        for name, title, hint in self.EFFECTS:
+            row = QHBoxLayout()
+            label = QLabel(title)
+            label.setFixedWidth(110)
+            label.setToolTip(hint)
+            slider = QSlider(Qt.Horizontal)
+            slider.setRange(0, 100)
+            slider.setValue(int(getattr(settings, name) * 100))
+            slider.setToolTip(hint)
+            slider.valueChanged.connect(
+                lambda value, key=name: self._on_slider(key, value))
+            value_label = QLabel(f"{getattr(settings, name):.2f}")
+            value_label.setFixedWidth(38)
+            value_label.setStyleSheet("color: #9A9A9A; font-size: 12px;")
+
+            row.addWidget(label)
+            row.addWidget(slider, 1)
+            row.addWidget(value_label)
+            layout.addLayout(row)
+            self.sliders[name] = slider
+            self.value_labels[name] = value_label
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel |
+                                   QDialogButtonBox.RestoreDefaults)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self._revert_and_reject)
+        buttons.button(QDialogButtonBox.RestoreDefaults).clicked.connect(self._defaults)
+        layout.addWidget(buttons, alignment=Qt.AlignRight)
+        self._sync_enabled()
+
+    def _on_enabled(self, checked):
+        self.settings.enabled = checked
+        self._sync_enabled()
+        self.on_change()
+
+    def _sync_enabled(self):
+        for slider in self.sliders.values():
+            slider.setEnabled(self.settings.enabled)
+
+    def _on_slider(self, key, value):
+        setattr(self.settings, key, value / 100.0)
+        self.value_labels[key].setText(f"{value / 100.0:.2f}")
+        self.on_change()
+
+    def _defaults(self):
+        fresh = blend.BlendSettings()
+        for name, _, _ in self.EFFECTS:
+            self.sliders[name].setValue(int(getattr(fresh, name) * 100))
+        self.enabled_box.setChecked(True)
+
+    def _revert_and_reject(self):
+        for key, value in self.original.items():
+            setattr(self.settings, key, value)
+        self.on_change()
+        self.reject()
+
 
 class QSwitch(QWidget):
     toggled = pyqtSignal(bool)  # Signal: emit True when turned on, False when turned off
@@ -594,6 +715,11 @@ class TrackingOverlay(QWidget):
         self.colourise_enabled = False
         self.colourise_factor = 0
 
+        # Automatic photometric matching: lighting, colour cast, softness,
+        # grain and motion blur measured from the footage being covered.
+        self.blend = blend.BlendSettings()
+        self._previous_quad = None
+
         # Tracking history: frame_index -> list of 4 corners
         self.tracking_history = {}
 
@@ -924,11 +1050,12 @@ class TrackingOverlay(QWidget):
         self.overlay_bgra = core.to_bgra(frame)
         self.update()
 
-    def styled_overlay(self, base_frame=None, quad=None) -> np.ndarray:
-        """The creative with brightness/contrast/colourise applied.
+    def styled_overlay(self, base_frame=None, quad=None, motion=None) -> np.ndarray:
+        """The creative, adapted to the frame it is going into.
 
         The render calls the identical helper, so what is previewed is what is
-        written to the file.
+        written to the file. Manual brightness/contrast are applied first, then
+        the automatic photometric match measured from the footage itself.
         """
         if self.overlay_bgra is None:
             return None
@@ -936,7 +1063,26 @@ class TrackingOverlay(QWidget):
             self.overlay_bgra, self.brightness, self.contrast)
         if self.colourise_enabled and base_frame is not None and quad is not None:
             styled = core.apply_colourise(styled, base_frame, quad)
+        if base_frame is not None and quad is not None and self.blend.enabled:
+            styled = blend.photometric_match(styled, base_frame, quad,
+                                             self.blend, motion=motion)
         return styled
+
+    def grain_for(self, base_frame, quad) -> float:
+        """How much grain to lay over the insert, measured from the footage."""
+        if base_frame is None or quad is None or not self.blend.enabled:
+            return 0.0
+        return blend.grain_sigma_for(base_frame, quad, self.blend)
+
+    def motion_since(self, quad) -> tuple:
+        """How far the surface moved since the last frame, for motion blur."""
+        current = np.float32(quad) if quad is not None else None
+        previous, self._previous_quad = self._previous_quad, (
+            None if current is None else current.copy())
+        if previous is None or current is None:
+            return None
+        delta = (current - previous).mean(axis=0)
+        return (float(delta[0]), float(delta[1]))
 
     def apply_brightness_contrast(self, img: np.ndarray) -> np.ndarray:
         return core.apply_brightness_contrast(img, self.brightness, self.contrast)
@@ -1259,6 +1405,7 @@ class LeftColumn(QWidget):
     brightnessClicked = pyqtSignal()
     contrastClicked = pyqtSignal()
     colouriseClicked = pyqtSignal(bool)
+    blendClicked = pyqtSignal()
     curveClicked = pyqtSignal(bool)
     clearClicked = pyqtSignal()
     
@@ -1283,6 +1430,9 @@ class LeftColumn(QWidget):
             ("⛅", "Contrast", "Raise or lower the creative's contrast."),
             ("🎨", "Colourise", "Match the creative's colours to the surface\n"
                                 "it is covering."),
+            ("🌫", "Blend", "Match the creative's lighting, softness, grain and\n"
+                            "motion blur to the footage, so it does not look\n"
+                            "pasted on."),
             ("〰", "Curve", "Bend the edges of the area around a curved\n"
                             "screen or pillar."),
             ("❌", "Clear", "Remove the tracking from every frame."),
@@ -1358,6 +1508,10 @@ class LeftColumn(QWidget):
                 icon_widget.set_selected(False)  # Instant action, deselect
             elif text == "Colourise":
                 self.colouriseClicked.emit(is_selected) # This is a state, so don't deselect
+            elif text == "Blend":
+                if is_selected:
+                    self.blendClicked.emit()
+                icon_widget.set_selected(False)   # opens a dialog, not a mode
             elif text == "Curve":
                 self.curveClicked.emit(is_selected)  # Also a state, keep it lit
             elif text == "Clear":
@@ -1797,6 +1951,8 @@ class CentralPanel(QWidget):
                         self.prev_frame, styled, region,
                         occlusion=self.occlusion_mask(self.prev_frame,
                                                       overlay.points))
+                    display_frame = self.apply_grain(
+                        display_frame, self.prev_frame, region)
 
         frame_rgb = cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB)
         h, w, ch = frame_rgb.shape
@@ -1886,13 +2042,16 @@ class CentralPanel(QWidget):
         self.prev_frame = frame.copy()
         display_frame = frame
         if len(overlay.points) == 4 and overlay.has_overlay():
-            styled = overlay.styled_overlay(frame, overlay.points)
+            motion = overlay.motion_since(overlay.points)
+            styled = overlay.styled_overlay(frame, overlay.points, motion)
             if styled is not None:
                 region = overlay.current_region()
                 if core.is_valid_region(region):
                     display_frame = core.composite_region(
                         frame, styled, region,
                         occlusion=self.occlusion_mask(frame, overlay.points))
+                    display_frame = self.apply_grain(
+                        display_frame, frame, region)
 
         frame_rgb = cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB)
         h_frame, w_frame, ch = frame_rgb.shape
@@ -2041,6 +2200,21 @@ class CentralPanel(QWidget):
         if not result.ok:
             return None
         return [(float(x), float(y)) for x, y in result.quad]
+
+    def apply_grain(self, composited, source_frame, region):
+        """Lay matched sensor noise over the insert.
+
+        Applied after the warp, in frame space: grain added to the creative
+        beforehand would be resampled along with it and come out the wrong size
+        for the shot.
+        """
+        overlay = self.tracking_overlay
+        sigma = overlay.grain_for(source_frame, region.corners)
+        if sigma <= 0.1:
+            return composited
+        h, w = composited.shape[:2]
+        mask = core.quad_to_mask(region.corners, w, h)
+        return blend.add_grain(composited, sigma, mask, seed=self.current_frame_index)
 
     def occlusion_mask(self, frame, quad):
         """A mask of people in front of the surface, or None if switched off."""
@@ -2374,7 +2548,8 @@ class RenderSettings:
                  scale_factor, fps, history, curvature, curved,
                  overlay_bgra=None, overlay_video_path=None,
                  overlay_start_frame=0, brightness=0, contrast=1.0,
-                 colourise=False, include_audio=True, occlusion=False):
+                 colourise=False, include_audio=True, occlusion=False,
+                 blend_settings=None):
         self.base_video_path = base_video_path
         self.out_path = out_path
         self.start_frame = int(start_frame)
@@ -2394,6 +2569,7 @@ class RenderSettings:
         # A flag, not a segmenter: a cv2.dnn.Net cannot be shared across
         # threads, so the worker builds its own.
         self.occlusion = occlusion
+        self.blend = blend_settings or blend.BlendSettings.off()
 
 
 class RenderWorker(QObject):
@@ -2435,11 +2611,15 @@ class RenderWorker(QObject):
                     "Error: no tracking data covers the chosen frame range.")
                 return
 
-            out_writer = cv2.VideoWriter(
-                settings.out_path, cv2.VideoWriter_fourcc(*"mp4v"),
-                settings.fps, (width, height))
-            if not out_writer.isOpened():
-                raise IOError(f"Could not open {settings.out_path} for writing.")
+            duration = ((settings.end_frame - settings.start_frame + 1)
+                        / max(settings.fps, 1e-6))
+            out_writer = core.FrameWriter(
+                settings.out_path, settings.fps, (width, height),
+                audio_source=(settings.base_video_path
+                              if settings.include_audio else None),
+                audio_start=settings.start_frame / max(settings.fps, 1e-6),
+                duration=duration)
+            caveats.extend(out_writer.caveats)
 
             overlay_fps = 0.0
             if settings.overlay_video_path:
@@ -2472,6 +2652,7 @@ class RenderWorker(QObject):
             overlay_cursor = -1
             overlay_exhausted = False
             frame_counter = 0
+            previous_quad = None
 
             for frame_idx in range(settings.start_frame, settings.end_frame + 1):
                 if self.is_canceled:
@@ -2511,6 +2692,21 @@ class RenderWorker(QObject):
                         if settings.colourise:
                             styled = core.apply_colourise(
                                 styled, base_frame, region.corners)
+                        grain = 0.0
+                        if settings.blend.enabled:
+                            motion = None
+                            if previous_quad is not None:
+                                delta = (region.corners - previous_quad).mean(axis=0)
+                                motion = (float(delta[0]), float(delta[1]))
+                            styled = blend.photometric_match(
+                                styled, base_frame, region.corners,
+                                settings.blend, motion=motion)
+                            previous_quad = region.corners.copy()
+                            # Measure the footage's grain BEFORE the creative
+                            # covers it, or the sample is of the clean creative
+                            # and no grain gets added at all.
+                            grain = blend.grain_sigma_for(
+                                base_frame, region.corners, settings.blend)
                         occlusion = None
                         if segmenter is not None:
                             try:
@@ -2523,30 +2719,37 @@ class RenderWorker(QObject):
                             base_frame = core.composite_region(
                                 base_frame, styled, region, in_place=True,
                                 occlusion=occlusion)
+                            if grain > 0.1:
+                                base_frame = blend.add_grain(
+                                    base_frame, grain,
+                                    core.quad_to_mask(region.corners,
+                                                      width, height),
+                                    seed=frame_idx)
 
                 out_writer.write(base_frame)
                 frame_counter += 1
                 self.progress.emit(frame_counter)
 
             base_cap.release()
-            out_writer.release()
-            base_cap = out_writer = None
+            base_cap = None
             if overlay_cap:
                 overlay_cap.release()
                 overlay_cap = None
 
             if self.is_canceled:
+                out_writer.abort()
+                out_writer = None
                 self.finished.emit("Canceled")
                 return
+
+            caveats.extend(c for c in out_writer.close()
+                           if c not in caveats)
+            out_writer = None
 
             if frame_counter == 0:
                 self.finished.emit("Error: no frames were written.")
                 return
 
-            status = self._attach_audio()
-            audio_note = status[len("Completed"):].strip(" ()")
-            if audio_note:
-                caveats.append(audio_note)
             self.finished.emit("Completed" +
                                (f" ({'; '.join(caveats)})" if caveats else ""))
 
@@ -2554,41 +2757,11 @@ class RenderWorker(QObject):
             logging.exception("Render worker failed")
             self.finished.emit(f"Error: {e}")
         finally:
-            for handle in (base_cap, overlay_cap, out_writer):
+            for handle in (base_cap, overlay_cap):
                 if handle is not None:
                     handle.release()
-
-    def _attach_audio(self) -> str:
-        """Graft the source audio back on, if ffmpeg is around to do it.
-
-        VideoWriter can only write pictures, so the render is silent until
-        ffmpeg copies the original audio across. Without ffmpeg the silent file
-        still stands, and the status says so rather than failing the render.
-        """
-        settings = self.settings
-        if not settings.include_audio:
-            return "Completed"
-        if not core.has_ffmpeg():
-            return "Completed (no audio: ffmpeg not found)"
-
-        base, ext = os.path.splitext(settings.out_path)
-        temp_path = f"{base}.audio{ext or '.mp4'}"
-        duration = ((settings.end_frame - settings.start_frame + 1)
-                    / max(settings.fps, 1e-6))
-
-        ok = core.remux_audio(settings.out_path, settings.base_video_path,
-                              temp_path,
-                              start_time=settings.start_frame / max(settings.fps, 1e-6),
-                              duration=duration)
-        if not ok:
-            return "Completed (no audio: the source may have none)"
-
-        try:
-            os.replace(temp_path, settings.out_path)
-        except OSError as exc:
-            logging.warning("Could not swap in the audio version: %s", exc)
-            return "Completed (no audio: could not replace the silent file)"
-        return "Completed"
+            if out_writer is not None:
+                out_writer.abort()
 
     def cancel(self):
         self.is_canceled = True
@@ -2731,6 +2904,7 @@ class MainWindow(QMainWindow):
         self.left_col.brightnessClicked.connect(self.on_brightness_clicked)
         self.left_col.contrastClicked.connect(self.on_contrast_clicked)
         self.left_col.colouriseClicked.connect(self.on_colourise_clicked)
+        self.left_col.blendClicked.connect(self.open_blend_dialog)
         self.left_col.curveClicked.connect(self.toggle_curved_edges)
         self.left_col.clearClicked.connect(self.on_clear_clicked)
 
@@ -2903,6 +3077,7 @@ class MainWindow(QMainWindow):
             contrast=overlay.contrast,
             colourise=overlay.colourise_enabled,
             occlusion=panel.occlusion_enabled,
+            blend_settings=blend.BlendSettings.from_dict(overlay.blend.to_dict()),
         )
 
     def on_render_finished(self, status):
@@ -2961,6 +3136,7 @@ class MainWindow(QMainWindow):
             "brightness": overlay.brightness,
             "contrast": overlay.contrast,
             "colourise": overlay.colourise_enabled,
+            "blend": overlay.blend.to_dict(),
             "overlay_path": overlay.overlay_source_path,
             "overlay_is_video": overlay.inserted_overlay_is_video,
             "overlay_start_frame": overlay.inserted_overlay_start_frame,
@@ -2994,6 +3170,7 @@ class MainWindow(QMainWindow):
         overlay.brightness = data.get("brightness", 0)
         overlay.contrast = data.get("contrast", 1.0)
         overlay.colourise_enabled = bool(data.get("colourise", False))
+        overlay.blend = blend.BlendSettings.from_dict(data.get("blend"))
 
         overlay_path = data.get("overlay_path")
         if overlay_path and os.path.exists(overlay_path):
@@ -3140,6 +3317,25 @@ class MainWindow(QMainWindow):
         if not enabled:
             panel.segmenter = None
         panel.refresh_display()
+
+    def open_blend_dialog(self):
+        """Tune how the creative is matched to the shot, with a live preview."""
+        panel = self.central_panel
+        if panel.prev_frame is None:
+            QMessageBox.warning(self, "Blend", "Load a base video first.")
+            return
+        overlay = panel.tracking_overlay
+        if not overlay.has_overlay() or len(overlay.points) != 4:
+            QMessageBox.warning(
+                self, "Blend",
+                "Mark the area and insert a creative first -- the match is "
+                "measured from the pixels the creative covers.")
+            return
+
+        dialog = BlendDialog(overlay.blend, panel.refresh_display, parent=self)
+        dialog.exec_()
+        panel.refresh_display()
+        self.mark_dirty()
 
     def toggle_curved_edges(self, enabled: bool):
         """Switch curved edges on or off for the insertion area."""

@@ -176,12 +176,38 @@ draw. That case is detected (`region_is_folded`) and the insert is left off the
 frame, the same way a self-intersecting bowtie quad is rejected. The outline
 turns red when this happens.
 
-## Audio
+## Blending the creative into the shot
 
-OpenCV's `VideoWriter` cannot write audio, so a render is silent until the
-original audio is copied back onto it. If `ffmpeg` is on `PATH` this happens
-automatically, offset to match the rendered frame range. If it is not, the
-render still succeeds and the completion message says the result is silent.
+A creative pasted in with correct geometry still reads as fake, because it is
+*too clean*. The footage around it has been through a lens, a sensor and a
+codec: unevenly lit, slightly soft, grainy, colour-cast by the ambient light,
+and smeared when the camera moves.
+
+The **Blend** tool measures those properties from the very pixels the creative
+is about to cover and reproduces them — lighting falloff, colour cast,
+softness, grain and motion blur — each on its own slider, updating the preview
+live.
+
+> **Colour is deliberately the weakest by default.** It is the one control that
+> alters the creative's own colours, which is frequently the thing an ad test is
+> measuring. On a cool-cast test scene, a colour strength of 0.5 moved the
+> creative's mean colour by 84 units and turned white type cyan; 0.15 moved it
+> by 27, nearly all of that from lighting rather than hue. Raise it only when
+> belonging in the frame matters more than the exact hue.
+
+## Audio and output quality
+
+Renders are encoded with **ffmpeg (x264, CRF 17)** when it is available, with
+the source audio muxed in the same pass.
+
+Without ffmpeg the render falls back to OpenCV's built-in `mp4v`, which is
+silent — `VideoWriter` cannot write audio — and measurably lossy, around 34 dB
+PSNR. That is enough to undo the subtler photometric matching: in one measured
+render, grain added at a sigma of 2.0 came back at 0.45, and a flat creative
+suffers worst because it is cheap to encode and gets quantised hardest. The
+render still succeeds and the completion message says which happened.
+
+Installing ffmpeg is therefore worth it for picture quality, not only audio.
 
 ## Saving and export formats
 
