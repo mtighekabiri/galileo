@@ -159,6 +159,19 @@ and the tracker's state is left untouched so it can recover on the next frame
 rather than being corrupted. A constant-velocity Kalman filter per corner
 smooths the result and coasts the shape through brief occlusions.
 
+The filter weights its own prediction and the tracker's measurement **equally**,
+because a many-point RANSAC homography is a good measurement and deserves to be
+trusted. Weighted the other way — as it was, by twenty to one in favour of the
+prediction — a 0.57 px reading came out as **2.94 px** on a handheld pan, the
+insert visibly swimming against the surface whenever the camera moved. That was
+worse than useless rather than a poor trade: smoothing is meant to buy
+steadiness in exchange for lag, and against a measurement deliberately
+corrupted by 1.5 px of noise the old weighting gave 3.17 px where *no filtering
+at all* gave 1.97 px, the lag exceeding the jitter it removed. Equal weights
+give 0.69 px on real data and 1.78 px on the corrupted one — better on both
+counts than either. Coasting through a dropout, which is what the filter is
+genuinely for, is unchanged.
+
 Results accumulate in `tracking_history`, a `{frame_index: [4 corners]}` map
 that drives both the preview and the render.
 
