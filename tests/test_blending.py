@@ -4,8 +4,8 @@ import cv2
 import numpy as np
 import pytest
 
-import lumen_blend as blend
-import lumen_core as core
+import galileo_blend as blend
+import galileo_core as core
 
 
 QUAD = np.float32([[120, 90], [520, 110], [505, 360], [135, 340]])

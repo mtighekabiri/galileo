@@ -15,7 +15,7 @@ import importlib.util
 import numpy as np
 import pytest
 
-import lumen_core as core
+import galileo_core as core
 from conftest import quad_path, render_clip, write_video
 
 pytest.importorskip("PyQt5.QtWidgets")
@@ -25,11 +25,11 @@ from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QKeyEvent
 
 _spec = importlib.util.spec_from_file_location(
-    "lumen_app",
+    "galileo_app",
     os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                 "LUMEN_Insertion_Tool_1.0.0.py"))
-lumen_app = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(lumen_app)
+                 "Galileo_Insertion_Tool_1.0.0.py"))
+galileo_app = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(galileo_app)
 
 KEY_PRESS = 6   # QEvent.KeyPress
 
@@ -42,7 +42,7 @@ def qapp():
 @pytest.fixture
 def app(qapp, clip_video):
     path, truth = clip_video
-    window = lumen_app.MainWindow()
+    window = galileo_app.MainWindow()
     window.show()
     window.central_panel.load_video(path)
     panel = window.central_panel
@@ -191,7 +191,7 @@ class TestTrackingSwitchGuard:
     def test_enabling_without_a_shape_is_refused(self, app, monkeypatch):
         """It used to go green and record nothing for the whole clip."""
         window, panel, overlay, truth = app
-        monkeypatch.setattr(lumen_app.QMessageBox, "information",
+        monkeypatch.setattr(galileo_app.QMessageBox, "information",
                             staticmethod(lambda *a, **k: None))
         overlay.points = []
         panel.on_tracking_toggled(True)
@@ -218,15 +218,15 @@ class TestUnsavedWork:
     def test_cancelling_the_prompt_blocks_the_action(self, app, monkeypatch):
         window, panel, overlay, truth = app
         window.mark_dirty()
-        monkeypatch.setattr(lumen_app.QMessageBox, "warning",
-                            staticmethod(lambda *a, **k: lumen_app.QMessageBox.Cancel))
+        monkeypatch.setattr(galileo_app.QMessageBox, "warning",
+                            staticmethod(lambda *a, **k: galileo_app.QMessageBox.Cancel))
         assert window.confirm_discard("x") is False
 
     def test_discard_allows_the_action(self, app, monkeypatch):
         window, panel, overlay, truth = app
         window.mark_dirty()
-        monkeypatch.setattr(lumen_app.QMessageBox, "warning",
-                            staticmethod(lambda *a, **k: lumen_app.QMessageBox.Discard))
+        monkeypatch.setattr(galileo_app.QMessageBox, "warning",
+                            staticmethod(lambda *a, **k: galileo_app.QMessageBox.Discard))
         assert window.confirm_discard("x") is True
 
     def test_title_names_the_loaded_video(self, app):

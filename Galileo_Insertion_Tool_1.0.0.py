@@ -6,9 +6,9 @@ import csv
 import numpy as np
 import json
 
-import lumen_core as core
-import lumen_blend as blend
-import lumen_morph as morphlib
+import galileo_core as core
+import galileo_blend as blend
+import galileo_morph as morphlib
 
 from PyQt5.QtCore import (
     QObject, QThread, pyqtSignal, Qt, QSize, QUrl, QEvent, QTimer, QPoint, QRect,
@@ -58,7 +58,7 @@ def user_data_directory() -> str:
         root = os.environ.get("XDG_DATA_HOME") or os.path.join(
             os.path.expanduser("~"), ".local", "share")
 
-    directory = os.path.join(root, "LUMEN")
+    directory = os.path.join(root, "Galileo")
     try:
         os.makedirs(directory, exist_ok=True)
         return directory
@@ -108,7 +108,7 @@ def ms_to_mmss(milliseconds: int) -> str:
     return f"{mm:02}:{ss:02}"
 
 # The Kalman filter, planar tracker, compositor and geometry helpers all live
-# in lumen_core so that the preview and the render share one implementation and
+# in galileo_core so that the preview and the render share one implementation and
 # cannot drift apart, and so they can be tested without a display.
 SimpleKalmanFilter = core.SimpleKalmanFilter
 
@@ -1884,7 +1884,7 @@ class TrackingOverlay(QWidget):
             self.points.append((avg_x, avg_y))  # 5th node
 
     def _color_transfer(self, source_bgr: np.ndarray, target_bgr: np.ndarray) -> np.ndarray:
-        """Kept as a thin alias; the implementation lives in lumen_core."""
+        """Kept as a thin alias; the implementation lives in galileo_core."""
         return core.color_transfer(source_bgr, target_bgr)
 
 class TitleBar(QWidget):
@@ -2866,7 +2866,7 @@ class CentralPanel(QWidget):
     def track_with_optical_flow(self, old_frame, new_frame, old_points):
         """Advance a quad by one frame.
 
-        Superseded by :class:`lumen_core.PlanarTracker`, which tracks the
+        Superseded by :class:`galileo_core.PlanarTracker`, which tracks the
         texture across the whole region instead of the four corner points and
         fits a homography to it. Kept as a one-shot convenience wrapper.
         """
@@ -3913,7 +3913,7 @@ class MainWindow(QMainWindow):
     def refresh_title(self):
         name = os.path.basename(getattr(self.central_panel, "current_video_path", "")
                                 or "")
-        parts = ["LUMEN"]
+        parts = ["Galileo"]
         if name:
             parts.append(name)
         title = "  —  ".join(parts) + (" *" if self.dirty else "")

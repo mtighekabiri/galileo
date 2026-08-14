@@ -19,7 +19,7 @@ import cv2
 import numpy as np
 import pytest
 
-import lumen_core as core
+import galileo_core as core
 
 pytest.importorskip("PyQt5.QtWidgets")
 
@@ -27,13 +27,13 @@ from PyQt5.QtCore import QRect                                   # noqa: E402
 from PyQt5.QtWidgets import QApplication                         # noqa: E402
 
 _spec = importlib.util.spec_from_file_location(
-    "lumen_app",
+    "galileo_app",
     os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                 "LUMEN_Insertion_Tool_1.0.0.py"))
-lumen_app = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(lumen_app)
+                 "Galileo_Insertion_Tool_1.0.0.py"))
+galileo_app = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(galileo_app)
 
-Point = lumen_app.MagnifierPoint
+Point = galileo_app.MagnifierPoint
 CORNERS = [(150.0, 110.0), (470.0, 110.0), (470.0, 300.0), (150.0, 300.0)]
 
 
@@ -62,7 +62,7 @@ def grab(widget):
 
 @pytest.fixture
 def magnifier(qapp):
-    widget = lumen_app.MagnifierWidget()
+    widget = galileo_app.MagnifierWidget()
     widget.resize(320, 320)
     return widget
 
@@ -291,7 +291,7 @@ class TestWiredIntoThePanel:
     @pytest.fixture
     def app(self, qapp, clip_video, logo_bgra):
         path, truth = clip_video
-        window = lumen_app.MainWindow()
+        window = galileo_app.MainWindow()
         window.central_panel.load_video(path)
         overlay = window.central_panel.tracking_overlay
         overlay.points = [tuple(map(float, p)) for p in truth[0]]

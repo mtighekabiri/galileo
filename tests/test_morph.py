@@ -12,8 +12,8 @@ import cv2
 import numpy as np
 import pytest
 
-import lumen_core as core
-import lumen_morph as morph
+import galileo_core as core
+import galileo_morph as morph
 
 
 def striped(width=400, height=200, spacing=40):
@@ -330,11 +330,11 @@ import importlib.util                                            # noqa: E402
 from PyQt5.QtWidgets import QApplication                         # noqa: E402
 
 _spec = importlib.util.spec_from_file_location(
-    "lumen_app",
+    "galileo_app",
     os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                 "LUMEN_Insertion_Tool_1.0.0.py"))
-lumen_app = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(lumen_app)
+                 "Galileo_Insertion_Tool_1.0.0.py"))
+galileo_app = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(galileo_app)
 
 
 @pytest.fixture(scope="session")
@@ -345,7 +345,7 @@ def qapp():
 @pytest.fixture
 def app(qapp, clip_video, logo_bgra):
     path, truth = clip_video
-    window = lumen_app.MainWindow()
+    window = galileo_app.MainWindow()
     window.central_panel.load_video(path)
     overlay = window.central_panel.tracking_overlay
     overlay.overlay_bgra = logo_bgra
@@ -390,7 +390,7 @@ class TestInTheApplication:
         window, panel, overlay, truth = app
         overlay.morph.yaw = 18
         overlay.morph.bow_h = 0.35
-        restored = lumen_app.Placement.from_dict(overlay.active.to_dict())
+        restored = galileo_app.Placement.from_dict(overlay.active.to_dict())
         assert restored.morph.yaw == 18
         assert restored.morph.bow_h == pytest.approx(0.35)
 
@@ -407,7 +407,7 @@ class TestInTheApplication:
         overlay.morph.yaw = 25
         overlay.morph.bow_h = 0.5
         out = str(tmp_path / "shaped.mp4")
-        worker = lumen_app.RenderWorker(
+        worker = galileo_app.RenderWorker(
             window.build_render_settings(0, 4, 1.0, out))
         statuses = []
         worker.finished.connect(statuses.append)
@@ -417,7 +417,7 @@ class TestInTheApplication:
 
     def test_the_dialog_writes_through_to_the_placement(self, app):
         window, panel, overlay, truth = app
-        dialog = lumen_app.MorphDialog(overlay.morph, overlay.overlay_bgra,
+        dialog = galileo_app.MorphDialog(overlay.morph, overlay.overlay_bgra,
                                        lambda: None, parent=window)
         dialog.sliders["yaw"].setValue(22)
         dialog.sliders["bow_h"].setValue(40)
@@ -427,7 +427,7 @@ class TestInTheApplication:
     def test_cancelling_the_dialog_puts_it_back(self, app):
         window, panel, overlay, truth = app
         overlay.morph.yaw = 10
-        dialog = lumen_app.MorphDialog(overlay.morph, overlay.overlay_bgra,
+        dialog = galileo_app.MorphDialog(overlay.morph, overlay.overlay_bgra,
                                        lambda: None, parent=window)
         dialog.sliders["yaw"].setValue(40)
         dialog._revert_and_reject()

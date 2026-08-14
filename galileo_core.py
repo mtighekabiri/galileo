@@ -1,7 +1,7 @@
-"""Qt-free core for the LUMEN Insertion Tool.
+"""Qt-free core for the Galileo Insertion Tool.
 
 Everything in here is plain NumPy/OpenCV so it can be exercised headlessly,
-without a display or an event loop. The GUI in ``LUMEN_Insertion_Tool_1.0.0.py``
+without a display or an event loop. The GUI in ``Galileo_Insertion_Tool_1.0.0.py``
 is a thin layer over these functions, which means the preview and the render
 run the *same* tracking and compositing code and cannot drift apart.
 

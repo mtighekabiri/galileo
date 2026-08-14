@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Build LUMEN into a standalone folder that needs no Python installed.
+"""Build Galileo into a standalone folder that needs no Python installed.
 
     python build.py
 
-Produces dist/LUMEN/ plus a zip beside it, ready to hand to a user who will
+Produces dist/Galileo/ plus a zip beside it, ready to hand to a user who will
 unzip it and double-click the executable. See BUILD.md for the details.
 
 Builds for the machine it runs on: PyInstaller cannot cross-compile, so run
@@ -21,7 +21,7 @@ import venv
 ROOT = os.path.dirname(os.path.abspath(__file__))
 BUILD_ENV = os.path.join(ROOT, ".buildenv")
 DIST = os.path.join(ROOT, "dist")
-SPEC = os.path.join(ROOT, "LUMEN.spec")
+SPEC = os.path.join(ROOT, "Galileo.spec")
 
 
 def env_python(env_dir: str) -> str:
@@ -74,7 +74,7 @@ def verify_no_duplicate_opencv(python: str) -> None:
 
 
 def check_bundle() -> None:
-    internal = os.path.join(DIST, "LUMEN", "_internal")
+    internal = os.path.join(DIST, "Galileo", "_internal")
     stray = os.path.join(internal, "opencv_python.libs")
     if os.path.isdir(stray):
         print("\n  WARNING: the bundle contains opencv_python.libs, which carries a\n"
@@ -83,7 +83,7 @@ def check_bundle() -> None:
     if not os.path.isdir(internal):
         return
     total = sum(os.path.getsize(os.path.join(root, name))
-                for root, _, files in os.walk(os.path.join(DIST, "LUMEN"))
+                for root, _, files in os.walk(os.path.join(DIST, "Galileo"))
                 for name in files)
     print(f"  Bundle size: {total / 1e6:.0f} MB")
 
@@ -93,7 +93,7 @@ def main() -> int:
     parser.add_argument("--reuse-env", action="store_true",
                         help="keep the existing .buildenv instead of rebuilding it")
     parser.add_argument("--no-zip", action="store_true",
-                        help="leave dist/LUMEN/ unzipped")
+                        help="leave dist/Galileo/ unzipped")
     args = parser.parse_args()
 
     if not os.path.exists(SPEC):
@@ -111,12 +111,12 @@ def main() -> int:
 
     if not args.no_zip:
         tag = f"{platform.system().lower()}-{platform.machine().lower()}"
-        archive = os.path.join(DIST, f"LUMEN-{tag}")
+        archive = os.path.join(DIST, f"Galileo-{tag}")
         print("Zipping...")
-        shutil.make_archive(archive, "zip", DIST, "LUMEN")
+        shutil.make_archive(archive, "zip", DIST, "Galileo")
         print(f"\nDone: {archive}.zip")
     else:
-        print(f"\nDone: {os.path.join(DIST, 'LUMEN')}")
+        print(f"\nDone: {os.path.join(DIST, 'Galileo')}")
 
     print("\nBefore handing it over, drop an ffmpeg binary next to the executable\n"
           "if you want rendered videos to keep their audio (see BUILD.md).")

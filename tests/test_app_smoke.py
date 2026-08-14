@@ -14,7 +14,7 @@ import cv2
 import numpy as np
 import pytest
 
-import lumen_core as core
+import galileo_core as core
 from conftest import make_texture, quad_path, render_clip, write_video
 
 pytest.importorskip("PyQt5.QtWidgets")
@@ -24,11 +24,11 @@ from PyQt5.QtWidgets import QApplication
 import importlib.util
 
 _spec = importlib.util.spec_from_file_location(
-    "lumen_app",
+    "galileo_app",
     os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                 "LUMEN_Insertion_Tool_1.0.0.py"))
-lumen_app = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(lumen_app)
+                 "Galileo_Insertion_Tool_1.0.0.py"))
+galileo_app = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(galileo_app)
 
 
 @pytest.fixture(scope="session")
@@ -39,7 +39,7 @@ def qapp():
 
 @pytest.fixture
 def window(qapp):
-    win = lumen_app.MainWindow()
+    win = galileo_app.MainWindow()
     yield win
     win.close()
 
@@ -134,7 +134,7 @@ class TestRendering:
 
         out = str(tmp_path / "render.mp4")
         settings = window.build_render_settings(0, 9, 1.0, out)
-        worker = lumen_app.RenderWorker(settings)
+        worker = galileo_app.RenderWorker(settings)
 
         statuses = []
         worker.finished.connect(statuses.append)
@@ -156,7 +156,7 @@ class TestRendering:
         settings = window.build_render_settings(0, 5, 1.0, str(tmp_path / "x.mp4"))
 
         for value in vars(settings).values():
-            assert not isinstance(value, (lumen_app.QPixmap, lumen_app.QImage))
+            assert not isinstance(value, (galileo_app.QPixmap, galileo_app.QImage))
         assert isinstance(settings.overlay_bgra, np.ndarray)
         # A detached copy, not a view onto the widget's array.
         assert settings.overlay_bgra is not window.central_panel.tracking_overlay.overlay_bgra
@@ -171,7 +171,7 @@ class TestRendering:
         panel, overlay = self._prepare(window, truth, creative)
 
         out = str(tmp_path / "transparent.mp4")
-        worker = lumen_app.RenderWorker(
+        worker = galileo_app.RenderWorker(
             window.build_render_settings(0, 4, 1.0, out))
         worker.run()
 
@@ -204,7 +204,7 @@ class TestRendering:
         dense = core.interpolate_tracking(settings.history, 0, 9)
         assert sorted(dense) == list(range(10))
 
-        worker = lumen_app.RenderWorker(settings)
+        worker = galileo_app.RenderWorker(settings)
         worker.run()
         assert os.path.exists(out)
 
@@ -212,7 +212,7 @@ class TestRendering:
         window, path, truth = loaded
         self._prepare(window, truth, logo_bgra)
         out = str(tmp_path / "half.mp4")
-        worker = lumen_app.RenderWorker(
+        worker = galileo_app.RenderWorker(
             window.build_render_settings(0, 5, 0.5, out))
         worker.run()
 
@@ -225,7 +225,7 @@ class TestRendering:
         window, path, truth = loaded
         self._prepare(window, truth, logo_bgra)
         out = str(tmp_path / "cancelled.mp4")
-        worker = lumen_app.RenderWorker(
+        worker = galileo_app.RenderWorker(
             window.build_render_settings(0, 9, 1.0, out))
         worker.cancel()
 
@@ -246,7 +246,7 @@ class TestRendering:
         assert settings.curved is True
         assert np.any(settings.curvature != 0)
 
-        worker = lumen_app.RenderWorker(settings)
+        worker = galileo_app.RenderWorker(settings)
         statuses = []
         worker.finished.connect(statuses.append)
         worker.run()
@@ -275,7 +275,7 @@ class TestScreenAndOcclusionToggles:
     def test_digital_screen_switches_the_feature_source(self, loaded, monkeypatch):
         window, path, truth = loaded
         panel = window.central_panel
-        monkeypatch.setattr(lumen_app.QMessageBox, "information",
+        monkeypatch.setattr(galileo_app.QMessageBox, "information",
                             staticmethod(lambda *a, **k: None))
 
         assert panel.feature_source == core.PlanarTracker.INTERIOR
@@ -287,7 +287,7 @@ class TestScreenAndOcclusionToggles:
     def test_switching_mode_reanchors_the_tracker(self, loaded, monkeypatch):
         window, path, truth = loaded
         panel = window.central_panel
-        monkeypatch.setattr(lumen_app.QMessageBox, "information",
+        monkeypatch.setattr(galileo_app.QMessageBox, "information",
                             staticmethod(lambda *a, **k: None))
 
         panel.tracking_overlay.points = [tuple(map(float, p)) for p in truth[0]]
@@ -301,7 +301,7 @@ class TestScreenAndOcclusionToggles:
     def test_the_tracker_is_built_with_the_chosen_source(self, loaded, monkeypatch):
         window, path, truth = loaded
         panel = window.central_panel
-        monkeypatch.setattr(lumen_app.QMessageBox, "information",
+        monkeypatch.setattr(galileo_app.QMessageBox, "information",
                             staticmethod(lambda *a, **k: None))
         window.toggle_digital_screen(True)
 
@@ -321,7 +321,7 @@ class TestScreenAndOcclusionToggles:
         monkeypatch.setattr(core.PersonSegmenter, "is_available",
                             classmethod(lambda cls: False))
         warned = []
-        monkeypatch.setattr(lumen_app.QMessageBox, "warning",
+        monkeypatch.setattr(galileo_app.QMessageBox, "warning",
                             staticmethod(lambda *a, **k: warned.append(a)))
 
         window.toggle_occlusion(True)
@@ -352,14 +352,14 @@ class TestAoiExport:
         overlay.tracking_history = history
         window.last_render = render
         out = str(tmp_path / "aoi.csv")
-        monkeypatch.setattr(lumen_app.QFileDialog, "getSaveFileName",
+        monkeypatch.setattr(galileo_app.QFileDialog, "getSaveFileName",
                             staticmethod(lambda *a, **k: (out, "")))
         for name in ("information", "warning"):
-            monkeypatch.setattr(lumen_app.QMessageBox, name,
+            monkeypatch.setattr(galileo_app.QMessageBox, name,
                                 staticmethod(lambda *a, **k: None))
         # Exporting with no render asks for confirmation; answer yes.
-        monkeypatch.setattr(lumen_app.QMessageBox, "question",
-                            staticmethod(lambda *a, **k: lumen_app.QMessageBox.Yes))
+        monkeypatch.setattr(galileo_app.QMessageBox, "question",
+                            staticmethod(lambda *a, **k: galileo_app.QMessageBox.Yes))
         window.save_aoi_geometry()
 
         import csv
@@ -482,10 +482,10 @@ class TestAoiMatchesTheRender:
         window.central_panel.tracking_overlay.tracking_history = {
             0: [tuple(map(float, p)) for p in truth[0]]}
         out = tmp_path / "declined.csv"
-        monkeypatch.setattr(lumen_app.QFileDialog, "getSaveFileName",
+        monkeypatch.setattr(galileo_app.QFileDialog, "getSaveFileName",
                             staticmethod(lambda *a, **k: (str(out), "")))
-        monkeypatch.setattr(lumen_app.QMessageBox, "question",
-                            staticmethod(lambda *a, **k: lumen_app.QMessageBox.No))
+        monkeypatch.setattr(galileo_app.QMessageBox, "question",
+                            staticmethod(lambda *a, **k: galileo_app.QMessageBox.No))
         window.save_aoi_geometry()
         assert not out.exists()
 
@@ -516,9 +516,9 @@ class TestProjectRoundTrip:
         overlay.set_control_point(1, 0, np.float32(truth[0][1]) + [12, 4])
 
         project = str(tmp_path / "project.json")
-        monkeypatch.setattr(lumen_app.QFileDialog, "getSaveFileName",
+        monkeypatch.setattr(galileo_app.QFileDialog, "getSaveFileName",
                             staticmethod(lambda *a, **k: (project, "")))
-        monkeypatch.setattr(lumen_app.QMessageBox, "information",
+        monkeypatch.setattr(galileo_app.QMessageBox, "information",
                             staticmethod(lambda *a, **k: None))
         window.save_project()
 

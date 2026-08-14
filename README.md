@@ -1,4 +1,4 @@
-# rembrand — LUMEN Insertion Tool
+# rembrand — Galileo Insertion Tool
 
 A PyQt5 desktop tool for inserting a creative (image or video) into a base
 video so that it sticks to a surface in the scene as the camera moves.
@@ -13,7 +13,7 @@ the rendered video.
 
 ```bash
 pip install -r requirements.txt
-python LUMEN_Insertion_Tool_1.0.0.py
+python Galileo_Insertion_Tool_1.0.0.py
 ```
 
 Requires a desktop session — it is a windowed Qt application, not a CLI.
@@ -26,8 +26,8 @@ package it into a self-contained folder they can unzip and double-click. No
 install, no admin rights. See [BUILD.md](BUILD.md).
 
 Debug output goes to `app_debug.log` in a per-user folder
-(`%LOCALAPPDATA%\LUMEN` on Windows, `~/Library/Application Support/LUMEN` on
-macOS, `~/.local/share/LUMEN` on Linux).
+(`%LOCALAPPDATA%\Galileo` on Windows, `~/Library/Application Support/Galileo` on
+macOS, `~/.local/share/Galileo` on Linux).
 
 ## Workflow
 
@@ -389,21 +389,21 @@ stored only a single quad.
 
 ## Layout
 
-`lumen_core.py` holds the algorithms as plain NumPy/OpenCV with no Qt imports.
-`LUMEN_Insertion_Tool_1.0.0.py` is the application on top of it. The split
+`galileo_core.py` holds the algorithms as plain NumPy/OpenCV with no Qt imports.
+`Galileo_Insertion_Tool_1.0.0.py` is the application on top of it. The split
 matters for more than tidiness: the preview and the renderer call the *same*
 compositing function, so what you approve on screen is what gets written to the
 file, and the algorithms can be tested without a display.
 
 | Component | Role |
 | --- | --- |
-| `lumen_core.PlanarTracker` | Feature-based planar tracking with RANSAC and sanity checks |
-| `lumen_core.ReferenceMatcher` | Locates a target in the footage from a reference image |
-| `lumen_core.PersonSegmenter` | Segments people so the insert can go behind them |
-| `lumen_core.Region` | Four corners plus per-edge curvature |
-| `lumen_core.composite_region` | Alpha-correct perspective/curved warp and blend |
-| `lumen_core.interpolate_tracking` | Fills the gaps between tracked frames |
-| `lumen_core.remux_audio` | Copies the source audio onto a finished render |
+| `galileo_core.PlanarTracker` | Feature-based planar tracking with RANSAC and sanity checks |
+| `galileo_core.ReferenceMatcher` | Locates a target in the footage from a reference image |
+| `galileo_core.PersonSegmenter` | Segments people so the insert can go behind them |
+| `galileo_core.Region` | Four corners plus per-edge curvature |
+| `galileo_core.composite_region` | Alpha-correct perspective/curved warp and blend |
+| `galileo_core.interpolate_tracking` | Fills the gaps between tracked frames |
+| `galileo_core.remux_audio` | Copies the source audio onto a finished render |
 | `MainWindow` | Frameless main window, menus, load/save/render actions |
 | `CentralPanel` | Video playback, frame stepping, the tracking loop |
 | `TrackingOverlay` | The area, corner and curve handles, live preview |

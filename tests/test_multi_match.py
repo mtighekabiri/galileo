@@ -15,7 +15,7 @@ import cv2
 import numpy as np
 import pytest
 
-import lumen_core as core
+import galileo_core as core
 from conftest import make_background, make_texture, quad_path, render_clip, write_video
 
 pytest.importorskip("PyQt5.QtWidgets")
@@ -26,11 +26,11 @@ from PyQt5.QtWidgets import QApplication
 # function-scoped fixture makes a fresh copy of every Qt class per test, which
 # crashes the interpreter.
 _spec = importlib.util.spec_from_file_location(
-    "lumen_app",
+    "galileo_app",
     os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                 "LUMEN_Insertion_Tool_1.0.0.py"))
-lumen_app = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(lumen_app)
+                 "Galileo_Insertion_Tool_1.0.0.py"))
+galileo_app = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(galileo_app)
 
 WIDTH, HEIGHT = 900, 600
 PANELS = [
@@ -253,10 +253,10 @@ class TestDetectionsBecomePlacements:
         frames = [plant(poster, PANELS) for _ in range(4)]
         path = write_video(frames, tmp_path / "panels.mp4")
 
-        win = lumen_app.MainWindow()
+        win = galileo_app.MainWindow()
         win.show()
         win.central_panel.load_video(path)
-        yield win, lumen_app, path
+        yield win, galileo_app, path
         win.dirty = False
         win.close()
 
