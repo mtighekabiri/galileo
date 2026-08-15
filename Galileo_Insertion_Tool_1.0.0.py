@@ -2624,6 +2624,10 @@ class CentralPanel(QWidget):
         super(CentralPanel, self).__init__(parent)
 
         self.tracking_mode = False
+        # Whether the pass now running has actually written anything down, so
+        # that ending it can account for the frames rather than mark a project
+        # unsaved because tracking was switched off and straight back on.
+        self.tracked_this_pass = False
         self.cap = None
         self.playing = False
         self.prev_frame = None
@@ -2986,17 +2990,18 @@ class CentralPanel(QWidget):
 
     def toggle_play_pause(self):
         self.playing = not self.playing
-        print(f"Toggling play: {self.playing}")
+        logging.debug("Toggling play: %s", self.playing)
         if self.playing:
             self.play_pause_btn.setIcon(self.style().standardIcon(QStyle.SP_MediaPause))
             interval_ms = max(1, int(1000 / self.fps))
-            print(f"Starting timer with interval={interval_ms} ms, FPS={self.fps}")
             self.timer.start(interval_ms)
         else:
             self.play_pause_btn.setIcon(self.style().standardIcon(QStyle.SP_MediaPlay))
             self.timer.stop()
+            # Pausing is how most passes end: the user plays as far as they
+            # want, stops, and looks at what was recorded.
+            self.note_tracking_pass_ended()
 
-        # <<<< Add this line >>>>
         if self.tracking_mode:
             self.tracking_overlay.setFocus()
 
@@ -3004,16 +3009,55 @@ class CentralPanel(QWidget):
         """Turns off the tracking mode and updates the UI switch."""
         self.tracking_mode = False
         self.switch.setChecked(False)
-        self.tracking_label.setText("Tracking Disabled")
-        self.tracking_label.setStyleSheet("""
-            QLabel {
-                color: #BBBBBB;
+        self.refresh_tracking_label()
+        self.note_tracking_pass_ended()
+
+    def refresh_tracking_label(self):
+        """Say whether tracking is on and, with several placements, on which.
+
+        Naming it matters: only the active placement is followed, so a user who
+        thinks a pass is covering every screen in the shot would come away
+        believing work had happened that had not.
+        """
+        overlay = self.tracking_overlay
+        several = len(overlay.placements) > 1
+        if self.tracking_mode:
+            colour = "limegreen"
+            tip = ("Following this placement only. Switch placement and play "
+                   "again to track another." if several else
+                   "Following the marked area through the clip.")
+        else:
+            colour = "#BBBBBB"
+            tip = "Nothing is being followed; shapes stay where they are."
+        self.tracking_label.setStyleSheet(f"""
+            QLabel {{
+                color: {colour};
                 font-size: 14px;
                 background-color: #1A1A1A;
                 padding: 5px;
-                min-width: 150px;
-            }
+            }}
         """)
+
+        if not self.tracking_mode:
+            text = "Tracking off"
+        elif not several:
+            text = "Tracking on"
+        else:
+            # Placement names are the user's own words and get long -- "Ryanair
+            # concourse portrait" is a realistic one. Shorten it rather than let
+            # it push the magnifier controls off the end of the strip.
+            # fontMetrics() rather than font(): the size comes from the
+            # stylesheet, so only the resolved font measures the text right.
+            metrics = self.tracking_label.fontMetrics()
+            text = "Tracking " + metrics.elidedText(overlay.active.name,
+                                                    Qt.ElideRight, 170)
+            tip = f"{tip}\nTracking: {overlay.active.name}"
+        self.tracking_label.setText(text)
+        self.tracking_label.setToolTip(tip)
+        # The strip hands this label its minimum width and no more, so without
+        # this a longer name was simply cut off mid-word.
+        self.tracking_label.setMinimumWidth(
+            max(150, self.tracking_label.sizeHint().width()))
 
     def on_shape_changed(self):
         # A hand edit invalidates the tracker's anchor, so drop it; it will be
@@ -3104,6 +3148,9 @@ class CentralPanel(QWidget):
             self.timer.stop()
             self.play_pause_btn.setIcon(self.style().standardIcon(QStyle.SP_MediaPlay))
             self.playing = False
+            # Running off the end of the clip ends the pass as surely as
+            # switching tracking off does.
+            self.note_tracking_pass_ended()
             return
 
         current_frame_index = int(self.cap.get(cv2.CAP_PROP_POS_FRAMES)) - 1
@@ -3126,35 +3173,21 @@ class CentralPanel(QWidget):
         # homography to it; the Kalman filters then smooth the result and
         # carry the shape through brief dropouts.
         if self.tracking_mode:
-            # Each placement carries its own tracker and filters, so one losing
-            # its surface cannot disturb the others.
-            for placement in self.placements_to_track():
-                if not placement.kalman_filters:
-                    placement.kalman_filters = core.make_filters(placement.points)
-                if placement.tracker is None and self.prev_frame is not None:
-                    placement.tracker = core.PlanarTracker(
-                        self.prev_frame, placement.points,
-                        feature_source=placement.feature_source)
-
-                measurement = None
-                if placement.tracker is not None:
-                    result = placement.tracker.track(frame)
-                    if result.ok:
-                        measurement = result.quad
-                    else:
-                        logging.debug("Tracking failed on frame %d for %s: %s",
-                                      current_frame_index, placement.name,
-                                      result.reason)
-
-                smoothed = core.smooth_quad(placement.kalman_filters, measurement)
-                placement.points = [(float(x), float(y)) for x, y in smoothed]
-                placement.tracking_history[current_frame_index] = placement.points[:]
-        elif not self.tracking_mode:
-            # Tracking off: show whatever was recorded for this frame.
-            self.kalman_filters = []
-            self.tracker = None
-            if current_frame_index in self.tracking_history:
-                overlay.points = self.tracking_history[current_frame_index][:]
+            # Only the placement being worked on is followed. Tracking them all
+            # at once read as a convenience, but a second pass -- to follow a
+            # screen added later, say -- re-tracked the first placement too and
+            # overwrote its history from wherever its corners happened to sit,
+            # throwing away corrections made by hand with nothing on screen to
+            # say it had happened. The others are not frozen: they replay their
+            # own recorded track, which is read and never written.
+            active = overlay.active
+            tracked = self.track_placement(active, frame, current_frame_index)
+            self.replay_recorded_shapes(current_frame_index,
+                                        being_tracked=active if tracked else None)
+        else:
+            # Tracking off: every placement shows whatever was recorded for
+            # this frame.
+            self.replay_recorded_shapes(current_frame_index)
 
         # If an overlay video is inserted, advance it to the matching frame.
         if overlay.inserted_overlay_is_video:
@@ -3264,6 +3297,9 @@ class CentralPanel(QWidget):
             else "Mark all four corners of the area first")
         if not ready and self.switch.isChecked():
             self.switch.setChecked(False)
+        # Called whenever the active placement changes, which is exactly when
+        # the name in the tracking label goes stale.
+        self.refresh_tracking_label()
 
     def on_tracking_toggled(self, on: bool):
         if on and len(self.tracking_overlay.points) != 4:
@@ -3274,28 +3310,9 @@ class CentralPanel(QWidget):
             return
 
         self.tracking_mode = on
-        if on:
-            self.tracking_label.setText("Tracking on")
-            self.tracking_label.setStyleSheet("""
-                QLabel {
-                    color: limegreen;
-                    font-size: 14px;
-                    background-color: #1A1A1A;
-                    padding: 5px;
-                    min-width: 150px;
-                }
-            """)
-        else:
-            self.tracking_label.setText("Tracking off")
-            self.tracking_label.setStyleSheet("""
-                QLabel {
-                    color: #BBBBBB;
-                    font-size: 14px;
-                    background-color: #1A1A1A;
-                    padding: 5px;
-                    min-width: 150px;
-                }
-            """)
+        self.refresh_tracking_label()
+        if not on:
+            self.note_tracking_pass_ended()
             # The shape deliberately survives. Turning tracking off means "stop
             # following the surface", not "throw away what I marked" -- and
             # rewinding, scrubbing backwards and Go-to-Frame all switch tracking
@@ -3369,10 +3386,77 @@ class CentralPanel(QWidget):
         mask = core.quad_to_mask(region.corners, w, h)
         return blend.add_grain(composited, sigma, mask, seed=self.current_frame_index)
 
-    def placements_to_track(self):
-        """Placements with a complete shape, so there is something to follow."""
-        return [p for p in self.tracking_overlay.placements
-                if p.enabled and len(p.points) == 4]
+    def track_placement(self, placement, frame, frame_index) -> bool:
+        """Follow one placement's surface into this frame and record it.
+
+        Returns whether anything was recorded, so the caller knows which
+        placement it has just written and can leave that one alone.
+        """
+        if not placement.enabled or len(placement.points) != 4:
+            return False
+
+        if not placement.kalman_filters:
+            placement.kalman_filters = core.make_filters(placement.points)
+        if placement.tracker is None and self.prev_frame is not None:
+            placement.tracker = core.PlanarTracker(
+                self.prev_frame, placement.points,
+                feature_source=placement.feature_source)
+
+        measurement = None
+        if placement.tracker is not None:
+            result = placement.tracker.track(frame)
+            if result.ok:
+                measurement = result.quad
+            else:
+                logging.debug("Tracking failed on frame %d for %s: %s",
+                              frame_index, placement.name, result.reason)
+
+        smoothed = core.smooth_quad(placement.kalman_filters, measurement)
+        placement.points = [(float(x), float(y)) for x, y in smoothed]
+        placement.tracking_history[frame_index] = placement.points[:]
+        self.tracked_this_pass = True
+        return True
+
+    def note_tracking_pass_ended(self):
+        """Account for the frames a tracking pass just recorded.
+
+        A pass writes straight into the placement's history and nothing else
+        noticed. The placement list -- the one readout of how far each
+        placement has been followed, and the only one now that a pass covers a
+        single placement -- went on showing the count from before it started;
+        and the unsaved-work flag stayed clear, so tracking a whole clip and
+        then closing threw the lot away without a prompt. A shape nudged by
+        hand marked the project dirty; two hundred tracked frames did not.
+        """
+        if not self.tracked_this_pass:
+            return
+        self.tracked_this_pass = False
+        window = self.tracking_overlay.get_main_window()
+        if window is not None and hasattr(window, "placement_list"):
+            # mark_dirty refreshes the list and the title together.
+            window.mark_dirty()
+
+    def replay_recorded_shapes(self, frame_index, being_tracked=None):
+        """Put every other placement onto the shape recorded for this frame.
+
+        Read-only by design: this is what stops a pass over one placement from
+        altering another's history. A placement with nothing recorded here
+        keeps the shape it has -- it has not been tracked at this frame, and
+        moving it anyway would be a guess written down as measurement.
+        """
+        for placement in self.tracking_overlay.placements:
+            if placement is being_tracked:
+                continue
+            # Its tracker is anchored to a frame this pass has moved away
+            # from, so drop it rather than let it resume from a stale anchor;
+            # it re-anchors from the current shape when the user comes back to
+            # this placement. _previous_quad survives on purpose -- motion blur
+            # still needs to know how far the shape moved between frames.
+            placement.tracker = None
+            placement.kalman_filters = []
+            recorded = placement.tracking_history.get(frame_index)
+            if recorded:
+                placement.points = recorded[:]
 
     def occlusion_mask(self, frame, quad):
         """A mask of people in front of the surface, or None if switched off."""

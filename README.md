@@ -364,6 +364,28 @@ Tick a placement to include it in the render; untick to leave it out without
 losing its tracking. Editing always applies to the selected one, drawn with
 solid handles; the rest stay visible as dashed outlines.
 
+**A tracking pass follows the selected placement only**, which is why the
+status reads *Tracking Left* rather than *Tracking on* once there is more than
+one. Track them one at a time: mark the first, play through, correct it where
+it slipped, then select the second and play through again. The second pass
+cannot touch the first placement's tracking — it is read on every frame, so
+that placement still moves with the footage on screen, and never written.
+
+> Following every placement on every frame sounds like it would save a pass,
+> and it did the opposite. The second play-through re-tracked the first
+> placement from wherever its corners happened to be sitting and wrote the
+> result over its history, discarding corrections made by hand — an 8px nudge
+> came back at 8.3px away from where it had been put, across two thirds of the
+> tracked frames. Nothing on screen said so, because the shape was redrawn
+> from the same guess that had just replaced it.
+
+The frame count beside each placement is how you see what a pass covered, so it
+is brought up to date when the pass ends — switching tracking off, pausing, or
+running off the end of the clip. Tracked frames also count as unsaved work now:
+a pass used to leave the project looking clean, so tracking a whole clip and
+closing the window lost it with no prompt, while nudging one corner by hand
+asked to save.
+
 **The library describes the selected placement.** Select a placement, press
 *Insert* on a creative, and that creative fills that placement — switch
 placement and the library redraws to describe the new one. The same creative
