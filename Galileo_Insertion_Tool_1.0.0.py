@@ -827,10 +827,11 @@ class MagnifierWidget(QWidget):
         #: Filling the video stage rather than floating over a corner of it.
         self.expanded = False
         self._expand_lit = False
-        #: One handle at a time, filling the widget, instead of a tile each.
-        #: A grid answers "where is everything"; a single view answers "is
-        #: this one right", and once curving is on there are twelve of them.
-        self.single_view = False
+        #: One magnified view of the whole area, with every handle on it,
+        #: instead of a tile each. A grid shows each handle closely but never
+        #: shows the shape they make; this shows the shape, which is what
+        #: tells you whether the outline is following the screen.
+        self.whole_area = False
         self._single_lit = False
         # Set here as well as on the first manual resize: update_magnifier_dimensions
         # reads it as soon as a second corner exists, which is long before the
@@ -927,10 +928,10 @@ class MagnifierWidget(QWidget):
         """Where the one-view-or-all button sits, beside it."""
         return QRect(self.width() - 52, 5, 22, 22)
 
-    def set_single_view(self, single: bool):
-        if bool(single) == self.single_view:
+    def set_whole_area(self, whole: bool):
+        if bool(whole) == self.whole_area:
             return
-        self.single_view = bool(single)
+        self.whole_area = bool(whole)
         self.update()
 
     def set_expanded(self, expanded: bool):
@@ -958,7 +959,7 @@ class MagnifierWidget(QWidget):
                 event.accept()
                 return
             if self.single_button_rect().contains(event.pos()):
-                self.set_single_view(not self.single_view)
+                self.set_whole_area(not self.whole_area)
                 event.accept()
                 return
             if not self.auto_zoom and self.zoom_badge_rect().contains(event.pos()):
@@ -1036,11 +1037,11 @@ class MagnifierWidget(QWidget):
         if not count:
             return []
 
+        if self.whole_area and self.focus_index is None:
+            if self.whole_area_point() is not None:
+                return [(self.rect().adjusted(2, 2, -2, -2), -1)]
+
         focus = self.focus_index
-        if focus is None and self.single_view:
-            # Follows whatever is picked, so the keys and the mouse both steer
-            # it: 1-4 for a corner, T/R/B/L for a bend.
-            focus = self.selected_index if 0 <= self.selected_index < count else 0
         if focus is not None and 0 <= focus < count:
             return [(self.rect().adjusted(2, 2, -2, -2), focus)]
 
@@ -1059,6 +1060,8 @@ class MagnifierWidget(QWidget):
 
     def grid_shape(self):
         """``(columns, rows)`` for the overview."""
+        if self.whole_area:
+            return 1, 1
         count = len(self.points)
         if count <= 1:
             return 1, 1
@@ -1086,8 +1089,58 @@ class MagnifierWidget(QWidget):
             return [0, 1, 3, 2]
         return list(range(len(self.points)))
 
+    def area_bounds(self):
+        """The marked area's extent, in frame coordinates, or None.
+
+        Taken from the outline rather than the corners so a bend that swings
+        wide of them is inside the view rather than cut off by it.
+        """
+        points = [(p.x, p.y) for p in self.points]
+        if self.region is not None:
+            try:
+                points += [tuple(p) for p in core.region_boundary(self.region,
+                                                                  samples=32)]
+            except Exception:
+                pass
+        if not points:
+            return None
+        xs = [p[0] for p in points]
+        ys = [p[1] for p in points]
+        return min(xs), min(ys), max(xs), max(ys)
+
+    def whole_area_point(self):
+        """A view of everything at once, centred on the marked area."""
+        bounds = self.area_bounds()
+        if bounds is None:
+            return None
+        left, top, right, bottom = bounds
+        return MagnifierPoint((left + right) / 2.0, (top + bottom) / 2.0,
+                              "", MagnifierPoint.CORNER, "Whole area")
+
+    def point_at(self, index):
+        """The point a tile shows. -1 is the whole-area view."""
+        if index < 0:
+            return self.whole_area_point()
+        return self.points[index]
+
     def zoom_for(self, rect) -> float:
         """The magnification this tile should use."""
+        if self.whole_area:
+            bounds = self.area_bounds()
+            if bounds is not None:
+                # Room round the edges: a handle sitting exactly on the border
+                # of the view is the one you cannot judge.
+                margin = 1.35
+                wide = max(1.0, (bounds[2] - bounds[0]) * margin)
+                tall = max(1.0, (bounds[3] - bounds[1]) * margin)
+                # Fits, whatever that takes. An area larger than the widget
+                # cannot be both shown whole and magnified, and showing it
+                # whole is the entire point of this view -- enlarging the
+                # magnifier, or filling the stage with it, is what buys the
+                # magnification back.
+                return float(np.clip(min(rect.width() / wide,
+                                         rect.height() / tall),
+                                     0.05, self.MAX_ZOOM))
         if not self.auto_zoom:
             return self.zoom_factor
         shorter = max(1, min(rect.width(), rect.height()))
@@ -1132,7 +1185,9 @@ class MagnifierWidget(QWidget):
             return
 
         for rect, index in self.tiles():
-            self._draw_tile(painter, rect, self.points[index], index)
+            point = self.point_at(index)
+            if point is not None:
+                self._draw_tile(painter, rect, point, index)
 
         # The whole-widget border last, so no tile paints over it.
         painter.setBrush(Qt.NoBrush)
@@ -1174,7 +1229,8 @@ class MagnifierWidget(QWidget):
         if zoom >= self.GRID_ABOVE:
             self._draw_pixel_grid(painter, rect, point, zoom)
         self._draw_geometry(painter, rect, point, zoom)
-        self._draw_crosshair(painter, rect, point, index)
+        if index >= 0:
+            self._draw_crosshair(painter, rect, point, index)
         self._draw_label(painter, rect, point, index)
 
         # An outline, not a fill: drawRect uses whatever brush is current, and
@@ -1230,12 +1286,22 @@ class MagnifierWidget(QWidget):
 
         corners = self.region.corners
         # The corners themselves, so a tile shows its neighbours as well as
-        # the handle it is centred on.
+        # the handle it is centred on -- and, in the whole-area view, so every
+        # handle is drawn where it actually is rather than one in the middle.
         painter.setBrush(Qt.NoBrush)
-        painter.setPen(QPen(QColor(255, 90, 90, 210), 2))
+        picked = None
+        if 0 <= self.selected_index < len(self.points):
+            chosen = self.points[self.selected_index]
+            picked = (chosen.x, chosen.y)
         for corner in corners:
             x, y = to_tile(*corner)
-            painter.drawEllipse(int(x) - 4, int(y) - 4, 8, 8)
+            here = (picked is not None
+                    and abs(corner[0] - picked[0]) < 0.5
+                    and abs(corner[1] - picked[1]) < 0.5)
+            painter.setPen(QPen(QColor(0, 255, 0) if here
+                                else QColor(255, 90, 90, 210), 2))
+            size = 6 if here else 4
+            painter.drawEllipse(int(x) - size, int(y) - size, size * 2, size * 2)
 
         if not self.region.curved:
             return
@@ -1305,7 +1371,7 @@ class MagnifierWidget(QWidget):
         picture is arbitrary footage: plain text was unreadable half the time
         and truncated by the tile the rest of it.
         """
-        focused = self.focus_index is not None or self.single_view
+        focused = self.focus_index is not None or self.whole_area
         text = point.title if focused else point.label
         if not text or rect.height() < 30:
             return
@@ -1335,8 +1401,11 @@ class MagnifierWidget(QWidget):
         painter.drawRect(box)
         painter.setPen(QPen(QColor(150, 150, 150) if self.auto_zoom
                             else QColor(210, 210, 210)))
+        # A decimal below 10x: the whole-area view often lands between one
+        # and two, where rounding reported the same number at every size.
+        shown = f"{zoom:.1f}x" if zoom < 10 else f"{zoom:.0f}x"
         painter.drawText(box, Qt.AlignCenter,
-                         f"{zoom:.0f}x" if self.auto_zoom else f"{zoom:.0f}x •")
+                         shown if self.auto_zoom else shown + " \u2022")
 
     def _draw_expand_button(self, painter):
         """Arrows out to fill the stage, arrows in to put it back."""
@@ -1365,7 +1434,7 @@ class MagnifierWidget(QWidget):
         painter.drawLine(left + 1, top + 1, right - 1, bottom - 1)
 
     def _draw_single_button(self, painter):
-        """Four panes to go back to all of them, one to show only this one.
+        """Four panes to go back to a tile each, one to show the whole area.
 
         Drawn as what pressing it does rather than as the state it is in,
         which is the only reading that tells someone who has not used it
@@ -1380,7 +1449,7 @@ class MagnifierWidget(QWidget):
         painter.setPen(QPen(shade, 1))
         painter.setBrush(Qt.NoBrush)
         inner = box.adjusted(5, 5, -5, -5)
-        if self.single_view:
+        if self.whole_area:
             middle_x = inner.x() + inner.width() // 2
             middle_y = inner.y() + inner.height() // 2
             painter.drawRect(inner)

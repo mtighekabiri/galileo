@@ -71,7 +71,7 @@ macOS, `~/.local/share/Galileo` on Linux).
 | Magnifier switch | Show/hide the magnifier (it also appears while dragging) |
 | Double-click the magnifier | Fill the video stage with it, or put it back |
 | Scroll on the magnifier | Set its magnification by hand |
-| Panes button on the magnifier | One view at a time, or all of them |
+| Panes button on the magnifier | One view of the whole area, or a tile per handle |
 
 Brightness, contrast and colourise adjustments for the inserted creative are
 available from the left toolbar, and all three apply to the render as well as
@@ -300,10 +300,13 @@ its switch.
   corner and its two bend handles.
 * **Dragging one gives it the whole widget.** That is the moment precision is
   wanted, and four thumbnails serve it worse than one clear view.
-* **Press the panes button for one view instead of a grid.** A grid answers
-  "where is everything"; a single large view answers "is this one right", which
-  is the question once curving is on and there are twelve handles. It follows
-  whatever is picked, so `1`–`4` and `T`/`R`/`B`/`L` steer it.
+* **Press the panes button for one view of the whole area.** The grid shows
+  each handle closely but never shows the shape they make together, which is
+  what tells you whether the outline is following the screen. This frames the
+  whole marked area with every handle drawn on it — all twelve once curving is
+  on — and follows the outline rather than the corners, so a bend swinging wide
+  of them is still inside the view. It fits whatever size the magnifier is, so
+  enlarging it or filling the stage is what buys back the magnification.
 * **Double-click, or press the corner button, to fill the video stage.**
   Twelve handles in a floating box a couple of hundred pixels wide leaves each
   one smaller than the thumbnail it replaced; filling the stage is what makes
