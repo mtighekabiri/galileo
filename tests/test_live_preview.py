@@ -220,3 +220,35 @@ class TestTheShapeEditorPreviewsOnTheFootage:
             overlay.morph, creative(), lambda: None, parent=window,
             preview=lambda: None)
         assert self.thumbnail(dialog) is not None
+
+
+class TestTheLibraryCardReads:
+    def test_the_creative_name_is_not_clipped(self, qapp, tmp_path):
+        """A round 18px height cut the descenders, so "ad.png" read "ad.pnq"."""
+        from PyQt5.QtWidgets import QLabel
+        path = tmp_path / "ad.png"
+        cv2.imwrite(str(path), np.full((40, 60, 3), 200, np.uint8))
+        window = galileo_app.MainWindow()
+        try:
+            window.add_overlay(str(path))
+            card = window.overlay_layout.itemAt(
+                window.overlay_layout.count() - 2).widget()
+            labels = [w for w in card.findChildren(QLabel) if w.text()]
+            assert labels, "the card shows no name at all"
+            for label in labels:
+                assert label.height() >= label.fontMetrics().height(), (
+                    f"{label.text()!r} is given less height than its font needs")
+        finally:
+            window.dirty = False
+            window.close()
+
+    def test_no_placeholder_word_where_a_logo_would_go(self, qapp):
+        """With no logo.png beside it, the word "Logo" beside the title reads
+        as something broken rather than as nothing at all."""
+        window = galileo_app.MainWindow()
+        try:
+            label = window.title_bar.logo_label
+            assert not (label.isVisible() and label.text())
+        finally:
+            window.dirty = False
+            window.close()

@@ -2282,13 +2282,13 @@ class TitleBar(QWidget):
         
         self.logo_label = QLabel()
         # A missing file gives a null pixmap rather than raising, so the
-        # except this used to sit behind could never fire: every build without
-        # a logo.png beside it drew an empty gap where the fallback should be.
+        # except this used to sit behind could never fire. Hidden rather than
+        # given placeholder text: the word "Logo" sitting beside the title is
+        # more obviously missing than a title with nothing after it.
         logo = QPixmap(os.path.join(resource_directory(), "logo.png"))
         if logo.isNull():
             logging.debug("no logo.png alongside the application")
-            self.logo_label.setText("Logo")
-            self.logo_label.setStyleSheet("color: white; font-size: 14px;")
+            self.logo_label.hide()
         else:
             self.logo_label.setPixmap(logo.scaled(40, 40, Qt.KeepAspectRatio,
                                                   Qt.SmoothTransformation))
@@ -2883,7 +2883,6 @@ class CentralPanel(QWidget):
         self.reset_tracker()
         if len(self.tracking_overlay.points) == 4 and self.prev_frame is not None:
             self.refresh_display()
-        self.update_magnifier_dimensions()
         self.update_magnifier()
 
     def refresh_display(self):
@@ -3284,6 +3283,9 @@ class CentralPanel(QWidget):
         magnifier.raise_()
         self.update_magnifier(force=True)
 
+    #: Smallest a single magnified view may be before it stops being one.
+    MAGNIFIER_TILE = 96
+
     def update_magnifier_dimensions(self):
         shape_pts = self.tracking_overlay.points
         if len(shape_pts) < 2:
@@ -3309,6 +3311,14 @@ class CentralPanel(QWidget):
             computed_w = int(computed_h * new_aspect)
         computed_w = max(150, computed_w)
         computed_h = max(150, computed_h)
+
+        # Enough room for the views it actually has to draw. Sized for the
+        # shape alone, switching curved edges on divided the same 150 pixels
+        # twelve ways instead of four, leaving each handle a 50x37 thumbnail
+        # -- smaller than the thing it was meant to magnify.
+        columns, rows = self.magnifier.grid_shape()
+        computed_w = max(computed_w, columns * self.MAGNIFIER_TILE)
+        computed_h = max(computed_h, rows * self.MAGNIFIER_TILE)
 
         current_w = self.magnifier.width()
         current_h = self.magnifier.height()
@@ -3358,6 +3368,10 @@ class CentralPanel(QWidget):
             focus_index=focus,
             selected_control=overlay.drag_control or overlay.selected_control,
         )
+        # Sized after the views are set, not before: the grid it has to fit
+        # depends on how many handles there are, and the widget only learns
+        # that from the call above.
+        self.update_magnifier_dimensions()
 
     def magnifier_points(self):
         """What the magnifier should show: ``(points, selected, focus)``.
@@ -5218,7 +5232,9 @@ class MainWindow(QMainWindow):
         name = os.path.basename(file_path)
         ext_label = QLabel(name)
         ext_label.setStyleSheet("color: white; font-size: 11px;")
-        ext_label.setFixedHeight(18)
+        # Its own font decides the height. A round 18 clipped the descenders,
+        # so "ad.png" read as "ad.pnq".
+        ext_label.setFixedHeight(ext_label.fontMetrics().height() + 2)
         ext_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         ext_label.setToolTip(file_path)
         metrics = ext_label.fontMetrics()

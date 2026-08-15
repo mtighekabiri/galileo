@@ -416,7 +416,11 @@ class TestFillingTheStage:
             assert panel.magnifier.geometry() == panel.tracking_overlay.geometry()
 
             panel.magnifier.set_expanded(False)
-            assert panel.magnifier.geometry() == floating
+            # Back to floating in the same corner. Not necessarily the same
+            # size: it re-applies whatever the current handle count needs,
+            # which is the auto-sizing doing its job.
+            assert panel.magnifier.pos() == floating.topLeft()
+            assert panel.magnifier.geometry() != panel.tracking_overlay.geometry()
         finally:
             window.dirty = False
             window.close()
@@ -746,3 +750,47 @@ class TestPickingABendHandleWithTheKeys:
         before = np.array(overlay.curvature).copy()
         self.press(overlay, Qt.Key_Up)
         assert not np.array_equal(before, np.array(overlay.curvature))
+
+
+class TestItIsBigEnoughToBeUseful:
+    def test_twelve_handles_get_more_room_than_four(self, qapp, clip_video):
+        """Sized for the shape alone, switching curved edges on divided the
+        same 150 pixels twelve ways instead of four, leaving each handle a
+        50x37 thumbnail -- smaller than the thing it was meant to magnify."""
+        path, truth = clip_video
+        window = galileo_app.MainWindow()
+        try:
+            panel = window.central_panel
+            panel.load_video(path)
+            overlay = panel.tracking_overlay
+            overlay.points = [tuple(map(float, p)) for p in truth[0]]
+            panel.update_magnifier(force=True)
+            flat = panel.magnifier.size()
+
+            overlay.curved_enabled = True
+            panel.update_magnifier(force=True)
+            curved = panel.magnifier.size()
+            assert curved.height() > flat.height()
+
+            rect, _ = panel.magnifier.tiles()[0]
+            assert min(rect.width(), rect.height()) >= 80, (
+                f"each view is only {rect.width()}x{rect.height()}")
+        finally:
+            window.dirty = False
+            window.close()
+
+    def test_a_hand_resize_is_still_respected(self, qapp, clip_video):
+        path, truth = clip_video
+        window = galileo_app.MainWindow()
+        try:
+            panel = window.central_panel
+            panel.load_video(path)
+            panel.tracking_overlay.points = [tuple(map(float, p)) for p in truth[0]]
+            panel.magnifier.user_resized = True
+            panel.magnifier.resize(210, 210)
+            panel.tracking_overlay.curved_enabled = True
+            panel.update_magnifier(force=True)
+            assert panel.magnifier.size().width() == 210
+        finally:
+            window.dirty = False
+            window.close()
