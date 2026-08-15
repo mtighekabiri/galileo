@@ -51,7 +51,8 @@ analysis = Analysis(
     # broken executable. galileo_blend and galileo_morph arrived after the
     # list was written and were never added to it.
     datas=DATAS,
-    hiddenimports=["galileo_core", "galileo_blend", "galileo_morph"],
+    hiddenimports=["galileo_core", "galileo_blend", "galileo_morph",
+                   "galileo_deflicker"],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

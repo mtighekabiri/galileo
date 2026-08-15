@@ -72,6 +72,7 @@ macOS, `~/.local/share/Galileo` on Linux).
 | Double-click the magnifier | Fill the video stage with it, or put it back |
 | Scroll on the magnifier | Set its magnification by hand |
 | Panes button on the magnifier | One view of the whole area, or a tile per handle |
+| Options → Steady the lighting | Even out pulsing from flickering fittings |
 
 Brightness, contrast and colourise adjustments for the inserted creative are
 available from the left toolbar, and all three apply to the render as well as
@@ -232,6 +233,76 @@ onto it, the area stays within **1.7px** throughout and is back on the panel to
 `TrackResult.following_camera` says when a step came from the camera rather
 than from the surface, and these steps count as measurements rather than
 failures, so the smoothing takes them instead of falling back on prediction.
+
+## Footage shot under flickering lighting
+
+*Options → Steady the lighting.*
+
+An office lit by fluorescent or cheap LED fittings is lit by something that
+brightens and dims a hundred or a hundred and twenty times a second. A camera
+sampling that at 25 or 30fps beats against it, and the footage comes back
+pulsing. That matters here beyond looking bad: flicker is one of the strongest
+bottom-up attention cues there is, so a flickering fitting pulls fixations
+whatever the advert is doing, and it contaminates the AOI data.
+
+Two things can happen, and **the wrong correction does nothing at all**, so
+Galileo works out which is present rather than offering one knob:
+
+| | what it is | correction |
+|---|---|---|
+| **Whole-frame** | mains lighting beating against the frame rate; every pixel brightens and dims together | one gain per frame |
+| **Banding** | a rolling shutter reads rows at different moments within one mains cycle, so bands crawl up the picture | one gain per row |
+
+Applying the whole-frame correction to banding measured **11.61% before and
+11.62% after** — that is the reason the kind is decided rather than asked. The
+same holds for ffmpeg's `deflicker` filter, which is whole-frame only.
+
+Both corrections work the same way: compare each frame, or each row of it,
+against a smoothed version of its own history and scale to match. The
+measurement is a median rather than a mean for the reason `level_gray` uses
+one — somebody walking through the shot must not be mistaken for the lights
+changing. Measured on matched clips: whole-frame flicker **20.6% → 0.9%**, and
+banding **11.8% → 2.2%** against a floor of 2.3% that is the scene's own
+row-to-row variation.
+
+> The per-row correction subsumes the whole-frame one. A row's own level
+> carries the global flicker as well as the band, so dividing by a smoothed
+> version of it removes both — 20.6% flicker with no banding at all still came
+> down to 0.9% under the per-row correction. The cheaper one exists because it
+> is cheaper, not because it catches anything the other misses.
+
+**Telling banding from ordinary motion** is the part that needs care. Every
+clip's rows vary a little as things move through it, so size alone would
+either miss real banding or call a busy scene banded. What separates them is
+structure: banding is one crawling sinusoid, so in a spectrum over (time ×
+row) its energy piles into a single peak, while motion is broadband and
+scatters. Measured on matched clips: **13%** of the energy in one peak for
+footage whose only row variation was a walking figure — and the same 13% for
+whole-frame flicker, which is not banding either — against **94%** for real
+banding.
+
+**How it runs.** Opening a video takes a short look at ninety consecutive
+frames from the middle and puts what it found in the menu item's tooltip
+(*"Flicker found: 18.4% frame to frame at about 7Hz"*), which costs about
+0.7s on a 1080p clip. Ticking the option measures the whole clip properly,
+with a progress bar — around 5s for 900 frames of 1080p. The statistics are
+taken from a shrunken copy of each frame, which is not a marginal
+optimisation: at full size the medians cost four times what decoding does, and
+the row gains stretch back to full height with no measurable loss.
+
+The gains are then applied **as each frame is decoded**, not by writing a
+corrected copy of the footage. Nothing is re-encoded, so there is no
+generation loss and no second file the size of the original, and unticking the
+option is free. It is applied before anything else sees the frame — so
+tracking, the blend tool's measurements and the preview all work from the same
+corrected plate the render will, rather than the advert being matched to
+lighting that never reaches the file. Only the setting goes into the project
+file; the gains are measured again on load, because per-row gains for a long
+clip run to millions of numbers.
+
+Tracking does not need this. The illumination levelling described above
+already handles flicker: worst corner error was **1.94px on clean footage and
+1.99px with 20% flicker**. This is for the stimulus, not the tracking.
 
 ## Finding a target from an image
 
@@ -556,6 +627,11 @@ drives the actual Qt widgets through loading, tracking and a full render, and
 its fix. `tests/test_offscreen.py` slides a window over a wide scene so the
 camera's motion and the surface's position are both known exactly, and asserts
 the area neither stalls at the edge of frame nor runs away while out of it.
+`tests/test_deflicker.py` builds both kinds of flicker over the same footage
+and asserts the right correction is chosen for each — including that the
+whole-frame one demonstrably does *not* fix banding, which is why the choice
+is made rather than offered — and that a preview that has been steadied is
+rendered to a file that is steady too.
 
 Occlusion tests that need the model file skip cleanly when it has not been
 fetched; the compositing side is tested with hand-made masks either way.

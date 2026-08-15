@@ -9,6 +9,7 @@ import json
 import galileo_core as core
 import galileo_blend as blend
 import galileo_morph as morphlib
+import galileo_deflicker as deflicker
 
 from PyQt5.QtCore import (
     QObject, QThread, pyqtSignal, Qt, QSize, QUrl, QEvent, QTimer, QPoint, QRect,
@@ -2408,6 +2409,13 @@ class TitleBar(QWidget):
         self.occlusion_action.toggled.connect(self.parent.toggle_occlusion)
         options_menu.addAction(self.occlusion_action)
 
+        self.deflicker_action = QAction(
+            "Steady the lighting", self, checkable=True)
+        self.deflicker_action.setToolTip(
+            "Even out pulsing from fluorescent or LED lighting")
+        self.deflicker_action.toggled.connect(self.parent.toggle_deflicker)
+        options_menu.addAction(self.deflicker_action)
+
         self.menu.addMenu(load_menu)
         self.menu.addMenu(save_menu)
         self.menu.addMenu(options_menu)
@@ -2660,6 +2668,14 @@ class CentralPanel(QWidget):
         # whole-area view can show the insert without compositing a second
         # time on every mouse move of a drag.
         self.display_frame = None
+        # Lighting correction for footage shot under a flickering fitting.
+        # Applied as each frame is decoded, before anything else sees it, so
+        # the tracker, the blend measurements and the render all work from a
+        # plate whose lighting holds still.
+        self.deflicker = None
+        #: What a quick look at the clip found when it was opened, so the
+        #: option can say what it would be correcting.
+        self.flicker_report = None
         self.fps = 30
 
         # The single source of truth for "which frame is on screen". Deriving
@@ -3186,6 +3202,13 @@ class CentralPanel(QWidget):
 
         current_frame_index = int(self.cap.get(cv2.CAP_PROP_POS_FRAMES)) - 1
         self.current_frame_index = current_frame_index
+
+        # Before anything else looks at it. Tracking, the blend's measurements
+        # of the surrounding footage and the preview all have to see the same
+        # corrected plate the render will, or the advert would be matched to
+        # lighting that is not what ends up in the file.
+        if self.deflicker is not None:
+            frame = self.deflicker.apply(frame, current_frame_index)
         if not self.slider.isSliderDown():
             # Moving the slider to follow playback must not be mistaken for the
             # user scrubbing. Without this, setValue fired valueChanged, which
@@ -3766,9 +3789,12 @@ class CentralPanel(QWidget):
 
         self.tracking_overlay.reset()
         self.update_tracking_availability()
+        self.scan_for_flicker()
         mw = self.window()
         if isinstance(mw, QMainWindow) and hasattr(mw, "refresh_title"):
             mw.refresh_title()
+        if isinstance(mw, QMainWindow) and hasattr(mw, "refresh_deflicker_action"):
+            mw.refresh_deflicker_action()
 
     def enable_tracking_mode(self):
         """
@@ -3841,6 +3867,59 @@ class CentralPanel(QWidget):
         if self.cap and self.cap.isOpened():
             self.cap.set(cv2.CAP_PROP_POS_FRAMES, value)
             self.read_frame()
+
+    # -- flickering lighting ------------------------------------------------
+
+    def scan_for_flicker(self):
+        """Take a quick look at the clip for pulsing lighting.
+
+        A window from the middle rather than the whole clip: this runs on every
+        video that is opened, and a full pass over a long one would be a stall
+        on each load for footage that usually turns out to be fine. The full
+        measurement only happens if the correction is actually switched on.
+        """
+        self.deflicker = None
+        self.flicker_report = None
+        path = getattr(self, "current_video_path", None)
+        if not path:
+            return None
+        try:
+            self.flicker_report = deflicker.scan(path)
+        except cv2.error as exc:
+            logging.warning("Could not scan %s for flicker: %s", path, exc)
+        return self.flicker_report
+
+    def set_deflicker(self, on: bool, progress=None):
+        """Switch the lighting correction on or off.
+
+        Measured over the whole clip and then applied to each frame as it is
+        decoded, rather than by writing a corrected copy of the footage:
+        nothing is re-encoded, so there is no generation loss and no second
+        file the size of the original, and switching it off again is free.
+
+        Returns the corrector, or None if there was nothing to correct or the
+        measurement was cancelled.
+        """
+        if not on:
+            self.deflicker = None
+            self.refresh_display()
+            return None
+
+        path = getattr(self, "current_video_path", None)
+        if not path:
+            return None
+        mode = "auto"
+        if self.flicker_report is not None and self.flicker_report.kind != "steady":
+            mode = self.flicker_report.kind
+        self.deflicker = deflicker.Deflicker.measure(path, mode=mode,
+                                                     progress=progress)
+        # The frame on screen was decoded before this existed, so re-read it
+        # rather than leave the preview a frame behind the setting.
+        if self.cap and self.cap.isOpened():
+            self.cap.set(cv2.CAP_PROP_POS_FRAMES, self.current_frame_index)
+            self.read_frame()
+        return self.deflicker
+
 
 class RenderDialog(QDialog):
     """One dialog for the whole render, showing what is actually tracked.
@@ -4089,7 +4168,8 @@ class RenderSettings:
                  overlay_bgra=None, overlay_video_path=None,
                  overlay_start_frame=0, brightness=0, contrast=1.0,
                  colourise=False, include_audio=True, occlusion=False,
-                 blend_settings=None, placements=None, morph=None):
+                 blend_settings=None, placements=None, morph=None,
+                 deflicker_gains=None):
         self.base_video_path = base_video_path
         self.out_path = out_path
         self.start_frame = int(start_frame)
@@ -4114,6 +4194,11 @@ class RenderSettings:
         # Every insertion to draw. The single-placement fields above are kept
         # so existing callers and tests go on working.
         self.placements = placements or []
+        # The lighting correction the preview was working from. It has to
+        # reach the file too, or what was tracked and blended against a steady
+        # plate would be rendered onto a flickering one. Plain arrays, so it
+        # crosses to the worker thread like everything else here.
+        self.deflicker = deflicker_gains
 
 
 class RenderWorker(QObject):
@@ -4287,6 +4372,11 @@ class RenderWorker(QObject):
                 ok, base_frame = base_cap.read()
                 if not ok:
                     break
+                # Before the resize: the per-row gains are one per row of the
+                # source, so scaling first would leave them describing rows
+                # that no longer exist.
+                if settings.deflicker is not None:
+                    base_frame = settings.deflicker.apply(base_frame, frame_idx)
                 if scale != 1.0:
                     base_frame = cv2.resize(base_frame, (width, height),
                                             interpolation=cv2.INTER_AREA)
@@ -4804,6 +4894,7 @@ class MainWindow(QMainWindow):
             placements=[PlacementSnapshot(p, scale_factor)
                         for p in overlay.placements
                         if p.is_ready()],
+            deflicker_gains=panel.deflicker,
         )
 
     def on_render_finished(self, status):
@@ -4867,6 +4958,11 @@ class MainWindow(QMainWindow):
             "overlay_path": overlay.overlay_source_path,
             "overlay_is_video": overlay.inserted_overlay_is_video,
             "overlay_start_frame": overlay.inserted_overlay_start_frame,
+            # The setting, not the gains. Per-row gains for a long clip run to
+            # millions of numbers, which would dwarf the rest of the file; they
+            # are cheap enough to measure again from the footage on load.
+            "deflicker": (self.central_panel.deflicker.mode
+                          if self.central_panel.deflicker is not None else None),
         }
         with open(path, "w") as f:
             json.dump(data, f, indent=2)
@@ -4929,6 +5025,14 @@ class MainWindow(QMainWindow):
         elif overlay_path:
             QMessageBox.warning(self, "Missing Creative",
                                 f"Could not find the creative at:\n{overlay_path}")
+
+        # Only the setting was saved, so the gains are measured again from the
+        # footage. Done through the same handler the menu uses, which is what
+        # puts a progress dialog on the pass rather than an unexplained pause.
+        mode = data.get("deflicker")
+        action = getattr(self.title_bar, "deflicker_action", None)
+        if mode and base_video and action is not None:
+            action.setChecked(True)      # fires toggle_deflicker
 
         current = self.central_panel.get_current_frame_index()
         points = overlay.tracking_history.get(current) or data.get("tracking_points", [])
@@ -5191,6 +5295,89 @@ class MainWindow(QMainWindow):
         if not enabled:
             panel.segmenter = None
         panel.refresh_display()
+
+    # -- flickering lighting ------------------------------------------------
+
+    def refresh_deflicker_action(self):
+        """Say in the menu what the clip's lighting is actually doing.
+
+        The option is worth nothing if you have to guess whether you need it:
+        an office fitting pulsing at a rate the frame rate half-hides is
+        exactly the sort of thing that is easier to measure than to see.
+        """
+        action = getattr(self.title_bar, "deflicker_action", None)
+        if action is None:
+            return
+        report = self.central_panel.flicker_report
+        loaded = bool(getattr(self.central_panel, "current_video_path", ""))
+        action.setEnabled(loaded)
+        if report is None:
+            action.setToolTip("Even out pulsing from fluorescent or LED lighting"
+                              if loaded else "Open a video first")
+        elif report.kind == "steady":
+            action.setToolTip("This clip's lighting is already steady "
+                              f"({report.whole:.1f}% frame to frame)")
+        elif report.kind == "rows":
+            action.setToolTip(
+                f"Banding found: {report.band_size:.1f}% across the rows, "
+                "crawling up the picture. Correcting it works row by row.")
+        else:
+            beat = f" at about {report.hz:.0f}Hz" if report.hz else ""
+            action.setToolTip(
+                f"Flicker found: {report.whole:.1f}% frame to frame{beat}.")
+
+    def toggle_deflicker(self, enabled: bool):
+        """Even out lighting that pulses, before anything else sees the frame."""
+        panel = self.central_panel
+        if not enabled:
+            panel.set_deflicker(False)
+            return
+
+        if not getattr(panel, "current_video_path", ""):
+            self.title_bar.deflicker_action.setChecked(False)
+            return
+
+        total = panel.total_frames or 0
+        dialog = QProgressDialog("Measuring the lighting…", "Cancel", 0,
+                                 max(total, 1), self)
+        dialog.setWindowTitle("Steady the lighting")
+        dialog.setWindowModality(Qt.WindowModal)
+        dialog.setMinimumDuration(400)
+
+        def progress(done, count):
+            dialog.setMaximum(max(count, done, 1))
+            dialog.setValue(done)
+            QApplication.processEvents()
+            return not dialog.wasCanceled()
+
+        try:
+            fixer = panel.set_deflicker(True, progress=progress)
+        finally:
+            # Read this before closing: closing a QProgressDialog rejects it,
+            # which sets wasCanceled, so asking afterwards always says the
+            # user cancelled and the "nothing to correct" notice never showed.
+            cancelled = dialog.wasCanceled()
+            dialog.close()
+
+        if fixer is None:
+            # Either nothing to correct or the user cancelled; either way the
+            # tick has to come back off rather than claim work that is not
+            # being done.
+            self.title_bar.deflicker_action.setChecked(False)
+            if not cancelled:
+                QMessageBox.information(
+                    self, "Steady the lighting",
+                    "This clip's lighting is already steady, so there is "
+                    "nothing to even out.")
+            return
+
+        self.mark_dirty()
+        kind = ("banding, row by row" if fixer.mode == "rows"
+                else "whole-frame flicker")
+        logging.info("Lighting steadied (%s) over %d frames.", kind, len(fixer))
+        self.title_bar.deflicker_action.setToolTip(
+            f"Steadying {kind} across {len(fixer)} frames. "
+            "Untick to see the footage as shot.")
 
     def open_blend_dialog(self):
         """Tune how the creative is matched to the shot, with a live preview."""
