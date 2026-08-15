@@ -66,7 +66,7 @@ macOS, `~/.local/share/Galileo` on Linux).
 | `5` | Select the whole shape |
 | `T` / `R` / `B` / `L` | Select that edge's bend handles; press again for the second |
 | Arrow keys | Nudge the selection by 1 px |
-| `D` / `C` | Delete this frame's shape / copy it from the previous frame |
+| `D` / `C` | Delete this frame's shape / copy it from the previous frame (also the *Delete* and *Copy* buttons) |
 | Tracking switch | Enable/disable tracking during playback |
 | Magnifier switch | Show/hide the magnifier (it also appears while dragging) |
 | Double-click the magnifier | Fill the video stage with it, or put it back |

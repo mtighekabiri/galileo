@@ -650,10 +650,11 @@ class IconWidget(QFrame):
         self.base_color = self.default_base_color
         self.hover_color = self.default_hover_color
 
-        # 80x100 for eight tools needed 945px of column; a 1366x768 laptop has
-        # about 660, so the labels were clipped away and the toolbar became
-        # eight bare glyphs with no tooltips.
-        self.setFixedSize(78, 62)
+        # Nine tools have to fit the shortest window the app allows. At 62
+        # high they needed 558px of column against the 480 a 1024x640 window
+        # leaves, so Curve and Clear sat below the fold behind a scrollbar
+        # barely a pixel wide -- present, but not findable.
+        self.setFixedSize(78, 52)
         self.set_normal_style()
 
         self.layout = QVBoxLayout()
@@ -2369,16 +2370,24 @@ class LeftColumn(QWidget):
         self.setStyleSheet("background-color: #1A1A1A;")
 
         layout = QVBoxLayout()
-        layout.setContentsMargins(0, 20, 0, 20)
-        layout.setSpacing(15)
+        # Nine tools at 52 high with 15 between them wanted 588px of column,
+        # against the 580 a 1024x640 window leaves -- so Render still fell off
+        # the bottom. Tighter margins and spacing give the whole set room with
+        # a little to spare.
+        layout.setContentsMargins(0, 8, 0, 8)
+        layout.setSpacing(6)
 
         # Emoji render inconsistently across Windows builds and several of
         # these are hard to tell apart at 20px, so every tool carries a tooltip
         # saying what it does. There were none anywhere on this toolbar.
+        # Ordered as the job is done: mark the area, then settle how the
+        # creative looks on it, then finish. Render sat second, between two
+        # marking tools, though it is the last thing anyone does.
         items = [
             ("🖱", "Draw", "Click four corners to mark the area to fill.\n"
                            "Drag a corner to adjust it."),
-            ("📼", "Render", "Export the video with the creative composited in."),
+            ("〰", "Curve", "Bend the edges of the area around a curved\n"
+                            "screen or pillar."),
             ("👀", "Frame", "Jump to a specific frame number."),
             ("🌞", "Brightness", "Brighten or darken the inserted creative."),
             ("⛅", "Contrast", "Raise or lower the creative's contrast."),
@@ -2387,9 +2396,8 @@ class LeftColumn(QWidget):
             ("🌫", "Blend", "Match the creative's lighting, softness, grain and\n"
                             "motion blur to the footage, so it does not look\n"
                             "pasted on."),
-            ("〰", "Curve", "Bend the edges of the area around a curved\n"
-                            "screen or pillar."),
             ("❌", "Clear", "Remove the tracking from every frame."),
+            ("📼", "Render", "Export the video with the creative composited in."),
         ]
 
         self.icons = []
@@ -2627,16 +2635,18 @@ class CentralPanel(QWidget):
         self.forward_btn.setStyleSheet(self.button_style())
         self.forward_btn.clicked.connect(self.on_forward)
 
-        self.del_btn = HoverButton("D")
-        self.del_btn.setStyleSheet(self.button_style())
-        self.del_btn.setToolTip("Delete shape (D key)")
-        self.del_btn.setFixedSize(40, 40)
+        # Labelled, not lettered. "C" and "D" in circles were only legible to
+        # someone who already knew, which is nobody on their first clip.
+        self.del_btn = HoverButton("Delete")
+        self.del_btn.setStyleSheet(self.button_style(radius=8))
+        self.del_btn.setToolTip("Remove this frame's shape  (D)")
+        self.del_btn.setFixedSize(72, 34)
         self.del_btn.clicked.connect(self.on_delete_shape)
 
-        self.copy_btn = HoverButton("C")
-        self.copy_btn.setStyleSheet(self.button_style())
-        self.copy_btn.setToolTip("Copy shape from previous frame (C key)")
-        self.copy_btn.setFixedSize(40, 40)
+        self.copy_btn = HoverButton("Copy")
+        self.copy_btn.setStyleSheet(self.button_style(radius=8))
+        self.copy_btn.setToolTip("Copy the shape from the previous frame  (C)")
+        self.copy_btn.setFixedSize(72, 34)
         self.copy_btn.clicked.connect(self.on_copy_shape)
 
         self.slider = QSlider(Qt.Horizontal)
@@ -2731,16 +2741,21 @@ class CentralPanel(QWidget):
 
         logging.debug("CentralPanel initialized.")
 
-    def button_style(self):
+    def button_style(self, radius: int = 20):
+        """Shared look for the transport row.
+
+        The radius is a parameter because the same style dressed both the round
+        transport buttons and the two beside them; fixed at 20 it made a 72x34
+        button look like a squashed circle. The fixed width and height went the
+        same way -- they overrode whatever size the button had been given.
+        """
         return """
             QPushButton {
                 background: #3C3C3C;
                 border: none;
-                border-radius: 20px;
-                width: 40px;
-                height: 40px;
+                border-radius: %dpx;
                 color: white;
-            }
+            }""" % radius + """
             QPushButton:hover {
                 background-color: #505050;
             }
@@ -3101,7 +3116,7 @@ class CentralPanel(QWidget):
         if self.magnifier.expanded:
             self.magnifier.setGeometry(x, y, max(1, width), max(1, height))
         else:
-            self.magnifier.move(x + 10, y + 10)
+            self.magnifier.move(*self.magnifier_corner(x, y, width, height))
         self.magnifier.raise_()
         self.tracking_overlay.raise_()
 
@@ -3285,6 +3300,45 @@ class CentralPanel(QWidget):
 
     #: Smallest a single magnified view may be before it stops being one.
     MAGNIFIER_TILE = 96
+
+    def magnifier_corner(self, x, y, width, height):
+        """Which corner of the picture the magnifier should sit in.
+
+        It used to sit in the top left whatever was underneath. Now that it is
+        sized to hold twelve views it is large enough to cover the very area
+        being worked on, which is the one thing it must not hide -- so it takes
+        whichever corner the marked area reaches into least.
+        """
+        margin = 10
+        box_w, box_h = self.magnifier.width(), self.magnifier.height()
+        corners = {
+            "top left": (x + margin, y + margin),
+            "top right": (x + width - box_w - margin, y + margin),
+            "bottom left": (x + margin, y + height - box_h - margin),
+            "bottom right": (x + width - box_w - margin,
+                             y + height - box_h - margin),
+        }
+
+        points = self.tracking_overlay.points
+        if len(points) < 2:
+            return corners["top left"]
+
+        shape = [self.tracking_overlay.raw_to_display(px, py) for px, py in points]
+        shape_box = (min(p[0] for p in shape) + x, min(p[1] for p in shape) + y,
+                     max(p[0] for p in shape) + x, max(p[1] for p in shape) + y)
+
+        def covered(position):
+            left, top = position
+            return self._overlap((left, top, left + box_w, top + box_h), shape_box)
+
+        return min(corners.values(), key=covered)
+
+    @staticmethod
+    def _overlap(a, b) -> float:
+        """Area shared by two boxes given as (left, top, right, bottom)."""
+        wide = max(0.0, min(a[2], b[2]) - max(a[0], b[0]))
+        tall = max(0.0, min(a[3], b[3]) - max(a[1], b[1]))
+        return wide * tall
 
     def update_magnifier_dimensions(self):
         shape_pts = self.tracking_overlay.points
@@ -4112,12 +4166,20 @@ class MainWindow(QMainWindow):
 
         self.placement_list = QListWidget()
         self.placement_list.setFixedHeight(110)
+        # Elide a long name rather than growing a scrollbar under a list four
+        # rows tall; the tooltip carries the whole thing either way.
+        self.placement_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.placement_list.setTextElideMode(Qt.ElideRight)
         self.placement_list.setStyleSheet("""
             QListWidget { background-color: #222; color: #E8E8E8;
                           border: 1px solid #3A3A3A; border-radius: 6px;
                           font-size: 12px; }
             QListWidget::item { padding: 4px; }
-            QListWidget::item:selected { background-color: #00A000; color: white; }
+            /* An accent rather than a flood. Pure green across the whole row
+               shouted louder than anything else in a deliberately quiet
+               window, and it is only saying which row is selected. */
+            QListWidget::item:selected { background-color: #2E4A6B; color: white;
+                                         border-left: 3px solid #6A9FD8; }
         """)
         self.placement_list.currentRowChanged.connect(self.on_placement_selected)
         self.placement_list.itemChanged.connect(self.on_placement_item_changed)
@@ -4142,8 +4204,10 @@ class MainWindow(QMainWindow):
         self.overlay_layout.addLayout(placement_buttons)
 
         library_title = QLabel("Library")
-        library_title.setStyleSheet("color: white; font-size: 16px; font-weight: bold;")
-        library_title.setAlignment(Qt.AlignCenter)
+        # Matching Placements above it: two headings in the same column, one
+        # centred and one not, reads as a mistake.
+        library_title.setStyleSheet(
+            "color: white; font-size: 15px; font-weight: bold;")
         self.overlay_layout.addWidget(library_title)
 
         library_spacer = QSpacerItem(20, 10, QSizePolicy.Minimum, QSizePolicy.Fixed)
@@ -4190,7 +4254,11 @@ class MainWindow(QMainWindow):
         for placement in overlay.placements:
             tracked = len(placement.tracking_history)
             mark = "\u25cf" if placement.has_overlay() else "\u25cb"
-            item = QListWidgetItem(f"{mark}  {placement.name}   {tracked}f")
+            # "0f" meant nothing to anyone who had not written it. Kept short
+            # all the same: the panel is narrow, and a longer word only got
+            # elided away again.
+            count = "1 frame" if tracked == 1 else f"{tracked} frames"
+            item = QListWidgetItem(f"{mark}  {placement.name}  \u00b7  {count}")
             item.setToolTip(
                 f"{placement.name}\n"
                 f"{tracked} tracked frames\n"

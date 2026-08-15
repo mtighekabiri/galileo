@@ -252,3 +252,101 @@ class TestTheLibraryCardReads:
         finally:
             window.dirty = False
             window.close()
+
+
+class TestTheWindowWorksAtItsSmallest:
+    """1024x640 is the smallest the app allows, so everything has to fit
+    there -- not only on the machine it was written on."""
+
+    def test_every_tool_is_reachable(self, qapp, clip_video):
+        path, truth = clip_video
+        window = galileo_app.MainWindow()
+        try:
+            window.show()
+            window.setGeometry(0, 0, window.minimumWidth(),
+                               window.minimumHeight())
+            window.central_panel.load_video(path)
+            for _ in range(4):
+                QApplication.processEvents()
+            hidden = [icon.meaning_label.text() for icon in window.left_col.icons
+                      if icon.visibleRegion().boundingRect().height() < icon.height()]
+            assert not hidden, f"{hidden} fall off the bottom of the toolbar"
+        finally:
+            window.dirty = False
+            window.close()
+
+    def test_the_last_tool_is_the_one_that_ends_the_job(self, qapp):
+        window = galileo_app.MainWindow()
+        try:
+            order = [icon.meaning_label.text() for icon in window.left_col.icons]
+            assert order[-1] == "Render", order
+            assert order.index("Draw") < order.index("Curve") < order.index("Render")
+        finally:
+            window.dirty = False
+            window.close()
+
+
+class TestTheMagnifierKeepsOutOfTheWay:
+    def test_it_takes_whichever_corner_the_area_reaches_into_least(self, qapp,
+                                                                   clip_video):
+        """Sized to hold twelve views it is large enough to cover the very
+        area being worked on, which is the one thing it must not hide. A big
+        area on a small stage cannot always be missed entirely, so what is
+        promised is the least bad corner -- and that is what is checked."""
+        path, truth = clip_video
+        window = galileo_app.MainWindow()
+        try:
+            window.show()
+            window.setGeometry(0, 0, 1400, 880)
+            panel = window.central_panel
+            panel.load_video(path)
+            overlay = panel.tracking_overlay
+            panel.magnifier.show()
+
+            for marked in ([(60., 50.), (360., 50.), (360., 260.), (60., 260.)],
+                           [(600., 50.), (900., 50.), (900., 260.), (600., 260.)],
+                           [(60., 300.), (360., 300.), (360., 500.), (60., 500.)]):
+                overlay.points = marked
+                panel.update_magnifier(force=True)
+                panel.layout_video_stage()
+                QApplication.processEvents()
+
+                stage = overlay.geometry()
+                shown = [overlay.raw_to_display(x, y) for x, y in marked]
+                area = (min(p[0] for p in shown) + stage.x(),
+                        min(p[1] for p in shown) + stage.y(),
+                        max(p[0] for p in shown) + stage.x(),
+                        max(p[1] for p in shown) + stage.y())
+
+                box = panel.magnifier
+                chosen = panel._overlap(
+                    (box.x(), box.y(), box.x() + box.width(),
+                     box.y() + box.height()), area)
+
+                margin = 10
+                every = []
+                for left in (stage.x() + margin,
+                             stage.x() + stage.width() - box.width() - margin):
+                    for top in (stage.y() + margin,
+                                stage.y() + stage.height() - box.height() - margin):
+                        every.append(panel._overlap(
+                            (left, top, left + box.width(), top + box.height()),
+                            area))
+                assert chosen <= min(every) + 1, (
+                    f"it covers {chosen:.0f}px where {min(every):.0f} was available")
+                assert chosen < 0.25 * ((area[2] - area[0]) * (area[3] - area[1]))
+        finally:
+            window.dirty = False
+            window.close()
+
+    def test_it_still_has_somewhere_to_go_with_no_area_marked(self, qapp,
+                                                              clip_video):
+        path, truth = clip_video
+        window = galileo_app.MainWindow()
+        try:
+            window.central_panel.load_video(path)
+            window.central_panel.layout_video_stage()
+            assert window.central_panel.magnifier.x() >= 0
+        finally:
+            window.dirty = False
+            window.close()
