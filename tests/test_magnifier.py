@@ -794,3 +794,124 @@ class TestItIsBigEnoughToBeUseful:
         finally:
             window.dirty = False
             window.close()
+
+
+class TestOneViewOfTheWholeArea:
+    """A grid shows each handle closely but never shows the shape they make.
+    This shows the shape, which is what tells you whether the outline is
+    following the screen."""
+
+    def whole(self, magnifier, region=None):
+        region = region if region is not None else curved_region()
+        magnifier.setData(screen_frame(), handle_points(region), region=region,
+                          selected_index=4, focus_index=None)
+        magnifier.set_whole_area(True)
+        return region
+
+    def test_it_shows_a_single_view(self, magnifier):
+        region = curved_region()
+        magnifier.setData(screen_frame(), handle_points(region), region=region,
+                          focus_index=None)
+        assert len(magnifier.tiles()) == 12
+        magnifier.set_whole_area(True)
+        assert len(magnifier.tiles()) == 1
+
+    def test_that_view_gets_the_whole_widget(self, magnifier):
+        self.whole(magnifier)
+        rect, _ = magnifier.tiles()[0]
+        assert rect.width() > magnifier.width() * 0.9
+
+    def test_every_handle_is_inside_it(self, magnifier):
+        """The point of the mode: all twelve at once, none cut off."""
+        region = self.whole(magnifier)
+        rect, index = magnifier.tiles()[0]
+        point = magnifier.point_at(index)
+        scale, offset_x, offset_y = magnifier.tile_mapping(rect, point)
+        for handle in magnifier.points:
+            x = handle.x * scale + offset_x
+            y = handle.y * scale + offset_y
+            assert rect.contains(int(x), int(y)), (
+                f"{handle.label} falls outside the view")
+
+    def test_it_frames_the_outline_not_just_the_corners(self, magnifier):
+        """A bend can swing wide of the corners; cutting it off would hide
+        the very thing being judged."""
+        magnifier.set_whole_area(True)
+        far = curved_region(90)
+        magnifier.setData(screen_frame(), handle_points(far), region=far,
+                          focus_index=None)
+        bounds = magnifier.area_bounds()
+        outline = core.region_boundary(far, samples=32)
+        assert bounds[1] <= float(np.min(outline[:, 1])) + 0.01
+
+    def test_it_fits_whatever_size_it_is_given(self, magnifier):
+        """An area larger than the widget cannot be both shown whole and
+        magnified, and showing it whole is the point."""
+        magnifier.resize(200, 200)
+        self.whole(magnifier)
+        small = magnifier.zoom_for(magnifier.tiles()[0][0])
+        magnifier.resize(900, 700)
+        big = magnifier.zoom_for(magnifier.tiles()[0][0])
+        assert big > small * 2, f"{small:.2f} then {big:.2f}"
+
+    def test_enlarging_it_buys_real_magnification(self, magnifier):
+        magnifier.resize(1100, 800)
+        self.whole(magnifier)
+        assert magnifier.zoom_for(magnifier.tiles()[0][0]) > 1.5
+
+    def test_no_crosshair_is_planted_in_the_middle(self, magnifier):
+        """Nothing is at the centre of this view, so marking it would point
+        at a handle that is not there."""
+        region = self.whole(magnifier)
+        shown = grab(magnifier)
+        middle = shown[magnifier.height() // 2 - 3:magnifier.height() // 2 + 3,
+                       magnifier.width() // 2 - 3:magnifier.width() // 2 + 3]
+        assert middle.std() < 60, "something is drawn dead centre"
+
+    def test_the_picked_handle_stands_out(self, magnifier):
+        region = curved_region()
+        magnifier.set_whole_area(True)
+        magnifier.setData(screen_frame(), handle_points(region), region=region,
+                          selected_index=0, focus_index=None)
+        first = grab(magnifier)
+        magnifier.setData(screen_frame(), handle_points(region), region=region,
+                          selected_index=3, focus_index=None)
+        assert not np.array_equal(first, grab(magnifier))
+
+    def test_the_button_toggles_it(self, magnifier):
+        magnifier.setData(screen_frame(), CORNERS, focus_index=None)
+        centre = magnifier.single_button_rect().center()
+        for expected in (True, False):
+            magnifier.mousePressEvent(QMouseEvent(
+                QEvent.MouseButtonPress, centre, magnifier.mapToGlobal(centre),
+                Qt.LeftButton, Qt.LeftButton, Qt.NoModifier))
+            assert magnifier.whole_area is expected
+
+    def test_it_does_not_ask_for_a_grid_worth_of_room(self, magnifier):
+        region = self.whole(magnifier)
+        assert magnifier.grid_shape() == (1, 1)
+
+    def test_its_button_does_not_sit_on_the_other_one(self, magnifier):
+        assert not magnifier.single_button_rect().intersects(
+            magnifier.expand_button_rect())
+
+    def test_double_clicking_a_button_does_not_also_expand(self, magnifier):
+        magnifier.setData(screen_frame(), CORNERS, focus_index=None)
+        centre = magnifier.single_button_rect().center()
+        magnifier.mouseDoubleClickEvent(QMouseEvent(
+            QEvent.MouseButtonDblClick, centre, magnifier.mapToGlobal(centre),
+            Qt.LeftButton, Qt.LeftButton, Qt.NoModifier))
+        assert magnifier.expanded is False
+
+    def test_dragging_still_overrides_it(self, magnifier):
+        """A drag wants the handle under the mouse as close as it can get."""
+        region = curved_region()
+        magnifier.set_whole_area(True)
+        magnifier.setData(screen_frame(), handle_points(region), region=region,
+                          selected_index=1, focus_index=5)
+        assert magnifier.tiles()[0][1] == 5
+
+    def test_it_copes_with_nothing_marked(self, magnifier):
+        magnifier.set_whole_area(True)
+        magnifier.setData(screen_frame(), [])
+        assert grab(magnifier).shape[:2] == (320, 320)

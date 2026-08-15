@@ -71,6 +71,7 @@ macOS, `~/.local/share/Galileo` on Linux).
 | Magnifier switch | Show/hide the magnifier (it also appears while dragging) |
 | Double-click the magnifier | Fill the video stage with it, or put it back |
 | Scroll on the magnifier | Set its magnification by hand |
+| Panes button on the magnifier | One view of the whole area, or a tile per handle |
 
 Brightness, contrast and colourise adjustments for the inserted creative are
 available from the left toolbar, and all three apply to the render as well as
@@ -299,6 +300,13 @@ its switch.
   corner and its two bend handles.
 * **Dragging one gives it the whole widget.** That is the moment precision is
   wanted, and four thumbnails serve it worse than one clear view.
+* **Press the panes button for one view of the whole area.** The grid shows
+  each handle closely but never shows the shape they make together, which is
+  what tells you whether the outline is following the screen. This frames the
+  whole marked area with every handle drawn on it — all twelve once curving is
+  on — and follows the outline rather than the corners, so a bend swinging wide
+  of them is still inside the view. It fits whatever size the magnifier is, so
+  enlarging it or filling the stage is what buys back the magnification.
 * **Double-click, or press the corner button, to fill the video stage.**
   Twelve handles in a floating box a couple of hundred pixels wide leaves each
   one smaller than the thumbnail it replaced; filling the stage is what makes
@@ -355,6 +363,34 @@ can hold a printed poster alongside a digital screen.
 Tick a placement to include it in the render; untick to leave it out without
 losing its tracking. Editing always applies to the selected one, drawn with
 solid handles; the rest stay visible as dashed outlines.
+
+**A tracking pass follows the selected placement only**, which is why the
+status reads *Tracking Left* rather than *Tracking on* once there is more than
+one. Track them one at a time: mark the first, play through, correct it where
+it slipped, then select the second and play through again. The second pass
+cannot touch the first placement's tracking — it is read on every frame, so
+that placement still moves with the footage on screen, and never written.
+
+> Following every placement on every frame sounds like it would save a pass,
+> and it did the opposite. The second play-through re-tracked the first
+> placement from wherever its corners happened to be sitting and wrote the
+> result over its history, discarding corrections made by hand — an 8px nudge
+> came back at 8.3px away from where it had been put, across two thirds of the
+> tracked frames. Nothing on screen said so, because the shape was redrawn
+> from the same guess that had just replaced it.
+
+The frame count beside each placement is how you see what a pass covered, so it
+is brought up to date when the pass ends — switching tracking off, pausing, or
+running off the end of the clip. Tracked frames also count as unsaved work now:
+a pass used to leave the project looking clean, so tracking a whole clip and
+closing the window lost it with no prompt, while nudging one corner by hand
+asked to save.
+
+**The library describes the selected placement.** Select a placement, press
+*Insert* on a creative, and that creative fills that placement — switch
+placement and the library redraws to describe the new one. The same creative
+can therefore fill as many placements as you like, which is what an A/B test
+against a control needs.
 
 The AOI export writes **one CSV per placement**, named after it, because an
 eye-tracking analysis has to tell the adverts apart.

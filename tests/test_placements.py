@@ -151,8 +151,12 @@ class TestDelegation:
         panel.tracking_mode = True
         panel.read_frame()
         assert first.tracker is not None
+        left_tracker = first.tracker
+
+        overlay.set_active(1)
+        panel.read_frame()
         assert second.tracker is not None
-        assert first.tracker is not second.tracker
+        assert second.tracker is not left_tracker
 
     def test_feature_source_is_per_placement(self, two, monkeypatch):
         """One shot can hold a printed poster and a digital screen."""
@@ -166,25 +170,186 @@ class TestDelegation:
 
 
 class TestTracking:
-    def test_all_placements_advance_together(self, two):
+    """A pass follows the placement being worked on, and only that one.
+
+    Two screens in a concourse shot get tracked one at a time: mark the first,
+    play through, correct it by hand where it slipped; then add the second and
+    play through again. When every placement was tracked on every frame, that
+    second pass re-tracked the first one as well and overwrote its history from
+    wherever its corners happened to sit -- discarding the hand corrections,
+    and looking right on screen because the shape had just been redrawn from
+    the same bad guess that replaced them.
+    """
+
+    def test_the_active_placement_is_tracked(self, two):
         window, panel, overlay, truth, first, second = two
-        for placement in (first, second):
-            placement.tracking_history = {0: placement.tracking_history[0]}
+        overlay.set_active(1)
+        second.tracking_history = {0: second.tracking_history[0]}
         panel.tracking_mode = True
         for _ in range(4):
             panel.read_frame()
-        assert len(first.tracking_history) >= 3
         assert len(second.tracking_history) >= 3
 
-    def test_one_failing_does_not_disturb_the_other(self, two):
-        """Independent trackers: a lost surface must not take the rest down."""
+    def test_a_pass_leaves_the_other_placements_history_alone(self, two):
         window, panel, overlay, truth, first, second = two
-        second.points = [(5.0, 5.0), (15.0, 5.0), (15.0, 15.0), (5.0, 15.0)]
+        overlay.set_active(1)
+        before = {index: shape[:] for index, shape in first.tracking_history.items()}
+        panel.tracking_mode = True
+        for _ in range(4):
+            panel.read_frame()
+        assert first.tracking_history == before
+
+    def test_hand_corrections_survive_a_pass_over_another_placement(self, two):
+        """The case that loses real work: corrected corners must stay put."""
+        window, panel, overlay, truth, first, second = two
+        corrected = [(x + 7.0, y - 5.0) for x, y in first.tracking_history[2]]
+        first.tracking_history[2] = corrected
+
+        overlay.set_active(1)
+        panel.tracking_mode = True
+        for _ in range(4):
+            panel.read_frame()
+        assert first.tracking_history[2] == corrected
+
+    def test_an_untracked_placement_still_follows_its_own_record(self, two):
+        """Not tracking it must not mean freezing it in the frame."""
+        window, panel, overlay, truth, first, second = two
+        overlay.set_active(1)
+        panel.tracking_mode = True
+        for _ in range(4):
+            panel.read_frame()
+        index = panel.get_current_frame_index()
+        assert first.points == first.tracking_history[index]
+
+    def test_a_placement_with_nothing_recorded_here_is_left_where_it_is(self, two):
+        window, panel, overlay, truth, first, second = two
+        first.tracking_history = {}
+        held = first.points[:]
+        overlay.set_active(1)
         panel.tracking_mode = True
         for _ in range(3):
             panel.read_frame()
-        index = panel.get_current_frame_index()
-        assert index in first.tracking_history
+        assert first.points == held
+        assert first.tracking_history == {}
+
+    def test_the_skipped_placement_drops_its_stale_tracker(self, two):
+        """Coming back to it must re-anchor, not resume from an old frame."""
+        window, panel, overlay, truth, first, second = two
+        panel.tracking_mode = True
+        panel.read_frame()
+        assert first.tracker is not None
+
+        overlay.set_active(1)
+        for _ in range(3):
+            panel.read_frame()
+        assert first.tracker is None
+        assert first.kalman_filters == []
+
+    def test_one_failing_does_not_disturb_the_other(self, two):
+        """A lost surface must not take the rest of the shot down with it."""
+        window, panel, overlay, truth, first, second = two
+        second.points = [(5.0, 5.0), (15.0, 5.0), (15.0, 15.0), (5.0, 15.0)]
+        overlay.set_active(1)
+        before = {index: shape[:] for index, shape in first.tracking_history.items()}
+        panel.tracking_mode = True
+        for _ in range(3):
+            panel.read_frame()
+        assert first.tracking_history == before
+
+    def test_with_tracking_off_every_placement_follows_its_record(self, two):
+        """Scrubbing used to move the active placement and freeze the rest."""
+        window, panel, overlay, truth, first, second = two
+        panel.tracking_mode = False
+        panel.jump_to_frame(5)
+        assert first.points == first.tracking_history[5]
+        assert second.points == second.tracking_history[5]
+
+    def test_the_label_names_the_placement_being_tracked(self, two):
+        window, panel, overlay, truth, first, second = two
+        overlay.set_active(1)
+        panel.on_tracking_toggled(True)
+        assert "Right" in panel.tracking_label.text()
+        overlay.set_active(0)
+        panel.update_tracking_availability()
+        assert "Left" in panel.tracking_label.text()
+
+    def test_the_label_stays_plain_with_a_single_placement(self, app):
+        window, panel, overlay, truth = app
+        overlay.points = [tuple(map(float, p)) for p in truth[0]]
+        panel.on_tracking_toggled(True)
+        assert panel.tracking_label.text() == "Tracking on"
+
+    def test_a_long_placement_name_is_shortened_not_cut_off(self, two):
+        """Real names are long: "Ryanair concourse portrait by gate 42"."""
+        window, panel, overlay, truth, first, second = two
+        second.name = "Ryanair concourse portrait screen by gate 42"
+        overlay.set_active(1)
+        panel.on_tracking_toggled(True)
+        panel.status_bar.layout().activate()
+
+        label = panel.tracking_label
+        assert label.width() >= label.sizeHint().width(), "text is being clipped"
+        assert "…" in label.text()
+        assert second.name in label.toolTip()
+
+
+class TestAccountingForAPass:
+    """A pass writes into the history; the rest of the app has to notice.
+
+    Nothing did. The placement list went on showing the count from before the
+    pass -- and with a pass now covering one placement, that list is the only
+    place you can see how far each has been followed. Worse, the unsaved-work
+    flag stayed clear, so tracking a whole clip and closing the window threw
+    the lot away with no prompt: a single corner nudged by hand marked the
+    project dirty, two hundred tracked frames did not.
+    """
+
+    def test_the_count_in_the_list_follows_a_pass(self, two):
+        window, panel, overlay, truth, first, second = two
+        first.tracking_history = {0: first.tracking_history[0]}
+        window.refresh_placement_list()
+        assert "1 frame" in window.placement_list.item(0).text()
+
+        panel.on_tracking_toggled(True)
+        for _ in range(5):
+            panel.read_frame()
+        panel.on_tracking_toggled(False)
+        assert f"{len(first.tracking_history)} frames" in \
+            window.placement_list.item(0).text()
+
+    def test_a_pass_counts_as_unsaved_work(self, two):
+        window, panel, overlay, truth, first, second = two
+        window.dirty = False
+        panel.on_tracking_toggled(True)
+        for _ in range(4):
+            panel.read_frame()
+        panel.on_tracking_toggled(False)
+        assert window.dirty is True
+
+    def test_running_off_the_end_of_the_clip_ends_the_pass(self, two):
+        window, panel, overlay, truth, first, second = two
+        window.dirty = False
+        panel.on_tracking_toggled(True)
+        for _ in range(len(truth) + 5):
+            panel.read_frame()
+        assert window.dirty is True
+
+    def test_pausing_ends_the_pass(self, two):
+        window, panel, overlay, truth, first, second = two
+        window.dirty = False
+        panel.on_tracking_toggled(True)
+        panel.playing = True
+        for _ in range(4):
+            panel.read_frame()
+        panel.toggle_play_pause()
+        assert window.dirty is True
+
+    def test_toggling_with_nothing_tracked_invents_no_unsaved_work(self, two):
+        window, panel, overlay, truth, first, second = two
+        window.dirty = False
+        panel.on_tracking_toggled(True)
+        panel.on_tracking_toggled(False)
+        assert window.dirty is False
 
 
 class TestRendering:
@@ -309,3 +474,114 @@ class TestAoiPerPlacement:
         with open(tmp_path / "aoi_Left.csv", newline="") as handle:
             left = list(csv.reader(handle))
         assert rows[2][-1] != left[2][-1]
+
+
+class TestOneCreativeInSeveralPlacements:
+    """The library describes one placement at a time -- the active one. It
+    used to describe whichever had been filled last, so a card could read
+    "Insert" over a creative that was in the video, and filling a second
+    placement from the same card took two clicks with a lie in between."""
+
+    def cards(self, window):
+        return list(window.library_cards())
+
+    def button(self, card):
+        from PyQt5.QtWidgets import QPushButton
+        return card.findChild(QPushButton, "selectBtn")
+
+    def sources(self, overlay):
+        return [p.overlay_source_path for p in overlay.placements]
+
+    def test_the_same_creative_can_fill_two_placements(self, two, tmp_path):
+        window, panel, overlay, truth, first, second = two
+        art = str(tmp_path / "one.png")
+        cv2.imwrite(art, np.full((80, 120, 3), 200, np.uint8))
+        window.add_overlay(art)
+        card = self.cards(window)[0]
+
+        overlay.set_active(0)
+        window.refresh_library_cards()
+        self.button(card).click()
+        assert overlay.placements[0].overlay_source_path == art
+
+        overlay.set_active(1)
+        window.refresh_library_cards()
+        assert self.button(card).text() == "Insert", (
+            "it should not claim to be in a placement it is not in")
+        self.button(card).click()
+        assert self.sources(overlay) == [art, art]
+
+    def test_the_labels_follow_the_active_placement(self, two, tmp_path):
+        window, panel, overlay, truth, first, second = two
+        red = str(tmp_path / "red.png")
+        blue = str(tmp_path / "blue.png")
+        cv2.imwrite(red, np.full((80, 120, 3), (30, 30, 220), np.uint8))
+        cv2.imwrite(blue, np.full((80, 120, 3), (220, 120, 30), np.uint8))
+        window.add_overlay(red)
+        window.add_overlay(blue)
+        first_card, second_card = self.cards(window)
+
+        overlay.set_active(0)
+        window.refresh_library_cards()
+        self.button(first_card).click()
+        overlay.set_active(1)
+        window.refresh_library_cards()
+        self.button(second_card).click()
+
+        overlay.set_active(0)
+        window.refresh_library_cards()
+        assert [self.button(c).text() for c in (first_card, second_card)] == \
+            ["Inserted", "Insert"]
+        overlay.set_active(1)
+        window.refresh_library_cards()
+        assert [self.button(c).text() for c in (first_card, second_card)] == \
+            ["Insert", "Inserted"]
+
+    def test_filling_one_placement_leaves_the_other_alone(self, two, tmp_path):
+        window, panel, overlay, truth, first, second = two
+        red = str(tmp_path / "red.png")
+        blue = str(tmp_path / "blue.png")
+        cv2.imwrite(red, np.full((80, 120, 3), (30, 30, 220), np.uint8))
+        cv2.imwrite(blue, np.full((80, 120, 3), (220, 120, 30), np.uint8))
+        window.add_overlay(red)
+        window.add_overlay(blue)
+        cards = self.cards(window)
+
+        overlay.set_active(0)
+        window.refresh_library_cards()
+        self.button(cards[0]).click()
+        overlay.set_active(1)
+        window.refresh_library_cards()
+        self.button(cards[1]).click()
+        assert self.sources(overlay) == [red, blue]
+
+    def test_taking_a_creative_out_clears_it_everywhere(self, two, tmp_path):
+        """Removing it from the library cannot leave a placement holding it."""
+        window, panel, overlay, truth, first, second = two
+        art = str(tmp_path / "one.png")
+        cv2.imwrite(art, np.full((80, 120, 3), 200, np.uint8))
+        window.add_overlay(art)
+        card = self.cards(window)[0]
+
+        for row in (0, 1):
+            overlay.set_active(row)
+            window.refresh_library_cards()
+            self.button(card).click()
+        assert self.sources(overlay) == [art, art]
+
+        overlay.set_active(0)
+        window.refresh_library_cards()
+        self.button(card).click()          # a click on "Inserted" removes it
+        assert overlay.placements[0].overlay_source_path is None
+
+    def test_both_are_rendered(self, two, tmp_path):
+        window, panel, overlay, truth, first, second = two
+        art = str(tmp_path / "one.png")
+        cv2.imwrite(art, np.full((80, 120, 3), 200, np.uint8))
+        window.add_overlay(art)
+        card = self.cards(window)[0]
+        for row in (0, 1):
+            overlay.set_active(row)
+            window.refresh_library_cards()
+            self.button(card).click()
+        assert len(overlay.ready_placements()) == 2
