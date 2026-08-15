@@ -915,3 +915,103 @@ class TestOneViewOfTheWholeArea:
         magnifier.set_whole_area(True)
         magnifier.setData(screen_frame(), [])
         assert grab(magnifier).shape[:2] == (320, 320)
+
+
+def filled_frame(colour=(200, 0, 200)):
+    """The same footage with a creative already covering the screen."""
+    frame = screen_frame()
+    cv2.rectangle(frame, (150, 110), (470, 300), colour, -1)
+    return frame
+
+
+class TestTheCreativeShowsInTheWholeAreaView:
+    """This view is about the insert as a whole -- whether the advert sits on
+    the screen and stays on it -- so it shows the creative in place. A tile is
+    the opposite: it exists to line one handle up against the real edge
+    underneath, which the creative covers, so tiles keep the untouched frame.
+    """
+
+    def setup_view(self, magnifier, whole=True, composited=None):
+        region = curved_region()
+        magnifier.setData(screen_frame(), handle_points(region), region=region,
+                          focus_index=None,
+                          composited=filled_frame() if composited is None
+                          else composited)
+        magnifier.set_whole_area(whole)
+        return region
+
+    def test_the_whole_area_view_magnifies_the_composited_frame(self, magnifier):
+        self.setup_view(magnifier)
+        assert magnifier.source_frame() is magnifier.composited
+
+    def test_the_creative_reaches_the_pixels_on_screen(self, magnifier):
+        """Not just the chosen source: the magenta has to be visible."""
+        self.setup_view(magnifier, whole=False)
+        without = grab(magnifier)
+        magnifier.set_whole_area(True)
+        with_creative = grab(magnifier)
+
+        def magenta(image):
+            b, g, r = image[..., 0], image[..., 1], image[..., 2]
+            return int(np.count_nonzero((b > 120) & (g < 90) & (r > 120)))
+
+        assert magenta(with_creative) > 5000
+        assert magenta(without) == 0
+
+    def test_a_tile_still_shows_the_edge_the_handle_lines_up_with(self, magnifier):
+        self.setup_view(magnifier, whole=False)
+        assert magnifier.source_frame() is magnifier.base_frame
+
+    def test_with_no_creative_it_falls_back_to_the_footage(self, magnifier):
+        self.setup_view(magnifier, composited=False)
+        magnifier.setData(screen_frame(), handle_points(curved_region()),
+                          focus_index=None, composited=None)
+        assert magnifier.source_frame() is magnifier.base_frame
+
+    def test_older_callers_that_pass_no_creative_still_work(self, magnifier):
+        magnifier.set_whole_area(True)
+        magnifier.setData(screen_frame(), CORNERS)
+        assert magnifier.composited is None
+        assert grab(magnifier).shape[:2] == (320, 320)
+
+
+class TestTheCreativeReachesTheMagnifierFromThePanel:
+    @pytest.fixture
+    def app(self, qapp, clip_video, logo_bgra):
+        path, truth = clip_video
+        window = galileo_app.MainWindow()
+        window.central_panel.load_video(path)
+        overlay = window.central_panel.tracking_overlay
+        overlay.points = [tuple(map(float, p)) for p in truth[0]]
+        yield window, window.central_panel, overlay
+        window.dirty = False
+        window.close()
+
+    def test_nothing_is_passed_before_a_creative_is_inserted(self, app):
+        window, panel, overlay = app
+        panel.update_magnifier(force=True)
+        assert panel.magnifier.composited is None
+
+    def test_inserting_one_sends_it_through(self, app, logo_bgra):
+        window, panel, overlay = app
+        overlay.overlay_bgra = logo_bgra
+        overlay.refresh_preview()
+        panel.update_magnifier(force=True)
+
+        composited = panel.magnifier.composited
+        assert composited is not None
+        assert not np.array_equal(composited, panel.prev_frame), \
+            "the frame handed over has no creative in it"
+
+    def test_it_follows_the_shape_while_a_corner_is_moved(self, app, logo_bgra):
+        """Composited once per redraw and cached, so this has to stay live."""
+        window, panel, overlay = app
+        panel.magnifier_switch.setChecked(True)   # the drag path only runs when on
+        overlay.overlay_bgra = logo_bgra
+        overlay.refresh_preview()
+        panel.update_magnifier(force=True)
+        before = panel.magnifier.composited.copy()
+
+        overlay.points = [(x - 40.0, y - 25.0) for x, y in overlay.points]
+        panel.on_shape_changed()
+        assert not np.array_equal(before, panel.magnifier.composited)
