@@ -307,6 +307,12 @@ its switch.
   on — and follows the outline rather than the corners, so a bend swinging wide
   of them is still inside the view. It fits whatever size the magnifier is, so
   enlarging it or filling the stage is what buys back the magnification.
+* **The whole-area view shows the creative in place.** That view is about the
+  insert as a whole — whether the advert sits on the screen and stays on it —
+  so it magnifies the frame as composited, creatives and all, and updates as
+  you drag. The tiles deliberately do not: a tile exists to line one handle up
+  against the real edge of the screen underneath, and that edge is exactly what
+  the creative covers.
 * **Double-click, or press the corner button, to fill the video stage.**
   Twelve handles in a floating box a couple of hundred pixels wide leaves each
   one smaller than the thumbnail it replaced; filling the stage is what makes

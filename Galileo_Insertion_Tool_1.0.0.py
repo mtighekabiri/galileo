@@ -832,6 +832,13 @@ class MagnifierWidget(QWidget):
         #: shows the shape they make; this shows the shape, which is what
         #: tells you whether the outline is following the screen.
         self.whole_area = False
+        #: The frame with the creatives composited into it. The whole-area view
+        #: shows this one: it is a view of the insert as a whole, so what
+        #: matters there is whether the advert sits on the screen properly. A
+        #: tile is the opposite -- it exists to line one handle up against the
+        #: real edge underneath, which the creative would cover -- so tiles
+        #: keep showing base_frame.
+        self.composited = None
         self._single_lit = False
         # Set here as well as on the first manual resize: update_magnifier_dimensions
         # reads it as soon as a second corner exists, which is long before the
@@ -861,6 +868,7 @@ class MagnifierWidget(QWidget):
         region=None,
         focus_index=-1,
         selected_control=-1,
+        composited=None,
     ):
         """
         Update the magnifier data and refresh.
@@ -874,8 +882,12 @@ class MagnifierWidget(QWidget):
         :param focus_index:    show this handle alone; None for all of them.
                                Left at -1 to mean "unchanged".
         :param selected_control: which bend handle is picked, as (edge, slot).
+        :param composited:     the same frame with the creatives drawn in, used
+                               by the whole-area view. None falls back to
+                               ``base_frame``.
         """
         self.base_frame = base_frame
+        self.composited = composited
         self.points = [MagnifierPoint.coerce(p, i)
                        for i, p in enumerate(overlay_points or [])]
         self.region = region
@@ -1166,6 +1178,19 @@ class MagnifierWidget(QWidget):
         scale, offset_x, offset_y = self.tile_mapping(rect, point)
         return ((x - offset_x) / scale, (y - offset_y) / scale)
 
+    def source_frame(self):
+        """The picture this view magnifies.
+
+        The whole-area view shows the creative in place, because that view is
+        about the insert as a whole -- whether the advert sits on the screen
+        and moves with it. A tile is the opposite: it is there to line one
+        handle up against the real edge underneath, and the creative covers
+        exactly that edge, so tiles stay on the untouched frame.
+        """
+        if self.whole_area and self.composited is not None:
+            return self.composited
+        return self.base_frame
+
     # -- painting ----------------------------------------------------------
 
     def paintEvent(self, event):
@@ -1218,7 +1243,7 @@ class MagnifierWidget(QWidget):
                              [0, zoom, offset_y - rect.y()]])
         crisp = zoom >= self.CRISP_ABOVE
         patch = cv2.warpAffine(
-            self.base_frame, matrix, (rect.width(), rect.height()),
+            self.source_frame(), matrix, (rect.width(), rect.height()),
             flags=cv2.INTER_NEAREST if crisp else cv2.INTER_LINEAR,
             borderMode=cv2.BORDER_CONSTANT, borderValue=(26, 20, 20))
         rgb = cv2.cvtColor(patch, cv2.COLOR_BGR2RGB)
@@ -2631,6 +2656,10 @@ class CentralPanel(QWidget):
         self.cap = None
         self.playing = False
         self.prev_frame = None
+        # The frame as shown, creatives and all. Kept so the magnifier's
+        # whole-area view can show the insert without compositing a second
+        # time on every mouse move of a drag.
+        self.display_frame = None
         self.fps = 30
 
         # The single source of truth for "which frame is on screen". Deriving
@@ -3074,8 +3103,10 @@ class CentralPanel(QWidget):
         paused, so the preview updates without having to step a frame.
         """
         if self.prev_frame is None:
+            self.display_frame = None
             return
         display_frame = self.composite_placements(self.prev_frame)
+        self.display_frame = display_frame
 
         frame_rgb = cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB)
         h, w, ch = frame_rgb.shape
@@ -3199,6 +3230,7 @@ class CentralPanel(QWidget):
         # preview is a true preview rather than a lookalike.
         self.prev_frame = frame.copy()
         display_frame = self.composite_placements(frame)
+        self.display_frame = display_frame
 
         frame_rgb = cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB)
         h_frame, w_frame, ch = frame_rgb.shape
@@ -3621,6 +3653,10 @@ class CentralPanel(QWidget):
 
         overlay = self.tracking_overlay
         points, selected, focus = self.magnifier_points()
+        # Only when a creative is actually in place; otherwise the composited
+        # frame is just the frame again, and the whole-area view should say so
+        # by falling back rather than holding a second reference to it.
+        composited = (self.display_frame if overlay.ready_placements() else None)
         self.magnifier.setData(
             base_frame=self.prev_frame.copy(),
             overlay_points=points,
@@ -3628,6 +3664,7 @@ class CentralPanel(QWidget):
             region=overlay.current_region() if len(overlay.points) == 4 else None,
             focus_index=focus,
             selected_control=overlay.drag_control or overlay.selected_control,
+            composited=composited,
         )
         # Sized after the views are set, not before: the grid it has to fit
         # depends on how many handles there are, and the widget only learns
