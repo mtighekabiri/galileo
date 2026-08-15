@@ -827,6 +827,11 @@ class MagnifierWidget(QWidget):
         #: Filling the video stage rather than floating over a corner of it.
         self.expanded = False
         self._expand_lit = False
+        #: One handle at a time, filling the widget, instead of a tile each.
+        #: A grid answers "where is everything"; a single view answers "is
+        #: this one right", and once curving is on there are twelve of them.
+        self.single_view = False
+        self._single_lit = False
         # Set here as well as on the first manual resize: update_magnifier_dimensions
         # reads it as soon as a second corner exists, which is long before the
         # user has had any reason to drag the magnifier.
@@ -918,6 +923,16 @@ class MagnifierWidget(QWidget):
         """Where the fill-the-stage button sits."""
         return QRect(self.width() - 27, 5, 22, 22)
 
+    def single_button_rect(self) -> QRect:
+        """Where the one-view-or-all button sits, beside it."""
+        return QRect(self.width() - 52, 5, 22, 22)
+
+    def set_single_view(self, single: bool):
+        if bool(single) == self.single_view:
+            return
+        self.single_view = bool(single)
+        self.update()
+
     def set_expanded(self, expanded: bool):
         if expanded == self.expanded:
             return
@@ -927,8 +942,10 @@ class MagnifierWidget(QWidget):
 
     def mouseDoubleClickEvent(self, event):
         """Double-click anywhere as well, since the button is small."""
-        if event.button() == Qt.LeftButton and not self.over_grip(event.x(),
-                                                                  event.y()):
+        on_a_button = (self.expand_button_rect().contains(event.pos())
+                       or self.single_button_rect().contains(event.pos()))
+        if (event.button() == Qt.LeftButton and not on_a_button
+                and not self.over_grip(event.x(), event.y())):
             self.set_expanded(not self.expanded)
             event.accept()
             return
@@ -938,6 +955,10 @@ class MagnifierWidget(QWidget):
         if event.button() == Qt.LeftButton:
             if self.expand_button_rect().contains(event.pos()):
                 self.set_expanded(not self.expanded)
+                event.accept()
+                return
+            if self.single_button_rect().contains(event.pos()):
+                self.set_single_view(not self.single_view)
                 event.accept()
                 return
             if not self.auto_zoom and self.zoom_badge_rect().contains(event.pos()):
@@ -971,20 +992,22 @@ class MagnifierWidget(QWidget):
         else:
             over_grip = self.over_grip(event.x(), event.y())
             over_expand = self.expand_button_rect().contains(event.pos())
-            if over_expand:
+            over_single = self.single_button_rect().contains(event.pos())
+            if over_expand or over_single:
                 self.setCursor(Qt.PointingHandCursor)
             elif over_grip:
                 self.setCursor(Qt.SizeFDiagCursor)
             else:
                 self.setCursor(Qt.ArrowCursor)
-            if (over_grip, over_expand) != (self._grip_lit, self._expand_lit):
-                self._grip_lit, self._expand_lit = over_grip, over_expand
+            lit = (over_grip, over_expand, over_single)
+            if lit != (self._grip_lit, self._expand_lit, self._single_lit):
+                self._grip_lit, self._expand_lit, self._single_lit = lit
                 self.update()
         super(MagnifierWidget, self).mouseMoveEvent(event)
 
     def leaveEvent(self, event):
-        if self._grip_lit or self._expand_lit:
-            self._grip_lit = self._expand_lit = False
+        if self._grip_lit or self._expand_lit or self._single_lit:
+            self._grip_lit = self._expand_lit = self._single_lit = False
             self.update()
         super(MagnifierWidget, self).leaveEvent(event)
 
@@ -1014,6 +1037,10 @@ class MagnifierWidget(QWidget):
             return []
 
         focus = self.focus_index
+        if focus is None and self.single_view:
+            # Follows whatever is picked, so the keys and the mouse both steer
+            # it: 1-4 for a corner, T/R/B/L for a bend.
+            focus = self.selected_index if 0 <= self.selected_index < count else 0
         if focus is not None and 0 <= focus < count:
             return [(self.rect().adjusted(2, 2, -2, -2), focus)]
 
@@ -1097,9 +1124,10 @@ class MagnifierWidget(QWidget):
             painter.setPen(QPen(QColor(130, 130, 130)))
             painter.drawText(self.rect(), Qt.AlignCenter,
                              "Mark an area to magnify it")
-            # Still offer the button: expanding and then clearing the shape
+            # Still offer the buttons: expanding and then clearing the shape
             # would otherwise leave the stage covered with no way back.
             self._draw_expand_button(painter)
+            self._draw_single_button(painter)
             painter.end()
             return
 
@@ -1113,6 +1141,7 @@ class MagnifierWidget(QWidget):
         self._draw_zoom_badge(painter)
         self._draw_resize_grip(painter)
         self._draw_expand_button(painter)
+        self._draw_single_button(painter)
         painter.end()
 
     def _draw_tile(self, painter, rect, point, index):
@@ -1276,7 +1305,7 @@ class MagnifierWidget(QWidget):
         picture is arbitrary footage: plain text was unreadable half the time
         and truncated by the tile the rest of it.
         """
-        focused = self.focus_index is not None
+        focused = self.focus_index is not None or self.single_view
         text = point.title if focused else point.label
         if not text or rect.height() < 30:
             return
@@ -1334,6 +1363,31 @@ class MagnifierWidget(QWidget):
             painter.drawLine(right, bottom, right - span, bottom)
             painter.drawLine(right, bottom, right, bottom - span)
         painter.drawLine(left + 1, top + 1, right - 1, bottom - 1)
+
+    def _draw_single_button(self, painter):
+        """Four panes to go back to all of them, one to show only this one.
+
+        Drawn as what pressing it does rather than as the state it is in,
+        which is the only reading that tells someone who has not used it
+        before what will happen.
+        """
+        box = self.single_button_rect()
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QBrush(QColor(0, 0, 0, 190 if self._single_lit else 140)))
+        painter.drawRect(box)
+
+        shade = QColor(245, 245, 245) if self._single_lit else QColor(185, 185, 185)
+        painter.setPen(QPen(shade, 1))
+        painter.setBrush(Qt.NoBrush)
+        inner = box.adjusted(5, 5, -5, -5)
+        if self.single_view:
+            middle_x = inner.x() + inner.width() // 2
+            middle_y = inner.y() + inner.height() // 2
+            painter.drawRect(inner)
+            painter.drawLine(middle_x, inner.y(), middle_x, inner.bottom())
+            painter.drawLine(inner.x(), middle_y, inner.right(), middle_y)
+        else:
+            painter.drawRect(inner)
 
     def _draw_resize_grip(self, painter):
         """The usual diagonal ribs in the corner.
@@ -4276,6 +4330,7 @@ class MainWindow(QMainWindow):
         self.central_panel.tracking_overlay.set_active(row)
         self.central_panel.refresh_display()
         self.central_panel.update_tracking_availability()
+        self.refresh_library_cards()
 
     def on_placement_item_changed(self, item):
         row = self.placement_list.row(item)
@@ -5390,62 +5445,100 @@ class MainWindow(QMainWindow):
         remove_btn.clicked.connect(remove_overlay)
 
         def uninsert_overlay():
-            overlay_widget.inserted = False
-            select_btn.setText("Insert")
-            select_btn.setStyleSheet("QPushButton { background-color: green; color: white; font-size: 14px; border: none; border-radius: 5px; padding: 5px; } QPushButton:hover { background-color: darkgreen; }")
-            shape_btn.setEnabled(False)
-            shape_btn.setToolTip("Insert this creative to bend or tilt it.")
-            overlay_widget.setStyleSheet("background-color: #2A2A2A; border-radius: 10px; padding: 5px;")
-            self.central_panel.tracking_overlay.remove_inserted_overlay()
-            if self.inserted_overlay_widget == overlay_widget:
-                self.inserted_overlay_widget = None
+            """Take this creative out of whichever placements are holding it."""
+            overlay = self.central_panel.tracking_overlay
+            source = self.card_source(overlay_widget)
+            active = overlay.active
+            for placement in overlay.placements:
+                if source is not None and placement.overlay_source_path == source:
+                    overlay.set_active(overlay.placements.index(placement))
+                    overlay.remove_inserted_overlay()
+            overlay.set_active(overlay.placements.index(active))
+            self.refresh_library_cards()
             if self.central_panel.tracking_mode:
-                self.central_panel.tracking_overlay.setFocus()
+                overlay.setFocus()
 
         def toggle_insert():
-            if self.inserted_overlay_widget and self.inserted_overlay_widget is not overlay_widget:
-                old_widget = self.inserted_overlay_widget
-                old_widget.inserted = False
-                old_widget.setStyleSheet("background-color: #2A2A2A; border-radius: 10px; padding: 5px;")
-                old_select_btn = old_widget.findChild(QPushButton, "selectBtn")
-                if old_select_btn:
-                    old_select_btn.setText("Insert")
-                    old_select_btn.setStyleSheet("QPushButton { background-color: green; color: white; font-size: 14px; border: none; border-radius: 5px; padding: 5px; } QPushButton:hover { background-color: darkgreen; }")
-                old_shape_btn = old_widget.findChild(QPushButton, "shapeBtn")
-                if old_shape_btn:
-                    old_shape_btn.setEnabled(False)
-                    old_shape_btn.setToolTip("Insert this creative to bend or tilt it.")
-                self.central_panel.tracking_overlay.remove_inserted_overlay()
-                self.inserted_overlay_widget = None
-            
-            if not overlay_widget.inserted:
-                overlay_widget.inserted = True
-                select_btn.setText("Inserted")
-                select_btn.setStyleSheet("QPushButton { background-color: limegreen; color: white; font-size: 14px; border: none; border-radius: 5px; padding: 5px; } QPushButton:hover { background-color: green; }")
-                overlay_widget.setStyleSheet("background-color: #00A000; border-radius: 10px; padding: 5px;")
-                shape_btn.setEnabled(True)
-                shape_btn.setToolTip("Bend and tilt this creative before it is "
-                                     "tracked into place.")
-                self.inserted_overlay_widget = overlay_widget
-                current_frame_index = self.central_panel.get_current_frame_index()
-                
+            """Put this creative into the placement being worked on, or take
+            it out again -- and only that placement.
+
+            It used to work off one global "the inserted creative", so filling
+            a second placement first appeared to un-insert the first: the card
+            still read "Inserted" because it was describing a different
+            placement, and the click that should have filled the second one
+            merely reset the label. It took two clicks, and left the library
+            describing whichever placement had been touched last.
+            """
+            overlay = self.central_panel.tracking_overlay
+            if overlay_widget.inserted:
+                overlay.remove_inserted_overlay()
+            else:
+                frame_index = self.central_panel.get_current_frame_index()
                 if overlay_widget.inserted_is_video and overlay_widget.video_path:
-                    self.central_panel.tracking_overlay.insert_video_overlay(start_frame_index=current_frame_index, video_path=overlay_widget.video_path)
-                    self.central_panel.tracking_overlay.update_overlay_video_frame_by_index(0)
+                    overlay.insert_video_overlay(
+                        start_frame_index=frame_index,
+                        video_path=overlay_widget.video_path)
+                    overlay.update_overlay_video_frame_by_index(0)
                 else:
                     # Prefer the file path: reading it directly keeps the
                     # creative's alpha channel intact.
-                    source = overlay_widget.image_path or overlay_widget.pixmap
-                    self.central_panel.tracking_overlay.insert_image_overlay(
-                        source, current_frame_index)
-                
-                self.central_panel.tracking_overlay.show()
-                self.central_panel.tracking_overlay.update()
-            else:
-                uninsert_overlay()
+                    overlay.insert_image_overlay(
+                        overlay_widget.image_path or overlay_widget.pixmap,
+                        frame_index)
+                overlay.show()
+            self.refresh_library_cards()
+            if self.central_panel.tracking_mode:
+                overlay.setFocus()
 
         select_btn.clicked.connect(toggle_insert)
         shape_btn.clicked.connect(self.open_morph_dialog)
+
+    def library_cards(self):
+        """Every creative card in the library panel."""
+        for index in range(self.overlay_layout.count()):
+            item = self.overlay_layout.itemAt(index)
+            widget = item.widget() if item is not None else None
+            if widget is not None and hasattr(widget, "inserted_is_video"):
+                yield widget
+
+    @staticmethod
+    def card_source(card):
+        """The file a card stands for, whichever kind it is."""
+        return card.video_path if card.inserted_is_video else card.image_path
+
+    def refresh_library_cards(self):
+        """Show which creative fills the placement being worked on.
+
+        The library describes one placement at a time -- the active one -- so
+        switching placements has to redraw all of it. Without that the labels
+        described whichever placement was filled last, and said "Insert" over a
+        creative that was in the video.
+        """
+        overlay = self.central_panel.tracking_overlay
+        holder = overlay.active.overlay_source_path
+        for card in self.library_cards():
+            source = self.card_source(card)
+            card.inserted = source is not None and source == holder
+            select = card.findChild(QPushButton, "selectBtn")
+            shape = card.findChild(QPushButton, "shapeBtn")
+            if select is not None:
+                select.setText("Inserted" if card.inserted else "Insert")
+                select.setStyleSheet(
+                    "QPushButton { background-color: %s; color: white; "
+                    "font-size: 14px; border: none; border-radius: 5px; "
+                    "padding: 5px; } QPushButton:hover { background-color: %s; }"
+                    % (("limegreen", "green") if card.inserted
+                       else ("green", "darkgreen")))
+            if shape is not None:
+                shape.setEnabled(card.inserted)
+                shape.setToolTip(
+                    "Bend and tilt this creative before it is tracked into place."
+                    if card.inserted else "Insert this creative to bend or tilt it.")
+            card.setStyleSheet(
+                "background-color: %s; border-radius: 10px; padding: 5px;"
+                % ("#00A000" if card.inserted else "#2A2A2A"))
+        if self.inserted_overlay_widget is not None:
+            self.inserted_overlay_widget = None
 
     def make_video_click_handler(self, player, original_event):
         def handler(event):

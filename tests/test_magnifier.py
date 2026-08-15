@@ -794,3 +794,78 @@ class TestItIsBigEnoughToBeUseful:
         finally:
             window.dirty = False
             window.close()
+
+
+class TestOneViewInsteadOfAGrid:
+    """A grid answers "where is everything"; a single view answers "is this
+    one right", and once curving is on there are twelve of them."""
+
+    def test_it_shows_one_view(self, magnifier):
+        region = curved_region()
+        magnifier.setData(screen_frame(), handle_points(region), region=region,
+                          selected_index=4, focus_index=None)
+        assert len(magnifier.tiles()) == 12
+        magnifier.set_single_view(True)
+        assert len(magnifier.tiles()) == 1
+
+    def test_the_one_it_shows_is_the_one_picked(self, magnifier):
+        region = curved_region()
+        points = handle_points(region)
+        magnifier.set_single_view(True)
+        for chosen in (0, 4, 7, 11):
+            magnifier.setData(screen_frame(), points, region=region,
+                              selected_index=chosen, focus_index=None)
+            _, index = magnifier.tiles()[0]
+            assert index == chosen
+
+    def test_it_falls_back_to_the_first_with_nothing_picked(self, magnifier):
+        magnifier.set_single_view(True)
+        magnifier.setData(screen_frame(), CORNERS, selected_index=-1,
+                          focus_index=None)
+        assert magnifier.tiles()[0][1] == 0
+
+    def test_the_one_view_gets_the_whole_widget(self, magnifier):
+        magnifier.set_single_view(True)
+        magnifier.setData(screen_frame(), CORNERS, focus_index=None)
+        rect, _ = magnifier.tiles()[0]
+        assert rect.width() > magnifier.width() * 0.9
+
+    def test_the_button_toggles_it(self, magnifier):
+        magnifier.setData(screen_frame(), CORNERS, focus_index=None)
+        centre = magnifier.single_button_rect().center()
+        for expected in (True, False):
+            magnifier.mousePressEvent(QMouseEvent(
+                QEvent.MouseButtonPress, centre, magnifier.mapToGlobal(centre),
+                Qt.LeftButton, Qt.LeftButton, Qt.NoModifier))
+            assert magnifier.single_view is expected
+
+    def test_its_button_does_not_sit_on_the_other_one(self, magnifier):
+        assert not magnifier.single_button_rect().intersects(
+            magnifier.expand_button_rect())
+
+    def test_double_clicking_a_button_does_not_also_expand(self, magnifier):
+        """Both live in the same corner; a press followed by a second press is
+        a double-click, and expanding on top of the toggle is not wanted."""
+        magnifier.setData(screen_frame(), CORNERS, focus_index=None)
+        centre = magnifier.single_button_rect().center()
+        magnifier.mouseDoubleClickEvent(QMouseEvent(
+            QEvent.MouseButtonDblClick, centre, magnifier.mapToGlobal(centre),
+            Qt.LeftButton, Qt.LeftButton, Qt.NoModifier))
+        assert magnifier.expanded is False
+
+    def test_it_spells_the_handle_out(self, magnifier):
+        """There is room for the full name once it is not sharing."""
+        region = curved_region()
+        points = handle_points(region)
+        magnifier.setData(screen_frame(), points, region=region,
+                          selected_index=1, focus_index=None)
+        grid = grab(magnifier)
+        magnifier.set_single_view(True)
+        assert not np.array_equal(grid, grab(magnifier))
+
+    def test_dragging_still_overrides_it(self, magnifier):
+        """A drag focuses what is being dragged whichever mode it is in."""
+        region = curved_region()
+        magnifier.setData(screen_frame(), handle_points(region), region=region,
+                          selected_index=1, focus_index=5)
+        assert magnifier.tiles()[0][1] == 5

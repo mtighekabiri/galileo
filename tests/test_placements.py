@@ -309,3 +309,114 @@ class TestAoiPerPlacement:
         with open(tmp_path / "aoi_Left.csv", newline="") as handle:
             left = list(csv.reader(handle))
         assert rows[2][-1] != left[2][-1]
+
+
+class TestOneCreativeInSeveralPlacements:
+    """The library describes one placement at a time -- the active one. It
+    used to describe whichever had been filled last, so a card could read
+    "Insert" over a creative that was in the video, and filling a second
+    placement from the same card took two clicks with a lie in between."""
+
+    def cards(self, window):
+        return list(window.library_cards())
+
+    def button(self, card):
+        from PyQt5.QtWidgets import QPushButton
+        return card.findChild(QPushButton, "selectBtn")
+
+    def sources(self, overlay):
+        return [p.overlay_source_path for p in overlay.placements]
+
+    def test_the_same_creative_can_fill_two_placements(self, two, tmp_path):
+        window, panel, overlay, truth, first, second = two
+        art = str(tmp_path / "one.png")
+        cv2.imwrite(art, np.full((80, 120, 3), 200, np.uint8))
+        window.add_overlay(art)
+        card = self.cards(window)[0]
+
+        overlay.set_active(0)
+        window.refresh_library_cards()
+        self.button(card).click()
+        assert overlay.placements[0].overlay_source_path == art
+
+        overlay.set_active(1)
+        window.refresh_library_cards()
+        assert self.button(card).text() == "Insert", (
+            "it should not claim to be in a placement it is not in")
+        self.button(card).click()
+        assert self.sources(overlay) == [art, art]
+
+    def test_the_labels_follow_the_active_placement(self, two, tmp_path):
+        window, panel, overlay, truth, first, second = two
+        red = str(tmp_path / "red.png")
+        blue = str(tmp_path / "blue.png")
+        cv2.imwrite(red, np.full((80, 120, 3), (30, 30, 220), np.uint8))
+        cv2.imwrite(blue, np.full((80, 120, 3), (220, 120, 30), np.uint8))
+        window.add_overlay(red)
+        window.add_overlay(blue)
+        first_card, second_card = self.cards(window)
+
+        overlay.set_active(0)
+        window.refresh_library_cards()
+        self.button(first_card).click()
+        overlay.set_active(1)
+        window.refresh_library_cards()
+        self.button(second_card).click()
+
+        overlay.set_active(0)
+        window.refresh_library_cards()
+        assert [self.button(c).text() for c in (first_card, second_card)] == \
+            ["Inserted", "Insert"]
+        overlay.set_active(1)
+        window.refresh_library_cards()
+        assert [self.button(c).text() for c in (first_card, second_card)] == \
+            ["Insert", "Inserted"]
+
+    def test_filling_one_placement_leaves_the_other_alone(self, two, tmp_path):
+        window, panel, overlay, truth, first, second = two
+        red = str(tmp_path / "red.png")
+        blue = str(tmp_path / "blue.png")
+        cv2.imwrite(red, np.full((80, 120, 3), (30, 30, 220), np.uint8))
+        cv2.imwrite(blue, np.full((80, 120, 3), (220, 120, 30), np.uint8))
+        window.add_overlay(red)
+        window.add_overlay(blue)
+        cards = self.cards(window)
+
+        overlay.set_active(0)
+        window.refresh_library_cards()
+        self.button(cards[0]).click()
+        overlay.set_active(1)
+        window.refresh_library_cards()
+        self.button(cards[1]).click()
+        assert self.sources(overlay) == [red, blue]
+
+    def test_taking_a_creative_out_clears_it_everywhere(self, two, tmp_path):
+        """Removing it from the library cannot leave a placement holding it."""
+        window, panel, overlay, truth, first, second = two
+        art = str(tmp_path / "one.png")
+        cv2.imwrite(art, np.full((80, 120, 3), 200, np.uint8))
+        window.add_overlay(art)
+        card = self.cards(window)[0]
+
+        for row in (0, 1):
+            overlay.set_active(row)
+            window.refresh_library_cards()
+            self.button(card).click()
+        assert self.sources(overlay) == [art, art]
+
+        overlay.set_active(0)
+        window.refresh_library_cards()
+        self.button(card).click()          # a click on "Inserted" removes it
+        assert overlay.placements[0].overlay_source_path is None
+
+    def test_both_are_rendered(self, two, tmp_path):
+        window, panel, overlay, truth, first, second = two
+        art = str(tmp_path / "one.png")
+        cv2.imwrite(art, np.full((80, 120, 3), 200, np.uint8))
+        window.add_overlay(art)
+        card = self.cards(window)[0]
+        for row in (0, 1):
+            overlay.set_active(row)
+            window.refresh_library_cards()
+            self.button(card).click()
+        assert len(overlay.ready_placements()) == 2

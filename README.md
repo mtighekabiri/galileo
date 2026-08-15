@@ -71,6 +71,7 @@ macOS, `~/.local/share/Galileo` on Linux).
 | Magnifier switch | Show/hide the magnifier (it also appears while dragging) |
 | Double-click the magnifier | Fill the video stage with it, or put it back |
 | Scroll on the magnifier | Set its magnification by hand |
+| Panes button on the magnifier | One view at a time, or all of them |
 
 Brightness, contrast and colourise adjustments for the inserted creative are
 available from the left toolbar, and all three apply to the render as well as
@@ -299,6 +300,10 @@ its switch.
   corner and its two bend handles.
 * **Dragging one gives it the whole widget.** That is the moment precision is
   wanted, and four thumbnails serve it worse than one clear view.
+* **Press the panes button for one view instead of a grid.** A grid answers
+  "where is everything"; a single large view answers "is this one right", which
+  is the question once curving is on and there are twelve handles. It follows
+  whatever is picked, so `1`–`4` and `T`/`R`/`B`/`L` steer it.
 * **Double-click, or press the corner button, to fill the video stage.**
   Twelve handles in a floating box a couple of hundred pixels wide leaves each
   one smaller than the thumbnail it replaced; filling the stage is what makes
@@ -355,6 +360,12 @@ can hold a printed poster alongside a digital screen.
 Tick a placement to include it in the render; untick to leave it out without
 losing its tracking. Editing always applies to the selected one, drawn with
 solid handles; the rest stay visible as dashed outlines.
+
+**The library describes the selected placement.** Select a placement, press
+*Insert* on a creative, and that creative fills that placement — switch
+placement and the library redraws to describe the new one. The same creative
+can therefore fill as many placements as you like, which is what an A/B test
+against a control needs.
 
 The AOI export writes **one CSV per placement**, named after it, because an
 eye-tracking analysis has to tell the adverts apart.
