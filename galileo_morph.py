@@ -42,10 +42,10 @@ class Morph:
     """How much to bend and tilt a creative. All zero means leave it alone."""
 
     __slots__ = ("pitch", "yaw", "roll", "bow_h", "bow_v", "perspective",
-                 "shading", "enabled")
+                 "shading", "fill", "enabled")
 
     def __init__(self, pitch=0.0, yaw=0.0, roll=0.0, bow_h=0.0, bow_v=0.0,
-                 perspective=0.5, shading=0.55, enabled=True):
+                 perspective=0.5, shading=0.55, fill=True, enabled=True):
         """
         Args:
             pitch: degrees to tip the top away from the viewer.
@@ -69,6 +69,7 @@ class Morph:
         self.bow_v = bow_v
         self.perspective = perspective
         self.shading = shading
+        self.fill = fill
         self.enabled = enabled
 
     def is_identity(self, tolerance: float = 1e-4) -> bool:
@@ -177,13 +178,20 @@ def apply_bow(image: np.ndarray, bow_h: float = 0.0, bow_v: float = 0.0,
 
     facing = (_bow_facing(width, bow_h, columns)[None, :]
               * _bow_facing(height, bow_v, rows)[:, None])
-    gain = (1.0 - strength * (1.0 - facing))[:, :, None]
+    gain = (1.0 - strength * (1.0 - facing)).astype(np.float32)
 
-    shaded = bowed.astype(np.float32)
-    # Colour only. Shading the alpha channel would eat away the creative's
-    # edges instead of dimming them.
-    shaded[:, :, :3] *= gain
-    return np.clip(shaded, 0, 255).astype(bowed.dtype)
+    # Channel at a time, through OpenCV's saturating multiply. Widening the
+    # whole four-channel image to float, multiplying, clipping and narrowing it
+    # back cost 52ms on a 1080p creative against 9ms for this -- and the shading
+    # was almost the entire cost of a morph, so a 1080p creative could not be
+    # previewed at more than about ten frames a second.
+    #
+    # Colour only. Shading the alpha would eat away the creative's edges
+    # instead of dimming them, so it is split off and put back untouched.
+    channels = cv2.split(bowed)
+    shaded = [cv2.multiply(channel, gain, dtype=cv2.CV_8U)
+              for channel in channels[:3]]
+    return cv2.merge(shaded + list(channels[3:]))
 
 
 # --------------------------------------------------------------------------
@@ -191,12 +199,20 @@ def apply_bow(image: np.ndarray, bow_h: float = 0.0, bow_v: float = 0.0,
 # --------------------------------------------------------------------------
 
 def tilt_corners(width: int, height: int, pitch: float, yaw: float, roll: float,
-                 perspective: float = 0.5) -> np.ndarray:
+                 perspective: float = 0.5, fill: bool = True) -> np.ndarray:
     """Where the creative's corners land after turning it in space.
 
     The sheet is placed in front of a pinhole camera, rotated, projected, then
-    scaled to sit back inside its own canvas -- so a tilt changes the shape
-    without changing how much room the creative takes up.
+    scaled about its centre -- so a tilt changes the shape without changing how
+    much room the creative takes up.
+
+    ``fill`` decides which way that last scaling goes. Filling grows the sheet
+    until the canvas is entirely inside it, so the creative still covers every
+    pixel of the area it is warped into and the overhang is cropped. Without
+    it the sheet shrinks until it fits *within* the canvas, which leaves
+    transparent wedges at the corners -- and those wedges are the tracked
+    surface itself showing through, which is the one thing an insert must
+    never do.
     """
     half_w, half_h = width / 2.0, height / 2.0
     corners = np.float32([[-half_w, -half_h, 0], [half_w, -half_h, 0],
@@ -222,24 +238,67 @@ def tilt_corners(width: int, height: int, pitch: float, yaw: float, roll: float,
     depth = np.where(np.abs(depth) < 1e-3, 1e-3, depth)
     projected = rotated[:, :2] * (focal / depth)[:, None]
 
-    # Scale back to fit the canvas, keeping the centre put.
-    extent = np.abs(projected).max(axis=0)
-    limit = np.array([half_w, half_h], np.float32)
-    fit = float(np.min(limit / np.maximum(extent, 1e-6)))
-    projected = projected * min(fit, 1.0)
+    scale = (_cover_scale(projected, half_w, half_h) if fill
+             else min(_contain_scale(projected, half_w, half_h), 1.0))
+    projected = projected * scale
 
     return (projected + np.float32([half_w, half_h])).astype(np.float32)
 
 
+def _contain_scale(quad, half_w, half_h) -> float:
+    """Largest scale that keeps the whole quad inside the canvas."""
+    extent = np.abs(quad).max(axis=0)
+    limit = np.array([half_w, half_h], np.float32)
+    return float(np.min(limit / np.maximum(extent, 1e-6)))
+
+
+#: How far past the canvas corners a filling tilt is pushed, in pixels.
+#: Landing exactly on them leaves the corner pixel half-covered, because the
+#: warp interpolates across the boundary -- a couple of stray see-through
+#: pixels in the very corner of the area, which is where they show most.
+COVER_CLEARANCE = 1.5
+
+
+def _cover_scale(quad, half_w, half_h) -> float:
+    """Smallest scale that puts the whole canvas inside the quad.
+
+    Scaling about the centre moves each of the quad's edges away from that
+    centre in proportion, so for each edge it is enough to ask how far the
+    canvas reaches in that edge's direction and how far the edge already is.
+    The largest of those ratios is the scale that clears every edge at once.
+    """
+    corners = np.float32([[-half_w, -half_h], [half_w, -half_h],
+                          [half_w, half_h], [-half_w, half_h]])
+    needed = 1.0
+    for index in range(4):
+        start, end = quad[index], quad[(index + 1) % 4]
+        edge = end - start
+        normal = np.float32([edge[1], -edge[0]])
+        length = float(np.hypot(*normal))
+        if length < 1e-9:
+            continue
+        normal = normal / length
+        reach = float(normal @ start)          # how far this edge sits out
+        if reach < 0:                          # normals point inwards; flip
+            normal, reach = -normal, -reach
+        if reach < 1e-6:                        # the centre is on the edge
+            return 1.0
+        wanted = float(np.max(corners @ normal)) + COVER_CLEARANCE
+        needed = max(needed, wanted / reach)
+    return needed
+
+
 def apply_tilt(image: np.ndarray, pitch: float = 0.0, yaw: float = 0.0,
-               roll: float = 0.0, perspective: float = 0.5) -> np.ndarray:
-    """Turn the creative in space, keeping it inside its own canvas."""
+               roll: float = 0.0, perspective: float = 0.5,
+               fill: bool = True) -> np.ndarray:
+    """Turn the creative in space, still covering its own canvas."""
     if image is None or (abs(pitch) < 1e-6 and abs(yaw) < 1e-6 and abs(roll) < 1e-6):
         return image
 
     height, width = image.shape[:2]
     source = np.float32([[0, 0], [width, 0], [width, height], [0, height]])
-    destination = tilt_corners(width, height, pitch, yaw, roll, perspective)
+    destination = tilt_corners(width, height, pitch, yaw, roll, perspective,
+                               fill)
 
     try:
         matrix = cv2.getPerspectiveTransform(source, destination)
@@ -260,9 +319,11 @@ def apply_tilt(image: np.ndarray, pitch: float = 0.0, yaw: float = 0.0,
 def apply_morph(creative, morph: Morph) -> np.ndarray:
     """Bend and tilt a creative, returning BGRA with transparent surround.
 
-    Whatever the morph pushes outside the canvas becomes transparent rather
-    than black, so the compositor's alpha handling leaves the footage showing
-    through exactly as it does around a creative's own transparency.
+    With ``fill`` on, which is the default, the creative still covers every
+    pixel of the area it is warped into: a tilt crops rather than shrinking.
+    With it off, whatever the morph pushes outside the canvas becomes
+    transparent rather than black, so the compositor leaves the footage showing
+    through as it does around a creative's own transparency.
     """
     if creative is None or morph is None or morph.is_identity():
         return creative
@@ -270,5 +331,48 @@ def apply_morph(creative, morph: Morph) -> np.ndarray:
     result = to_bgra(creative)
     result = apply_bow(result, morph.bow_h, morph.bow_v, morph.shading)
     result = apply_tilt(result, morph.pitch, morph.yaw, morph.roll,
-                        morph.perspective)
+                        morph.perspective, morph.fill)
     return result
+
+
+class ShapeCache:
+    """Remembers the last shaped creative.
+
+    Shaping is expensive -- a 1080p creative costs tens of milliseconds -- and
+    for a still creative with settings the user is not currently dragging, the
+    inputs are identical on every frame of playback and every frame of a
+    render. Doing it once and keeping the answer turns that into nothing at
+    all.
+
+    The source is compared by identity, not by value: comparing two 1080p
+    images costs more than the work being avoided. Holding the reference is
+    what makes identity safe, since the array cannot be freed and its place
+    taken by another while the cache still points at it. A creative *video*
+    hands over a new array each frame and so misses every time, which is
+    correct -- there is genuinely new work to do.
+    """
+
+    __slots__ = ("_source", "_settings", "_result", "hits", "misses")
+
+    def __init__(self):
+        self._source = None
+        self._settings = None
+        self._result = None
+        self.hits = 0
+        self.misses = 0
+
+    def apply(self, creative, morph):
+        settings = None if morph is None else morph.to_dict()
+        if (creative is self._source and settings == self._settings
+                and self._result is not None):
+            self.hits += 1
+            return self._result
+
+        self.misses += 1
+        result = apply_morph(creative, morph)
+        self._source, self._settings, self._result = creative, settings, result
+        return result
+
+    def clear(self):
+        self._source = self._settings = self._result = None
+

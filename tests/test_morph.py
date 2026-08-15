@@ -253,37 +253,49 @@ class TestTilt:
 
     def test_a_roll_turns_the_artwork_clockwise(self):
         """Positive is clockwise on screen, as a rotation means everywhere else."""
-        corners = morph.tilt_corners(400, 200, 0, 0, 20)
+        corners = morph.tilt_corners(400, 200, 0, 0, 20, fill=False)
         assert corners[0][0] > 200 * 0.2, "top-left should have swung right"
+        filled = morph.tilt_corners(400, 200, 0, 0, 20)
+        assert filled[0][1] < filled[1][1], "the top edge should still tip"
 
-    def test_the_result_stays_inside_its_canvas(self):
+    def test_without_filling_it_stays_inside_its_canvas(self):
         for pitch, yaw, roll in [(40, 0, 0), (0, 45, 0), (0, 0, 30), (30, 30, 20)]:
-            corners = morph.tilt_corners(400, 200, pitch, yaw, roll, 1.0)
+            corners = morph.tilt_corners(400, 200, pitch, yaw, roll, 1.0,
+                                         fill=False)
             assert corners[:, 0].min() >= -0.5 and corners[:, 0].max() <= 400.5
             assert corners[:, 1].min() >= -0.5 and corners[:, 1].max() <= 200.5
+
+    def test_filling_deliberately_goes_outside_it(self):
+        """Which is the point: the overhang is cropped so that what remains
+        covers every pixel of the area."""
+        corners = morph.tilt_corners(400, 200, 0, 35, 0, 1.0)
+        assert (corners[:, 0].min() < -0.5 or corners[:, 0].max() > 400.5
+                or corners[:, 1].min() < -0.5 or corners[:, 1].max() > 200.5)
 
     def test_the_canvas_keeps_its_size(self, poster):
         assert morph.apply_tilt(poster, 20, 20, 10).shape == poster.shape
 
 
 class TestWhatTheCompositorSees:
-    def test_a_tilt_leaves_transparency_not_black(self, poster):
+    def test_a_tilt_leaves_transparency_not_black_when_not_filling(self, poster):
         """The compositor keys on alpha. Black corners would paint a black
         wedge over the footage instead of letting it show through."""
-        tilted = morph.apply_morph(poster, morph.Morph(yaw=35, perspective=0.8))
+        tilted = morph.apply_morph(
+            poster, morph.Morph(yaw=35, perspective=0.8, fill=False))
         assert tilted[0, 0, 3] == 0
         assert tilted[100, 200, 3] == 255
 
-    def test_the_footage_shows_through_where_the_tilt_vacated(self, poster):
+    def test_the_footage_shows_through_only_when_filling_is_off(self, poster):
         scene = np.full((300, 500, 3), 90, np.uint8)
         quad = np.float32([[40, 30], [460, 30], [460, 270], [40, 270]])
         flat = core.composite_overlay(scene, poster, quad)
         tilted = core.composite_overlay(
-            scene, morph.apply_morph(poster, morph.Morph(pitch=35, perspective=0.9)),
+            scene, morph.apply_morph(
+                poster, morph.Morph(pitch=35, perspective=0.9, fill=False)),
             quad)
         untouched = np.abs(tilted.astype(int) - 90).max(axis=2) < 3
         assert untouched.sum() > 0.05 * untouched.size, (
-            "a strong tilt should leave part of the area showing the shot")
+            "with filling off a strong tilt should leave the shot showing")
         assert not np.array_equal(flat, tilted)
 
     def test_a_three_channel_creative_comes_back_with_alpha(self):
@@ -432,3 +444,122 @@ class TestInTheApplication:
         dialog.sliders["yaw"].setValue(40)
         dialog._revert_and_reject()
         assert overlay.morph.yaw == 10
+
+
+class TestFillingTheArea:
+    """An insert that does not cover the area it is warped into shows the
+    tracked surface through the gaps, which is the one thing it must not do."""
+
+    def opaque(self, width=400, height=240):
+        panel = np.zeros((height, width, 4), np.uint8)
+        panel[:, :, :3] = (30, 60, 200)
+        panel[:, :, 3] = 255
+        return panel
+
+    def gap_fraction(self, image):
+        return float((image[:, :, 3] < 255).mean())
+
+    def test_no_setting_leaves_a_hole(self):
+        panel = self.opaque()
+        for settings in (dict(yaw=30), dict(pitch=35), dict(roll=20),
+                         dict(pitch=25, yaw=25, roll=15),
+                         dict(yaw=45, perspective=1.0),
+                         dict(bow_h=0.9, yaw=30),
+                         dict(pitch=-40, yaw=-40, roll=-25, perspective=1.0)):
+            shaped = morph.apply_morph(panel, morph.Morph(**settings))
+            assert self.gap_fraction(shaped) == 0.0, (
+                f"{settings} left {self.gap_fraction(shaped):.1%} showing through")
+
+    def test_turning_it_off_leaves_the_gaps_it_used_to(self):
+        panel = self.opaque()
+        shaped = morph.apply_morph(panel, morph.Morph(roll=20, fill=False))
+        assert self.gap_fraction(shaped) > 0.3
+
+    def test_filling_is_the_default(self):
+        assert morph.Morph().fill is True
+
+    def test_it_crops_rather_than_shrinking(self):
+        """Filling has a cost, and it is the edges of the artwork. Stating it
+        here keeps that a decision rather than a surprise: the same tilt keeps
+        the artwork whole when filling is off, and loses its edges when on."""
+        shape = dict(pitch=30, yaw=20, roll=0, perspective=0.9)
+        inside = morph.tilt_corners(400, 240, fill=False, **shape)
+        filling = morph.tilt_corners(400, 240, fill=True, **shape)
+
+        def area(quad):
+            x, y = quad[:, 0], quad[:, 1]
+            return abs(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1))) / 2
+
+        assert area(filling) > area(inside)
+        assert area(filling) > 400 * 240, "it has to reach past the canvas"
+
+    def test_the_setting_is_saved_and_reloaded(self):
+        assert morph.Morph.from_dict(morph.Morph(fill=False).to_dict()).fill is False
+
+    def test_a_bow_alone_already_filled(self):
+        """It resamples the whole canvas, so it never had gaps to close."""
+        panel = self.opaque()
+        assert self.gap_fraction(morph.apply_bow(panel, 0.9, 0.5, 0.5)) == 0.0
+
+
+class TestNotShapingTheSameThingTwice:
+    """Shaping a 1080p creative costs tens of milliseconds. For a still
+    creative with settings nobody is dragging, that work is identical on every
+    frame of playback and of a render."""
+
+    def creative(self, seed=0):
+        rng = np.random.default_rng(seed)
+        return np.dstack([rng.integers(0, 255, (200, 320, 3), dtype=np.uint8),
+                          np.full((200, 320), 255, np.uint8)])
+
+    def test_the_same_inputs_are_only_done_once(self):
+        cache = morph.ShapeCache()
+        art, shape = self.creative(), morph.Morph(yaw=20)
+        first = cache.apply(art, shape)
+        for _ in range(5):
+            assert cache.apply(art, shape) is first
+        assert (cache.hits, cache.misses) == (5, 1)
+
+    def test_the_answer_is_the_same_as_doing_it_directly(self):
+        cache = morph.ShapeCache()
+        art, shape = self.creative(), morph.Morph(yaw=20, bow_h=0.5)
+        assert np.array_equal(cache.apply(art, shape),
+                              morph.apply_morph(art, shape))
+
+    def test_moving_a_slider_redoes_it(self):
+        cache = morph.ShapeCache()
+        art, shape = self.creative(), morph.Morph(yaw=20)
+        cache.apply(art, shape)
+        shape.yaw = 21
+        assert cache.misses == 2 or cache.apply(art, shape) is not None
+        cache.apply(art, shape)
+        assert cache.misses >= 2
+
+    def test_a_creative_video_is_redone_every_frame(self):
+        """A new picture each frame is genuinely new work, and must not be
+        served the previous frame's answer."""
+        cache = morph.ShapeCache()
+        shape = morph.Morph(yaw=20)
+        results = [cache.apply(self.creative(i), shape) for i in range(4)]
+        assert cache.hits == 0
+        assert not np.array_equal(results[0], results[1])
+
+    def test_it_holds_on_to_what_it_compares_against(self):
+        """Comparing by identity is only safe while the array cannot be freed
+        and something else take its place in memory."""
+        cache = morph.ShapeCache()
+        cache.apply(self.creative(), morph.Morph(yaw=20))
+        assert cache._source is not None
+
+    def test_clearing_it_forgets(self):
+        cache = morph.ShapeCache()
+        art, shape = self.creative(), morph.Morph(yaw=20)
+        cache.apply(art, shape)
+        cache.clear()
+        cache.apply(art, shape)
+        assert cache.misses == 2
+
+    def test_an_identity_morph_is_cached_too(self):
+        cache = morph.ShapeCache()
+        art = self.creative()
+        assert cache.apply(art, morph.Morph()) is art

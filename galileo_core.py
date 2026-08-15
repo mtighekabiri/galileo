@@ -1054,7 +1054,23 @@ class PlanarTracker:
         On success the tracker's state moves forward. On failure the state is
         left untouched, so the caller can coast on prediction and retry on the
         next frame without the tracker having been corrupted.
+
+        Failure always arrives as a refused :class:`TrackResult`, never as an
+        exception. OpenCV raises on inputs it cannot work with -- a frame whose
+        size differs from the one the tracker was anchored on is the easy way
+        to provoke it -- and an exception escaping here does not reach a caller
+        prepared for it: tracking is driven from the frame-display path, so it
+        would surface as playback dying rather than as one frame going
+        unmeasured.
         """
+        try:
+            return self._track(frame)
+        except cv2.error as exc:
+            logger.debug("tracking step refused: %s", exc)
+            return TrackResult(False, following_camera=self.following_camera,
+                               reason=f"the frame could not be followed: {exc}")
+
+    def _track(self, frame) -> TrackResult:
         gray = self._gray(frame)
 
         # Once the surface has left the shot there is nothing of it left to

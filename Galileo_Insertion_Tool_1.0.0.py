@@ -293,6 +293,7 @@ class BlendDialog(QDialog):
         for name, _, _ in self.EFFECTS:
             self.sliders[name].setValue(int(getattr(fresh, name) * 100))
         self.enabled_box.setChecked(True)
+        self.fill_box.setChecked(morphlib.Morph().fill)
 
     def _revert_and_reject(self):
         for key, value in self.original.items():
@@ -365,10 +366,23 @@ class MorphDialog(QDialog):
         layout = QVBoxLayout(self)
         layout.setSpacing(9)
 
+        switches = QHBoxLayout()
         self.enabled_box = QCheckBox("Shape this creative")
         self.enabled_box.setChecked(morph.enabled)
         self.enabled_box.toggled.connect(self._on_enabled)
-        layout.addWidget(self.enabled_box)
+        switches.addWidget(self.enabled_box)
+
+        self.fill_box = QCheckBox("Fill the area")
+        self.fill_box.setChecked(morph.fill)
+        self.fill_box.setToolTip(
+            "Keep the creative covering every pixel of the tracked area,\n"
+            "cropping whatever a turn pushes outside it.\n\n"
+            "Turned off, a turn leaves transparent wedges at the corners --\n"
+            "and those wedges are the tracked surface showing through.")
+        self.fill_box.toggled.connect(self._on_fill)
+        switches.addWidget(self.fill_box)
+        switches.addStretch()
+        layout.addLayout(switches)
 
         self.thumbnail = QLabel()
         self.thumbnail.setFixedHeight(210 if preview is not None else 150)
@@ -420,6 +434,10 @@ class MorphDialog(QDialog):
         self._sync_enabled()
         self._refresh()
 
+    def _on_fill(self, checked):
+        self.morph.fill = checked
+        self._refresh()
+
     def _sync_enabled(self):
         for slider in self.sliders.values():
             slider.setEnabled(self.morph.enabled)
@@ -435,6 +453,7 @@ class MorphDialog(QDialog):
                 int(round(getattr(fresh, name) * 100)) if name in self.SCALED
                 else int(round(getattr(fresh, name))))
         self.enabled_box.setChecked(True)
+        self.fill_box.setChecked(morphlib.Morph().fill)
 
     def _revert_and_reject(self):
         for key, value in self.original.items():
@@ -631,10 +650,11 @@ class IconWidget(QFrame):
         self.base_color = self.default_base_color
         self.hover_color = self.default_hover_color
 
-        # 80x100 for eight tools needed 945px of column; a 1366x768 laptop has
-        # about 660, so the labels were clipped away and the toolbar became
-        # eight bare glyphs with no tooltips.
-        self.setFixedSize(78, 62)
+        # Nine tools have to fit the shortest window the app allows. At 62
+        # high they needed 558px of column against the 480 a 1024x640 window
+        # leaves, so Curve and Clear sat below the fold behind a scrollbar
+        # barely a pixel wide -- present, but not findable.
+        self.setFixedSize(78, 52)
         self.set_normal_style()
 
         self.layout = QVBoxLayout()
@@ -1372,6 +1392,10 @@ class Placement:
         # describes where the surface is and must not be nudged to fake the
         # look of the artwork on it.
         self.morph = morphlib.Morph()
+        # Shaping a 1080p creative costs tens of milliseconds, and for a still
+        # creative with settings nobody is dragging the answer is the same on
+        # every frame of playback and of a render.
+        self.shape_cache = morphlib.ShapeCache()
 
         # Tracking state, rebuilt whenever the shape is edited.
         self.feature_source = core.PlanarTracker.INTERIOR
@@ -1932,7 +1956,8 @@ class TrackingOverlay(QWidget):
         """One placement's creative, adapted to the frame it is going into."""
         if placement.overlay_bgra is None:
             return None
-        styled = morphlib.apply_morph(placement.overlay_bgra, placement.morph)
+        styled = placement.shape_cache.apply(placement.overlay_bgra,
+                                             placement.morph)
         styled = core.apply_brightness_contrast(
             styled, placement.brightness, placement.contrast)
         if placement.colourise_enabled and base_frame is not None:
@@ -1961,7 +1986,7 @@ class TrackingOverlay(QWidget):
         """
         if self.overlay_bgra is None:
             return None
-        styled = morphlib.apply_morph(self.overlay_bgra, self.morph)
+        styled = self.active.shape_cache.apply(self.overlay_bgra, self.morph)
         styled = core.apply_brightness_contrast(
             styled, self.brightness, self.contrast)
         if self.colourise_enabled and base_frame is not None and quad is not None:
@@ -2257,12 +2282,17 @@ class TitleBar(QWidget):
         self.title_label.setAlignment(Qt.AlignCenter)
         
         self.logo_label = QLabel()
-        try:
-            self.logo_label.setPixmap(QPixmap("logo.png").scaled(40, 40, Qt.KeepAspectRatio, Qt.SmoothTransformation))
-        except:
-            logging.warning("logo.png not found. Skipping logo display.")
-            self.logo_label.setText("Logo")
-            self.logo_label.setStyleSheet("color: white; font-size: 14px;")
+        # A missing file gives a null pixmap rather than raising, so the
+        # except this used to sit behind could never fire. Hidden rather than
+        # given placeholder text: the word "Logo" sitting beside the title is
+        # more obviously missing than a title with nothing after it.
+        logo = QPixmap(os.path.join(resource_directory(), "logo.png"))
+        if logo.isNull():
+            logging.debug("no logo.png alongside the application")
+            self.logo_label.hide()
+        else:
+            self.logo_label.setPixmap(logo.scaled(40, 40, Qt.KeepAspectRatio,
+                                                  Qt.SmoothTransformation))
         self.logo_label.setAlignment(Qt.AlignCenter)
         
         self.center_layout.addWidget(self.title_label)
@@ -2340,16 +2370,24 @@ class LeftColumn(QWidget):
         self.setStyleSheet("background-color: #1A1A1A;")
 
         layout = QVBoxLayout()
-        layout.setContentsMargins(0, 20, 0, 20)
-        layout.setSpacing(15)
+        # Nine tools at 52 high with 15 between them wanted 588px of column,
+        # against the 580 a 1024x640 window leaves -- so Render still fell off
+        # the bottom. Tighter margins and spacing give the whole set room with
+        # a little to spare.
+        layout.setContentsMargins(0, 8, 0, 8)
+        layout.setSpacing(6)
 
         # Emoji render inconsistently across Windows builds and several of
         # these are hard to tell apart at 20px, so every tool carries a tooltip
         # saying what it does. There were none anywhere on this toolbar.
+        # Ordered as the job is done: mark the area, then settle how the
+        # creative looks on it, then finish. Render sat second, between two
+        # marking tools, though it is the last thing anyone does.
         items = [
             ("🖱", "Draw", "Click four corners to mark the area to fill.\n"
                            "Drag a corner to adjust it."),
-            ("📼", "Render", "Export the video with the creative composited in."),
+            ("〰", "Curve", "Bend the edges of the area around a curved\n"
+                            "screen or pillar."),
             ("👀", "Frame", "Jump to a specific frame number."),
             ("🌞", "Brightness", "Brighten or darken the inserted creative."),
             ("⛅", "Contrast", "Raise or lower the creative's contrast."),
@@ -2358,9 +2396,8 @@ class LeftColumn(QWidget):
             ("🌫", "Blend", "Match the creative's lighting, softness, grain and\n"
                             "motion blur to the footage, so it does not look\n"
                             "pasted on."),
-            ("〰", "Curve", "Bend the edges of the area around a curved\n"
-                            "screen or pillar."),
             ("❌", "Clear", "Remove the tracking from every frame."),
+            ("📼", "Render", "Export the video with the creative composited in."),
         ]
 
         self.icons = []
@@ -2598,16 +2635,18 @@ class CentralPanel(QWidget):
         self.forward_btn.setStyleSheet(self.button_style())
         self.forward_btn.clicked.connect(self.on_forward)
 
-        self.del_btn = HoverButton("D")
-        self.del_btn.setStyleSheet(self.button_style())
-        self.del_btn.setToolTip("Delete shape (D key)")
-        self.del_btn.setFixedSize(40, 40)
+        # Labelled, not lettered. "C" and "D" in circles were only legible to
+        # someone who already knew, which is nobody on their first clip.
+        self.del_btn = HoverButton("Delete")
+        self.del_btn.setStyleSheet(self.button_style(radius=8))
+        self.del_btn.setToolTip("Remove this frame's shape  (D)")
+        self.del_btn.setFixedSize(72, 34)
         self.del_btn.clicked.connect(self.on_delete_shape)
 
-        self.copy_btn = HoverButton("C")
-        self.copy_btn.setStyleSheet(self.button_style())
-        self.copy_btn.setToolTip("Copy shape from previous frame (C key)")
-        self.copy_btn.setFixedSize(40, 40)
+        self.copy_btn = HoverButton("Copy")
+        self.copy_btn.setStyleSheet(self.button_style(radius=8))
+        self.copy_btn.setToolTip("Copy the shape from the previous frame  (C)")
+        self.copy_btn.setFixedSize(72, 34)
         self.copy_btn.clicked.connect(self.on_copy_shape)
 
         self.slider = QSlider(Qt.Horizontal)
@@ -2702,16 +2741,21 @@ class CentralPanel(QWidget):
 
         logging.debug("CentralPanel initialized.")
 
-    def button_style(self):
+    def button_style(self, radius: int = 20):
+        """Shared look for the transport row.
+
+        The radius is a parameter because the same style dressed both the round
+        transport buttons and the two beside them; fixed at 20 it made a 72x34
+        button look like a squashed circle. The fixed width and height went the
+        same way -- they overrode whatever size the button had been given.
+        """
         return """
             QPushButton {
                 background: #3C3C3C;
                 border: none;
-                border-radius: 20px;
-                width: 40px;
-                height: 40px;
+                border-radius: %dpx;
                 color: white;
-            }
+            }""" % radius + """
             QPushButton:hover {
                 background-color: #505050;
             }
@@ -2854,7 +2898,6 @@ class CentralPanel(QWidget):
         self.reset_tracker()
         if len(self.tracking_overlay.points) == 4 and self.prev_frame is not None:
             self.refresh_display()
-        self.update_magnifier_dimensions()
         self.update_magnifier()
 
     def refresh_display(self):
@@ -3073,7 +3116,7 @@ class CentralPanel(QWidget):
         if self.magnifier.expanded:
             self.magnifier.setGeometry(x, y, max(1, width), max(1, height))
         else:
-            self.magnifier.move(x + 10, y + 10)
+            self.magnifier.move(*self.magnifier_corner(x, y, width, height))
         self.magnifier.raise_()
         self.tracking_overlay.raise_()
 
@@ -3255,6 +3298,48 @@ class CentralPanel(QWidget):
         magnifier.raise_()
         self.update_magnifier(force=True)
 
+    #: Smallest a single magnified view may be before it stops being one.
+    MAGNIFIER_TILE = 96
+
+    def magnifier_corner(self, x, y, width, height):
+        """Which corner of the picture the magnifier should sit in.
+
+        It used to sit in the top left whatever was underneath. Now that it is
+        sized to hold twelve views it is large enough to cover the very area
+        being worked on, which is the one thing it must not hide -- so it takes
+        whichever corner the marked area reaches into least.
+        """
+        margin = 10
+        box_w, box_h = self.magnifier.width(), self.magnifier.height()
+        corners = {
+            "top left": (x + margin, y + margin),
+            "top right": (x + width - box_w - margin, y + margin),
+            "bottom left": (x + margin, y + height - box_h - margin),
+            "bottom right": (x + width - box_w - margin,
+                             y + height - box_h - margin),
+        }
+
+        points = self.tracking_overlay.points
+        if len(points) < 2:
+            return corners["top left"]
+
+        shape = [self.tracking_overlay.raw_to_display(px, py) for px, py in points]
+        shape_box = (min(p[0] for p in shape) + x, min(p[1] for p in shape) + y,
+                     max(p[0] for p in shape) + x, max(p[1] for p in shape) + y)
+
+        def covered(position):
+            left, top = position
+            return self._overlap((left, top, left + box_w, top + box_h), shape_box)
+
+        return min(corners.values(), key=covered)
+
+    @staticmethod
+    def _overlap(a, b) -> float:
+        """Area shared by two boxes given as (left, top, right, bottom)."""
+        wide = max(0.0, min(a[2], b[2]) - max(a[0], b[0]))
+        tall = max(0.0, min(a[3], b[3]) - max(a[1], b[1]))
+        return wide * tall
+
     def update_magnifier_dimensions(self):
         shape_pts = self.tracking_overlay.points
         if len(shape_pts) < 2:
@@ -3280,6 +3365,14 @@ class CentralPanel(QWidget):
             computed_w = int(computed_h * new_aspect)
         computed_w = max(150, computed_w)
         computed_h = max(150, computed_h)
+
+        # Enough room for the views it actually has to draw. Sized for the
+        # shape alone, switching curved edges on divided the same 150 pixels
+        # twelve ways instead of four, leaving each handle a 50x37 thumbnail
+        # -- smaller than the thing it was meant to magnify.
+        columns, rows = self.magnifier.grid_shape()
+        computed_w = max(computed_w, columns * self.MAGNIFIER_TILE)
+        computed_h = max(computed_h, rows * self.MAGNIFIER_TILE)
 
         current_w = self.magnifier.width()
         current_h = self.magnifier.height()
@@ -3329,6 +3422,10 @@ class CentralPanel(QWidget):
             focus_index=focus,
             selected_control=overlay.drag_control or overlay.selected_control,
         )
+        # Sized after the views are set, not before: the grid it has to fit
+        # depends on how many handles there are, and the widget only learns
+        # that from the call above.
+        self.update_magnifier_dimensions()
 
     def magnifier_points(self):
         """What the magnifier should show: ``(points, selected, focus)``.
@@ -3723,6 +3820,7 @@ class PlacementSnapshot:
         self.colourise = placement.colourise_enabled
         self.blend = blend.BlendSettings.from_dict(placement.blend.to_dict())
         self.morph = morphlib.Morph.from_dict(placement.morph.to_dict())
+        self.shape_cache = morphlib.ShapeCache()
         self.scale = scale
         # Per-placement decode state, filled in by the worker.
         self.capture = None
@@ -3849,7 +3947,7 @@ class RenderWorker(QObject):
         if not core.is_valid_region(region):
             return base_frame
 
-        styled = morphlib.apply_morph(creative, placement.morph)
+        styled = placement.shape_cache.apply(creative, placement.morph)
         styled = core.apply_brightness_contrast(
             styled, placement.brightness, placement.contrast)
         if placement.colourise:
@@ -3882,6 +3980,11 @@ class RenderWorker(QObject):
         """The main rendering loop."""
         settings = self.settings
         base_cap = overlay_cap = out_writer = None
+        # Bound before the try so the cleanup below can always run. It used to
+        # be assigned inside, where a failure opening the base video left the
+        # name unbound and the cleanup raised on its way out, hiding whatever
+        # had actually gone wrong.
+        placements = []
         try:
             base_cap = cv2.VideoCapture(settings.base_video_path)
             if not base_cap.isOpened():
@@ -3965,10 +4068,6 @@ class RenderWorker(QObject):
 
             base_cap.release()
             base_cap = None
-            for placement in placements:
-                if placement.capture is not None:
-                    placement.capture.release()
-                    placement.capture = None
 
             if self.is_canceled:
                 out_writer.abort()
@@ -3991,6 +4090,15 @@ class RenderWorker(QObject):
             logging.exception("Render worker failed")
             self.finished.emit(f"Error: {e}")
         finally:
+            # Every placement carrying a creative video holds a capture of its
+            # own. These were released on the way out of a successful render
+            # only, so a render that failed part-way -- the case most likely to
+            # be retried, and retried again -- leaked one open file per
+            # placement each time.
+            for placement in placements:
+                if getattr(placement, "capture", None) is not None:
+                    placement.capture.release()
+                    placement.capture = None
             for handle in (base_cap, overlay_cap):
                 if handle is not None:
                     handle.release()
@@ -4058,12 +4166,20 @@ class MainWindow(QMainWindow):
 
         self.placement_list = QListWidget()
         self.placement_list.setFixedHeight(110)
+        # Elide a long name rather than growing a scrollbar under a list four
+        # rows tall; the tooltip carries the whole thing either way.
+        self.placement_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.placement_list.setTextElideMode(Qt.ElideRight)
         self.placement_list.setStyleSheet("""
             QListWidget { background-color: #222; color: #E8E8E8;
                           border: 1px solid #3A3A3A; border-radius: 6px;
                           font-size: 12px; }
             QListWidget::item { padding: 4px; }
-            QListWidget::item:selected { background-color: #00A000; color: white; }
+            /* An accent rather than a flood. Pure green across the whole row
+               shouted louder than anything else in a deliberately quiet
+               window, and it is only saying which row is selected. */
+            QListWidget::item:selected { background-color: #2E4A6B; color: white;
+                                         border-left: 3px solid #6A9FD8; }
         """)
         self.placement_list.currentRowChanged.connect(self.on_placement_selected)
         self.placement_list.itemChanged.connect(self.on_placement_item_changed)
@@ -4088,8 +4204,10 @@ class MainWindow(QMainWindow):
         self.overlay_layout.addLayout(placement_buttons)
 
         library_title = QLabel("Library")
-        library_title.setStyleSheet("color: white; font-size: 16px; font-weight: bold;")
-        library_title.setAlignment(Qt.AlignCenter)
+        # Matching Placements above it: two headings in the same column, one
+        # centred and one not, reads as a mistake.
+        library_title.setStyleSheet(
+            "color: white; font-size: 15px; font-weight: bold;")
         self.overlay_layout.addWidget(library_title)
 
         library_spacer = QSpacerItem(20, 10, QSizePolicy.Minimum, QSizePolicy.Fixed)
@@ -4136,7 +4254,11 @@ class MainWindow(QMainWindow):
         for placement in overlay.placements:
             tracked = len(placement.tracking_history)
             mark = "\u25cf" if placement.has_overlay() else "\u25cb"
-            item = QListWidgetItem(f"{mark}  {placement.name}   {tracked}f")
+            # "0f" meant nothing to anyone who had not written it. Kept short
+            # all the same: the panel is narrow, and a longer word only got
+            # elided away again.
+            count = "1 frame" if tracked == 1 else f"{tracked} frames"
+            item = QListWidgetItem(f"{mark}  {placement.name}  \u00b7  {count}")
             item.setToolTip(
                 f"{placement.name}\n"
                 f"{tracked} tracked frames\n"
@@ -4935,15 +5057,25 @@ class MainWindow(QMainWindow):
         QMessageBox.information(self, "Loaded", f"Tracking loaded from:\n{path}")
 
     def _write_aoi_file(self, path, placement, fps, video_w, video_h,
-                        first_frame, last_frame, scale) -> int:
-        """Write one placement's AOI geometry. Returns the row count."""
+                        first_frame, last_frame, scale):
+        """Write one placement's AOI geometry.
+
+        Returns ``(rows written, frames skipped)``. This is the only writer of
+        the format: the single-placement case used to have a second copy of
+        the whole thing, which had already drifted -- it labelled every file
+        "aoi1" instead of naming the placement, so which advert a file
+        described depended on how many there had been.
+        """
         frame_dict = core.interpolate_tracking(placement.tracking_history,
                                                first_frame, last_frame)
         origin = first_frame if first_frame is not None else 0
-        rows = []
+        rows, skipped = [], 0
         for frame_idx in sorted(frame_dict):
             corners = frame_dict[frame_idx]
+            # An unrenderable shape draws no advert, so it must not claim an
+            # area of interest either.
             if not core.is_valid_quad(corners):
+                skipped += 1
                 continue
             scaled = [(float(x) * scale, float(y) * scale) for x, y in corners]
             rows.append([
@@ -4967,7 +5099,7 @@ class MainWindow(QMainWindow):
                 "disc_viewable_anagle", "disc_deflection_angle", "disc_diam",
                 "points"])
             writer.writerows(rows)
-        return len(rows)
+        return len(rows), skipped
 
     def save_aoi_geometry(self):
         import csv
@@ -5014,35 +5146,6 @@ class MainWindow(QMainWindow):
         if not save_path:
             return
 
-        # Row 1 (optional)
-        row1 = [
-            f"name:aoi1",
-            "csv_type_3",
-            "width:None",
-            "height:None",
-            f"stim_width:{video_w}",
-            f"stim_height:{video_h}",
-        ]
-
-        # Row 2 (the requested header)
-        row2 = [
-            "START",
-            "END",
-            "topleft_coords_XYZ_m",
-            "topright_coords_XYZ_m",
-            "bottomleft_coords_XYZ_m",
-            "bottomright_coords_XYZ_m",
-            "top_angle_deg",
-            "left_angle_deg",
-            "bottom_angle_deg",
-            "right_angle_deg",
-            "average_dist_from_corners",
-            "disc_viewable_anagle",
-            "disc_deflection_angle",
-            "disc_diam",
-            "points"
-        ]
-
         # One AOI file per placement: an eye-tracking analysis needs to tell
         # the adverts apart, so they cannot share a single area of interest.
         placements = [pl for pl in self.central_panel.tracking_overlay.placements
@@ -5054,75 +5157,29 @@ class MainWindow(QMainWindow):
                 safe = "".join(c if c.isalnum() or c in "-_ " else "_"
                                for c in placement.name).strip().replace(" ", "_")
                 target = f"{stem}_{safe}{ext or '.csv'}"
-                rows = self._write_aoi_file(
+                rows, dropped = self._write_aoi_file(
                     target, placement, fps, video_w, video_h,
                     first_frame, last_frame, scale)
-                written.append(f"{os.path.basename(target)}  ({rows} frames)")
+                note = f"  ({rows} frames" + (f", {dropped} skipped)" if dropped
+                                              else ")")
+                written.append(os.path.basename(target) + note)
             QMessageBox.information(
                 self, "Export Complete",
                 "AOI geometry written, one file per placement:\n\n"
                 + "\n".join(written))
             return
 
-        geometry_data = []
+        # And one placement through the same writer, rather than a second copy
+        # of the format. Keeping two is how they drifted apart: the copy here
+        # headed every file "aoi1" instead of naming the placement, so which
+        # advert a file described depended on how many there had been.
+        only = (placements[0] if placements
+                else self.central_panel.tracking_overlay.active)
+        written, skipped = self._write_aoi_file(
+            save_path, only, fps, video_w, video_h,
+            first_frame, last_frame, scale)
 
-        # Interpolate exactly as the renderer does. Exporting only the frames
-        # that happen to be keyed would leave holes in the AOI wherever the
-        # user scrubbed or re-adjusted, so a fixation landing on the ad during
-        # a gap would not be attributed to it -- quietly under-counting dwell
-        # time and fixation counts. It would also disagree with the rendered
-        # video, which draws the ad on every frame in the range.
-        frame_dict = core.interpolate_tracking(
-            self.central_panel.tracking_overlay.tracking_history,
-            first_frame, last_frame)
-
-        origin = first_frame if first_frame is not None else 0
-        skipped = 0
-
-        # Sort the frame numbers so CSV rows are in ascending order
-        for frame_idx in sorted(frame_dict.keys()):
-            corners = frame_dict[frame_idx]
-
-            # An unrenderable shape draws no advert, so it must not claim an
-            # area of interest either.
-            if not core.is_valid_quad(corners):
-                skipped += 1
-                continue
-
-            # Times are relative to the start of the rendered file.
-            start_time = (frame_idx - origin) / fps
-            end_time = (frame_idx - origin + 1) / fps
-
-            # Coordinates must be in the rendered file's pixel space.
-            scaled = [(float(x) * scale, float(y) * scale) for x, y in corners]
-            points_str = ";".join(f"{v:.4f}" for point in scaled for v in point)
-
-            row_out = [
-                f"{start_time:.3f}",
-                f"{end_time:.3f}",
-                "0; 0; 0",
-                "0; 0; 0",
-                "0; 0; 0",
-                "0; 0; 0",
-                "None",
-                "None",
-                "None",
-                "None",
-                "0",
-                "None",
-                "None",
-                "None",
-                points_str
-            ]
-            geometry_data.append(row_out)
-
-        with open(save_path, "w", newline='', encoding="utf-8") as csvfile:
-            writer = csv.writer(csvfile, delimiter=',')  # or delimiter=';'
-            writer.writerow(row1)
-            writer.writerow(row2)
-            writer.writerows(geometry_data)
-
-        if not geometry_data:
+        if not written:
             QMessageBox.warning(
                 self, "Nothing Exported",
                 "No usable tracking data, so an empty AOI file was written.\n\n"
@@ -5130,19 +5187,17 @@ class MainWindow(QMainWindow):
                 "exporting.")
             return
 
-        detail = (f"{len(geometry_data)} frames, "
-                  f"{geometry_data[0][0]}s–{geometry_data[-1][1]}s, "
-                  f"{video_w}×{video_h}")
+        detail = f"{written} frames, {video_w}\u00d7{video_h}"
         if render:
             detail += f"\nMatched to: {os.path.basename(render['out_path'])}"
         else:
-            detail += "\n\n⚠  Describes the full-resolution source video."
+            detail += "\n\n\u26a0  Describes the full-resolution source video."
         if skipped:
             detail += f"\n{skipped} frame(s) skipped: the shape was unrenderable."
 
         QMessageBox.information(self, "Export Complete",
-                                f"AOI geometry saved to:\n{save_path}\n\n{detail}")
-
+                                f"AOI geometry written to:\n{save_path}\n\n{detail}")
+        return
 
     def upload_base_video(self):
         if not self.confirm_discard("Loading another video will replace it."):
@@ -5245,7 +5300,9 @@ class MainWindow(QMainWindow):
         name = os.path.basename(file_path)
         ext_label = QLabel(name)
         ext_label.setStyleSheet("color: white; font-size: 11px;")
-        ext_label.setFixedHeight(18)
+        # Its own font decides the height. A round 18 clipped the descenders,
+        # so "ad.png" read as "ad.pnq".
+        ext_label.setFixedHeight(ext_label.fontMetrics().height() + 2)
         ext_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         ext_label.setToolTip(file_path)
         metrics = ext_label.fontMetrics()
