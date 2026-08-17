@@ -3789,12 +3789,14 @@ class CentralPanel(QWidget):
         self.current_frame_index = 0
         self.reset_tracker()
 
-        ret, frame = self.cap.read()
-        if ret:
-            self.prev_frame = frame
-            self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-            self.read_frame()
-        else:
+        # One decode, not two: read_frame() decodes frame 0 and records it as
+        # prev_frame itself. The old pre-read-then-seek-back decoded the same
+        # frame twice on every load. prev_frame is cleared first so a clip
+        # whose first frame will not decode is caught rather than masked by
+        # the previous video's frame.
+        self.prev_frame = None
+        self.read_frame()
+        if self.prev_frame is None:
             logging.error("Failed to read initial frame from video.")
             return
 
