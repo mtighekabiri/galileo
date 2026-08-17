@@ -37,6 +37,7 @@ EXCLUDES = [
     "PyQt5.QtQuick3D", "PyQt5.QtBluetooth", "PyQt5.QtNfc", "PyQt5.QtDesigner",
     "PyQt5.QtHelp", "PyQt5.QtLocation", "PyQt5.QtPositioning", "PyQt5.QtSql",
     "PyQt5.QtTest", "PyQt5.QtXmlPatterns", "PyQt5.Qt3DCore",
+    "PyQt5.QtMultimedia", "PyQt5.QtMultimediaWidgets",
     # Other GUI toolkits, and heavy scientific packages nothing here imports.
     "PySide2", "PySide6", "PyQt6", "tkinter", "matplotlib", "scipy", "pandas",
     "IPython", "jupyter", "notebook", "pytest", "setuptools", "pip",

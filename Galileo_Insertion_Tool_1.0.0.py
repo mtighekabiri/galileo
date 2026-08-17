@@ -23,8 +23,6 @@ from PyQt5.QtWidgets import (
     QListWidget, QListWidgetItem, QWIDGETSIZE_MAX)
 from PyQt5.QtGui import (
     QCursor, QPixmap, QColor, QPainter, QBrush, QPen, QImage, QPolygonF)
-from PyQt5.QtMultimedia import QMediaPlayer, QMediaContent
-from PyQt5.QtMultimediaWidgets import QVideoWidget
 
 def app_directory() -> str:
     """Where the application lives — the bundle folder when packaged."""
@@ -5917,15 +5915,6 @@ class MainWindow(QMainWindow):
                 % ("#00A000" if card.inserted else "#2A2A2A"))
         if self.inserted_overlay_widget is not None:
             self.inserted_overlay_widget = None
-
-    def make_video_click_handler(self, player, original_event):
-        def handler(event):
-            if player.state() == QMediaPlayer.PlayingState:
-                player.pause()
-            else:
-                player.play()
-            original_event(event)
-        return handler
 
 if __name__ == '__main__':
     logging.debug("Application about to start QApplication")
