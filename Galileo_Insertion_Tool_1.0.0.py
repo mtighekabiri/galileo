@@ -68,12 +68,15 @@ def user_data_directory() -> str:
 
 LOG_PATH = os.path.join(user_data_directory(), "app_debug.log")
 
+# INFO by default: the frame loop and the widgets log at DEBUG, and writing
+# every one of those lines to disk for a whole session is a per-frame cost
+# nobody reads. GALILEO_DEBUG=1 restores the full firehose for support.
 logging.basicConfig(
     filename=LOG_PATH,
     filemode='w',
-    level=logging.DEBUG,
+    level=logging.DEBUG if os.environ.get("GALILEO_DEBUG") else logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s')
-logging.debug("Application start; log at %s", LOG_PATH)
+logging.info("Application start; log at %s", LOG_PATH)
 
 # Let a bundled ffmpeg and the segmentation model sitting beside the
 # application be found, so audio and occlusion work without anything installed.
@@ -82,9 +85,9 @@ for _directory in (app_directory(), resource_directory()):
     core.register_model_dir(_directory)
     core.register_model_dir(os.path.join(_directory, core.MODEL_DIR_NAME))
 
-logging.debug("Frozen: %s | app dir: %s | resources: %s",
-              bool(getattr(sys, "frozen", False)), app_directory(),
-              resource_directory())
+logging.info("Frozen: %s | app dir: %s | resources: %s",
+             bool(getattr(sys, "frozen", False)), app_directory(),
+             resource_directory())
 
 
 def log_optional_components():
@@ -622,7 +625,6 @@ class HoverButton(QPushButton):
         self.hover_effect = None
 
     def enterEvent(self, event):
-        logging.debug(f"Hover enter on button '{self.text()}'")
         self.setCursor(QCursor(Qt.PointingHandCursor))
         self.hover_effect = QGraphicsDropShadowEffect(self)
         self.hover_effect.setBlurRadius(15)
@@ -632,7 +634,6 @@ class HoverButton(QPushButton):
         super(HoverButton, self).enterEvent(event)
 
     def leaveEvent(self, event):
-        logging.debug(f"Hover leave on button '{self.text()}'")
         self.setGraphicsEffect(None)
         self.hover_effect = None
         super(HoverButton, self).leaveEvent(event)
@@ -5927,7 +5928,7 @@ class MainWindow(QMainWindow):
             self.inserted_overlay_widget = None
 
 if __name__ == '__main__':
-    logging.debug("Application about to start QApplication")
+    logging.info("Application about to start QApplication")
     app = QApplication(sys.argv)
     app.setStyleSheet("""
     * {
@@ -5936,7 +5937,7 @@ if __name__ == '__main__':
     """)
     window = MainWindow()
     window.show()
-    logging.debug("Entering app event loop")
+    logging.info("Entering app event loop")
     # Time-to-first-paint marker: fires once the event loop goes idle, which
     # is only after the window has been laid out and painted. The diagnostic
     # probes run in the same turn, after the user already has a window.
