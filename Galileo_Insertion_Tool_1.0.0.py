@@ -9,7 +9,8 @@ import json
 import galileo_core as core
 import galileo_blend as blend
 import galileo_morph as morphlib
-import galileo_deflicker as deflicker
+# galileo_deflicker is imported where it is used: nothing needs it until a
+# video is loaded, so it stays off the startup path.
 
 from PyQt5.QtCore import (
     QObject, QThread, pyqtSignal, Qt, QSize, QUrl, QEvent, QTimer, QPoint, QRect,
@@ -2448,11 +2449,13 @@ class TitleBar(QWidget):
         self.title_label.setAlignment(Qt.AlignCenter)
         
         self.logo_label = QLabel()
-        # A missing file gives a null pixmap rather than raising, so the
-        # except this used to sit behind could never fire. Hidden rather than
-        # given placeholder text: the word "Logo" sitting beside the title is
-        # more obviously missing than a title with nothing after it.
-        logo = QPixmap(os.path.join(resource_directory(), "logo.png"))
+        # Hidden rather than given placeholder text when the file is absent:
+        # the word "Logo" sitting beside the title is more obviously missing
+        # than a title with nothing after it. The exists() check first --
+        # a missing file gives a null pixmap rather than raising, but only
+        # after QPixmap has tried every image plugin against it.
+        logo_path = os.path.join(resource_directory(), "logo.png")
+        logo = QPixmap(logo_path) if os.path.exists(logo_path) else QPixmap()
         if logo.isNull():
             logging.debug("no logo.png alongside the application")
             self.logo_label.hide()
@@ -3899,6 +3902,7 @@ class CentralPanel(QWidget):
         path = getattr(self, "current_video_path", None)
         if not path:
             return None
+        import galileo_deflicker as deflicker
         try:
             self.flicker_report = deflicker.scan(path)
         except cv2.error as exc:
@@ -3927,6 +3931,7 @@ class CentralPanel(QWidget):
         mode = "auto"
         if self.flicker_report is not None and self.flicker_report.kind != "steady":
             mode = self.flicker_report.kind
+        import galileo_deflicker as deflicker
         self.deflicker = deflicker.Deflicker.measure(path, mode=mode,
                                                      progress=progress)
         # The frame on screen was decoded before this existed, so re-read it
