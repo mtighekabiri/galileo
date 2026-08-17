@@ -1819,9 +1819,10 @@ class TrackingOverlay(QWidget):
                     hover_idx = i
                     break
 
-            if hover_idx != self.active_point_index:
-                self.active_point_index = hover_idx
-                self.shape_changed.emit()
+            # Only note it. Nothing reads active_point_index to paint, and
+            # emitting shape_changed here recomposited the whole frame every
+            # time the pointer crossed a handle.
+            self.active_point_index = hover_idx
 
         super(TrackingOverlay, self).mouseMoveEvent(event)
 
@@ -2773,7 +2774,7 @@ class CentralPanel(QWidget):
         self.tracking_overlay.setFocusPolicy(Qt.StrongFocus)
         self.tracking_overlay.raise_()
         self.tracking_overlay.hide()
-        self.tracking_overlay.shape_changed.connect(self.on_shape_changed)
+        self.tracking_overlay.shape_changed.connect(self._queue_shape_refresh)
         self.tracking_overlay.selection_changed.connect(self.update_magnifier)
 
         # Frame label
@@ -2954,6 +2955,10 @@ class CentralPanel(QWidget):
         self.frame_timer = QTimer()
         self.frame_timer.setInterval(100)
         self.frame_timer.timeout.connect(self.update_frame_label)
+
+        # Whether a coalesced shape refresh is already scheduled for this
+        # event-loop turn.
+        self._shape_refresh_queued = False
 
         # Focus
         self.setFocusPolicy(Qt.StrongFocus)
@@ -3149,6 +3154,20 @@ class CentralPanel(QWidget):
         # this a longer name was simply cut off mid-word.
         self.tracking_label.setMinimumWidth(
             max(150, self.tracking_label.sizeHint().width()))
+
+    def _queue_shape_refresh(self):
+        # Coalesce bursts. A corner drag emits shape_changed for every mouse
+        # position, and each one used to recomposite the whole frame; one
+        # composite at the end of the event-loop turn shows the same final
+        # geometry. Direct calls to on_shape_changed stay synchronous.
+        if self._shape_refresh_queued:
+            return
+        self._shape_refresh_queued = True
+        QTimer.singleShot(0, self._flush_shape_refresh)
+
+    def _flush_shape_refresh(self):
+        self._shape_refresh_queued = False
+        self.on_shape_changed()
 
     def on_shape_changed(self):
         # A hand edit invalidates the tracker's anchor, so drop it; it will be
