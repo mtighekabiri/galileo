@@ -4594,9 +4594,40 @@ class MainWindow(QMainWindow):
         self.last_render = None
         self.pending_render = None
         self.last_output_dir = ""
+
+        # One timer animates every video card in the library, at a thumbnail
+        # rate. A timer per card at the clip's own fps meant three loaded
+        # creatives ran three full-rate decode loops on the GUI thread for
+        # 200-pixel previews.
+        self.card_preview_updaters = []
+        self.card_preview_timer = QTimer(self)
+        self.card_preview_timer.setInterval(100)
+        self.card_preview_timer.timeout.connect(self._tick_card_previews)
+
         self.refresh_title()
         self.refresh_placement_list()
         logging.info("MainWindow constructed")
+
+    def register_card_preview(self, widget, advance):
+        """Animate a library card's thumbnail on the shared preview timer."""
+        self.card_preview_updaters.append((widget, advance))
+        if not self.card_preview_timer.isActive():
+            self.card_preview_timer.start()
+
+    def deregister_card_preview(self, widget):
+        self.card_preview_updaters = [
+            (w, fn) for w, fn in self.card_preview_updaters if w is not widget]
+        if not self.card_preview_updaters:
+            self.card_preview_timer.stop()
+
+    def _tick_card_previews(self):
+        # Thumbnails yield to real playback: while the main video runs, the
+        # GUI thread's spare time belongs to it, and the cards hold still.
+        if self.central_panel.playing:
+            return
+        for widget, advance in list(self.card_preview_updaters):
+            if getattr(widget, "preview_playing", False):
+                advance()
 
     # -- unsaved work ------------------------------------------------------
 
@@ -5688,7 +5719,7 @@ class MainWindow(QMainWindow):
         overlay_widget.video_path = None
         overlay_widget.image_path = None
         overlay_widget.pixmap = None
-        overlay_widget.preview_timer = None
+        overlay_widget.preview_playing = False
         overlay_widget.preview_cap = None
 
         # This is the main vertical layout for the entire widget card.
@@ -5793,42 +5824,43 @@ class MainWindow(QMainWindow):
             preview_label.setCursor(QCursor(Qt.PointingHandCursor))
             overlay_layout.addWidget(preview_label)
 
-            # Create a VideoCapture and QTimer specific to this widget
+            # A VideoCapture specific to this widget, advanced by the shared
+            # card timer rather than a timer of its own.
             overlay_widget.preview_cap = cv2.VideoCapture(file_path)
-            overlay_widget.preview_timer = QTimer(overlay_widget) # Parent to the widget
+            overlay_widget.preview_playing = True
 
             def update_preview_frame():
-                if not overlay_widget.preview_cap or not overlay_widget.preview_cap.isOpened():
+                cap = overlay_widget.preview_cap
+                if not cap or not cap.isOpened():
                     return
-                
-                ret, frame = overlay_widget.preview_cap.read()
+
+                ret, frame = cap.read()
                 if not ret: # If end of video, loop back to the start
-                    overlay_widget.preview_cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                    ret, frame = overlay_widget.preview_cap.read()
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                    ret, frame = cap.read()
                     if not ret: return
 
+                # Shrink to the card first: colour-converting and smooth-
+                # scaling the full-resolution frame per tick was the bulk of
+                # the cost of having a video in the library at all.
+                h, w = frame.shape[:2]
+                if w > 200:
+                    frame = cv2.resize(frame, (200, max(1, round(h * 200 / w))),
+                                       interpolation=cv2.INTER_AREA)
                 frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 h, w, ch = frame_rgb.shape
-                bytes_per_line = ch * w
-                q_img = QImage(frame_rgb.data, w, h, bytes_per_line, QImage.Format_RGB888)
-                pixmap = QPixmap.fromImage(q_img)
-                preview_label.setPixmap(pixmap.scaledToWidth(200, Qt.SmoothTransformation))
+                q_img = QImage(frame_rgb.data, w, h, ch * w,
+                               QImage.Format_RGB888)
+                preview_label.setPixmap(QPixmap.fromImage(q_img))
 
             def toggle_preview_playback(event):
-                if overlay_widget.preview_timer.isActive():
-                    overlay_widget.preview_timer.stop()
-                else:
-                    overlay_widget.preview_timer.start()
+                overlay_widget.preview_playing = not overlay_widget.preview_playing
                 event.accept()
 
             preview_label.mousePressEvent = toggle_preview_playback
 
             if overlay_widget.preview_cap.isOpened():
-                fps = overlay_widget.preview_cap.get(cv2.CAP_PROP_FPS)
-                interval = int(1000 / fps) if fps > 0 else 40 # Default to 25fps
-                overlay_widget.preview_timer.setInterval(interval)
-                overlay_widget.preview_timer.timeout.connect(update_preview_frame)
-                overlay_widget.preview_timer.start()
+                self.register_card_preview(overlay_widget, update_preview_frame)
             else:
                 preview_label.setText("Preview failed")
 
@@ -5840,8 +5872,7 @@ class MainWindow(QMainWindow):
             if confirm == QMessageBox.Yes:
                 if overlay_widget.inserted:
                     uninsert_overlay()
-                if overlay_widget.preview_timer:
-                    overlay_widget.preview_timer.stop()
+                self.deregister_card_preview(overlay_widget)
                 if overlay_widget.preview_cap:
                     overlay_widget.preview_cap.release()
                 overlay_widget.deleteLater()
