@@ -161,6 +161,83 @@ class TestCurved:
         assert out.dtype == np.uint8
 
 
+class TestSmoothness:
+    def _stripes(self):
+        """A full-resolution creative of 1px lines, the worst case for a warp."""
+        stripes = np.zeros((400, 400, 4), np.uint8)
+        stripes[:, :, 3] = 255
+        stripes[::2, :, :3] = 255
+        return stripes
+
+    SMALL_QUAD = np.float32([[200, 100], [280, 104], [278, 180], [202, 176]])
+
+    def test_fine_artwork_is_averaged_not_point_sampled(self, base):
+        """Squeezed into a small quad, 1px stripes must melt to an even grey.
+
+        A plain INTER_LINEAR warp point-samples the artwork, turning them into
+        coarse moire bands that swing the full 0-255 range and crawl as the
+        surface moves -- the jagged, shimmering lines complaint.
+        """
+        out = core.composite_overlay(base, self._stripes(), self.SMALL_QUAD)
+        inside = cv2.erode(core.quad_to_mask(self.SMALL_QUAD, 640, 360),
+                           np.ones((9, 9), np.uint8)) > 0
+        values = out[inside].astype(np.float32)
+        assert 90 < values.mean() < 165
+        assert values.std() < 40
+
+    def test_fine_artwork_is_averaged_on_the_curved_path_too(self, base):
+        region = core.Region(self.SMALL_QUAD, curved=True)
+        bend_edge(region, 0, [0, -6])
+        out = core.composite_region(base, self._stripes(), region)
+        inside = cv2.erode(core.quad_to_mask(self.SMALL_QUAD, 640, 360),
+                           np.ones((11, 11), np.uint8)) > 0
+        values = out[inside].astype(np.float32)
+        assert 90 < values.mean() < 165
+        assert values.std() < 40
+
+    def test_no_dark_fringe_around_an_opaque_insert(self):
+        """Warping colour and alpha separately bled the border's black into
+        edge pixels, outlining a bright insert on a bright base with a dark
+        halo. Premultiplied colour must never dip below either side."""
+        bright = np.full((360, 640, 3), 200, np.uint8)
+        overlay = np.full((100, 100, 4), 255, np.uint8)
+        out = core.composite_overlay(bright, overlay, QUAD)
+        assert int(out.min()) >= 198
+
+    def test_slanted_edges_carry_intermediate_coverage(self):
+        """A smooth edge is a ramp of part-covered pixels, not a 0/255 step."""
+        dark = np.zeros((360, 640, 3), np.uint8)
+        overlay = np.full((100, 100, 4), 255, np.uint8)
+        out = core.composite_overlay(dark, overlay, QUAD)
+        ramp = (out[:, :, 0] > 31) & (out[:, :, 0] < 224)
+        assert int(np.count_nonzero(ramp)) >= 100
+
+    def test_supersampling_does_not_shift_the_insert(self, base):
+        """The half-pixel bookkeeping must keep the insert exactly in place.
+
+        With symmetric anti-aliasing, the coverage-weighted centre of the
+        painted area equals the quad polygon's own centroid; any systematic
+        shift from the supersampling grid would move it.
+        """
+        overlay = np.full((100, 100, 4), 255, np.uint8)
+        out = core.composite_overlay(base, overlay, QUAD)
+
+        weight = np.clip(out[:, :, 0].astype(np.float64) - 60, 0, None)
+        ys, xs = np.mgrid[0:360, 0:640]
+        painted_x = float((xs * weight).sum() / weight.sum())
+        painted_y = float((ys * weight).sum() / weight.sum())
+
+        x, y = QUAD[:, 0].astype(np.float64), QUAD[:, 1].astype(np.float64)
+        xn, yn = np.roll(x, -1), np.roll(y, -1)
+        cross = x * yn - xn * y
+        area = cross.sum() / 2.0
+        centroid_x = float(((x + xn) * cross).sum() / (6.0 * area))
+        centroid_y = float(((y + yn) * cross).sum() / (6.0 * area))
+
+        assert abs(painted_x - centroid_x) < 0.5
+        assert abs(painted_y - centroid_y) < 0.5
+
+
 class TestColour:
     def test_brightness_leaves_alpha_untouched(self):
         img = np.zeros((10, 10, 4), np.uint8)
@@ -187,3 +264,15 @@ class TestColour:
         out = core.apply_colourise(overlay, base, QUAD)
         assert out.shape[2] == 4
         assert np.all(out[:, :, 3] == 128)
+
+    def test_colourise_measures_only_what_the_quad_covers(self):
+        """A diamond quad's bounding box is half background. Colours from
+        around the surface must not pull the transfer off the surface."""
+        scene = np.zeros((360, 640, 3), np.uint8)
+        scene[:, :] = (0, 255, 0)                       # green surroundings
+        diamond = np.float32([[320, 40], [520, 180], [320, 320], [120, 180]])
+        cv2.fillPoly(scene, [diamond.astype(np.int32)], (0, 0, 255))  # red surface
+        overlay = np.full((80, 80, 4), 255, np.uint8)
+        overlay[:, :, :3] = 128
+        out = core.apply_colourise(overlay, scene, diamond)
+        assert float(out[:, :, 2].mean()) > float(out[:, :, 1].mean()) + 30

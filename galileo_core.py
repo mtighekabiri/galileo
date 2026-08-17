@@ -139,17 +139,30 @@ def apply_brightness_contrast(img: np.ndarray, brightness: float = 0.0,
     return cv2.convertScaleAbs(img, alpha=contrast, beta=brightness)
 
 
-def _lab_mean_std(lab: np.ndarray):
+def _lab_mean_std(lab: np.ndarray, mask: np.ndarray = None):
+    if mask is not None:
+        pixels = lab.reshape(-1, 3)[np.asarray(mask).reshape(-1) > 0]
+        # Below a handful of pixels the statistics are noise; fall through to
+        # the whole image rather than transfer garbage.
+        if len(pixels) >= 16:
+            means = pixels.mean(axis=0)
+            stds = pixels.std(axis=0)
+            return tuple(map(float, means)), tuple(map(float, stds))
     l, a, b = cv2.split(lab)
     return (l.mean(), a.mean(), b.mean()), (l.std(), a.std(), b.std())
 
 
-def color_transfer(source_bgr: np.ndarray, target_bgr: np.ndarray) -> np.ndarray:
+def color_transfer(source_bgr: np.ndarray, target_bgr: np.ndarray,
+                   target_mask: np.ndarray = None) -> np.ndarray:
     """Shift ``source`` to carry ``target``'s colour statistics (Reinhard).
 
     This is what makes an inserted creative sit in the scene's lighting rather
     than looking pasted on: the mean and spread of each L*a*b* channel are
     matched to the region of the base frame the creative will cover.
+
+    ``target_mask`` restricts which of the target's pixels are measured, so a
+    caller holding a bounding box can still take its statistics from the
+    surface alone rather than whatever surrounds it.
     """
     if source_bgr is None or target_bgr is None:
         return source_bgr
@@ -160,7 +173,7 @@ def color_transfer(source_bgr: np.ndarray, target_bgr: np.ndarray) -> np.ndarray
     tgt_lab = cv2.cvtColor(target_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
 
     s_means, s_stds = _lab_mean_std(src_lab)
-    t_means, t_stds = _lab_mean_std(tgt_lab)
+    t_means, t_stds = _lab_mean_std(tgt_lab, target_mask)
 
     for c in range(3):
         src_lab[..., c] = ((src_lab[..., c] - s_means[c])
@@ -187,7 +200,11 @@ def apply_colourise(overlay_bgra: np.ndarray, base_bgr: np.ndarray,
 
     has_alpha = overlay_bgra.ndim == 3 and overlay_bgra.shape[2] == 4
     bgr = overlay_bgra[:, :, :3] if has_alpha else overlay_bgra
-    transferred = color_transfer(bgr, region)
+    # Measure through the quad's own mask: the bounding box of a rotated or
+    # perspective quad is largely *around* the surface, and the wall behind a
+    # tilted billboard used to pull the transfer off the surface's colour.
+    inside = quad_to_mask(quad, x1 - x0, y1 - y0, offset=(x0, y0))
+    transferred = color_transfer(bgr, region, target_mask=inside)
 
     if strength < 1.0:
         transferred = cv2.addWeighted(transferred, strength, bgr, 1.0 - strength, 0)
@@ -222,8 +239,8 @@ def load_image_bgra(path: str) -> np.ndarray:
     return to_bgra(img)
 
 
-def _apply_occlusion(alpha: np.ndarray, occlusion, box) -> np.ndarray:
-    """Hold the insert back wherever something is in front of the surface.
+def _occlusion_factor(occlusion, box):
+    """Per-pixel keep fraction from an occlusion mask, or ``None`` for none.
 
     ``occlusion`` is a frame-sized mask where 255 means "this pixel belongs to
     something nearer than the surface". Scaling the creative's alpha by its
@@ -231,13 +248,131 @@ def _apply_occlusion(alpha: np.ndarray, occlusion, box) -> np.ndarray:
     having it painted over them.
     """
     if occlusion is None:
-        return alpha
+        return None
     x0, y0, x1, y1 = box
     patch = occlusion[y0:y1, x0:x1]
-    if patch.shape[:2] != alpha.shape[:2]:
-        patch = cv2.resize(patch, (alpha.shape[1], alpha.shape[0]),
+    if patch.shape[:2] != (y1 - y0, x1 - x0):
+        patch = cv2.resize(patch, (x1 - x0, y1 - y0),
                            interpolation=cv2.INTER_LINEAR)
-    return alpha * (1.0 - patch.astype(np.float32) / 255.0)
+    return 1.0 - patch.astype(np.float32) / 255.0
+
+
+#: How finely the compositor rasterises before averaging back to the frame.
+#: Warping and masking at twice the resolution and box-filtering down gives
+#: every edge pixel a true coverage fraction instead of a hit-or-miss sample,
+#: which is what turns a stair-stepped diagonal into a smooth line. 2 is
+#: visually sufficient; higher factors cost quadratically.
+SUPERSAMPLE = 2
+
+#: Refuse supersampled intermediates beyond this many pixels. An insert
+#: covering an entire 4K frame drops back to plain resolution rather than
+#: allocating enormous scratch buffers.
+_SUPERSAMPLE_BUDGET = 16_000_000
+
+
+def _supersample_factor(roi_w: int, roi_h: int) -> int:
+    factor = SUPERSAMPLE
+    while factor > 1 and roi_w * roi_h * factor * factor > _SUPERSAMPLE_BUDGET:
+        factor -= 1
+    return factor
+
+
+def _quad_pixel_size(points):
+    """The quad's on-screen extent, as mean lengths of opposite edge pairs."""
+    q = as_quad(points)
+    width = (np.linalg.norm(q[1] - q[0]) + np.linalg.norm(q[2] - q[3])) / 2.0
+    height = (np.linalg.norm(q[3] - q[0]) + np.linalg.norm(q[2] - q[1])) / 2.0
+    return float(width), float(height)
+
+
+def _premultiplied(overlay_bgra: np.ndarray) -> np.ndarray:
+    """The overlay with its colour scaled by its own alpha, still uint8 BGRA.
+
+    Resampling a straight-alpha image drags in whatever colour sits behind
+    its transparent pixels -- black, in the case of the warp's constant
+    border -- and that used to draw a dark fringe around every insert. A
+    premultiplied transparent pixel contributes nothing however it is
+    filtered, so edges keep the colour of the artwork.
+    """
+    if cv2.minMaxLoc(cv2.extractChannel(overlay_bgra, 3))[0] == 255:
+        return overlay_bgra          # fully opaque: premultiplying is identity
+    b, g, r, alpha = cv2.split(overlay_bgra)
+    scaled = [cv2.multiply(channel, alpha, scale=1.0 / 255.0)
+              for channel in (b, g, r)]
+    return cv2.merge(scaled + [alpha])
+
+
+def _prescaled_for(packed: np.ndarray, quad_w: float, quad_h: float,
+                   supersample: int) -> np.ndarray:
+    """Shrink an oversized creative towards its on-screen size first.
+
+    A warp reads only a 2x2 neighbourhood per output pixel, so squeezing a
+    full-resolution creative straight into a small quad point-samples the
+    artwork: thin lines come out staircased and shimmer as the surface moves.
+    An area-filtered reduction to a little above the quad's own size (times
+    the supersampling) makes the warp's taps genuinely cover the source,
+    which is what keeps fine detail smooth. Never upscales.
+    """
+    oh, ow = packed.shape[:2]
+    headroom = 1.25   # perspective packs the far edge denser than the mean
+    target_w = min(ow, max(1, int(np.ceil(quad_w * supersample * headroom))))
+    target_h = min(oh, max(1, int(np.ceil(quad_h * supersample * headroom))))
+    if target_w > ow * 0.8 and target_h > oh * 0.8:
+        return packed             # too small a reduction to be worth a pass
+    return cv2.resize(packed, (target_w, target_h),
+                      interpolation=cv2.INTER_AREA)
+
+
+def _blend_into(out: np.ndarray, box, warped: np.ndarray, mask: np.ndarray,
+                opacity: float, occlusion, supersample: int) -> np.ndarray:
+    """Average a supersampled warp down and lay it onto the frame.
+
+    ``warped`` is the premultiplied creative and ``mask`` the coverage
+    raster, both at ``supersample`` times the ROI's resolution. Everything
+    that shapes the composite at sub-pixel scale -- the artwork's own alpha
+    and the quad outline -- is folded in *before* the average, so the
+    downsample itself produces the smooth edge.
+    """
+    x0, y0, x1, y1 = box
+    # Fold the outline into the premultiplied creative while still uint8 and
+    # still supersampled: alpha and coverage must meet *before* the average,
+    # or their sub-pixel correlation -- the smooth edge itself -- is lost.
+    # Staying in uint8 keeps this real-time; the cost is under half a level
+    # of rounding noise.
+    mask4 = cv2.merge([mask, mask, mask, mask])
+    shaped = cv2.multiply(warped, mask4, scale=1.0 / 255.0)
+    if supersample > 1:
+        shaped = cv2.resize(shaped, (x1 - x0, y1 - y0),
+                            interpolation=cv2.INTER_AREA)
+
+    alpha8 = cv2.extractChannel(shaped, 3)
+    if not cv2.countNonZero(alpha8):
+        return out
+
+    if opacity >= 1.0 and occlusion is None:
+        # The common case never leaves uint8: out = roi*(1-a) + colour*a with
+        # the colour already premultiplied. Saturating SIMD arithmetic, at a
+        # cost of one rounding step against the float path.
+        inverse = cv2.merge([255 - alpha8] * 3)
+        kept = cv2.multiply(out[y0:y1, x0:x1], inverse, scale=1.0 / 255.0)
+        out[y0:y1, x0:x1] = cv2.add(kept, shaped[:, :, :3])
+        return out
+
+    alpha = alpha8.astype(np.float32) / 255.0
+    premult = shaped[:, :, :3].astype(np.float32)
+    if opacity < 1.0:
+        scale = float(max(0.0, opacity))
+        alpha *= scale
+        premult *= scale
+    keep = _occlusion_factor(occlusion, box)
+    if keep is not None:
+        alpha *= keep
+        premult *= keep[:, :, None]
+
+    roi = out[y0:y1, x0:x1].astype(np.float32)
+    blended = roi * (1.0 - alpha[:, :, None]) + premult
+    out[y0:y1, x0:x1] = np.clip(blended, 0, 255).astype(np.uint8)
+    return out
 
 
 def composite_overlay(base_bgr: np.ndarray, overlay: np.ndarray, quad,
@@ -246,9 +381,13 @@ def composite_overlay(base_bgr: np.ndarray, overlay: np.ndarray, quad,
     """Warp ``overlay`` into ``quad`` on ``base_bgr`` with real alpha blending.
 
     The creative's own alpha channel is honoured and multiplied by an
-    anti-aliased quad mask, so transparent PNGs stay transparent and edges do
-    not stair-step. Work is confined to the quad's bounding box, so cost
-    scales with the size of the insert rather than the size of the frame.
+    anti-aliased quad mask, so transparent PNGs stay transparent. Colour
+    travels premultiplied by alpha, the creative is area-reduced towards its
+    on-screen size before the warp, and the composite is rasterised at
+    ``SUPERSAMPLE`` times the frame's resolution then averaged down -- which
+    together keep both the insert's outline and the fine lines of its artwork
+    smooth instead of stair-stepped. Work is confined to the quad's bounding
+    box, so cost scales with the size of the insert rather than the frame.
 
     Pass ``occlusion`` (a frame-sized mask, 255 where something is in front of
     the surface) to have the insert render behind it.
@@ -269,11 +408,20 @@ def composite_overlay(base_bgr: np.ndarray, overlay: np.ndarray, quad,
         return out  # entirely off-screen
     x0, y0, x1, y1 = box
     roi_w, roi_h = x1 - x0, y1 - y0
+    supersample = _supersample_factor(roi_w, roi_h)
 
-    overlay = to_bgra(overlay)
-    oh, ow = overlay.shape[:2]
+    packed = _premultiplied(to_bgra(overlay))
+    quad_w, quad_h = _quad_pixel_size(quad)
+    packed = _prescaled_for(packed, quad_w, quad_h, supersample)
+    oh, ow = packed.shape[:2]
 
-    src = np.float32([[0, 0], [ow, 0], [ow, oh], [0, oh]])
+    # OpenCV samples pixel *centres* at integer coordinates, so the content
+    # of an ow-wide image spans [-0.5, ow-0.5]. Mapping that extent onto the
+    # quad puts the artwork exactly where the corners say; the plain [0, ow]
+    # convention leaves everything half a source pixel off towards the
+    # top-left, which at magnification is a visible misplacement.
+    src = np.float32([[-0.5, -0.5], [ow - 0.5, -0.5],
+                      [ow - 0.5, oh - 0.5], [-0.5, oh - 0.5]])
     dst = as_quad(quad)
     try:
         # Exact for a 4-point correspondence; findHomography would fit the
@@ -283,28 +431,24 @@ def composite_overlay(base_bgr: np.ndarray, overlay: np.ndarray, quad,
         logger.debug("composite skipped: could not solve perspective transform")
         return out
 
-    # Fold the ROI translation into the warp so we only rasterise the box.
-    translate = np.array([[1, 0, -x0], [0, 1, -y0], [0, 0, 1]], dtype=np.float64)
+    # Fold the ROI translation and the supersampling into the warp so only
+    # the box is rasterised. The half-pixel term keeps the supersampled pixel
+    # centres averaging back onto the plain grid's centres, so supersampling
+    # never shifts the insert.
+    half = (supersample - 1) / 2.0
+    to_roi = np.array([[supersample, 0, -x0 * supersample + half],
+                       [0, supersample, -y0 * supersample + half],
+                       [0, 0, 1]], dtype=np.float64)
     warped = cv2.warpPerspective(
-        overlay, translate @ matrix, (roi_w, roi_h),
+        packed, to_roi @ matrix, (roi_w * supersample, roi_h * supersample),
         flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT,
         borderValue=(0, 0, 0, 0))
 
-    mask = quad_to_mask(quad, roi_w, roi_h, feather=feather, offset=(x0, y0))
-
-    alpha = (warped[:, :, 3].astype(np.float32) / 255.0)
-    alpha *= mask.astype(np.float32) / 255.0
-    if opacity < 1.0:
-        alpha *= float(max(0.0, opacity))
-    alpha = _apply_occlusion(alpha, occlusion, (x0, y0, x1, y1))
-    if not alpha.any():
-        return out
-
-    alpha = alpha[:, :, None]
-    roi = out[y0:y1, x0:x1].astype(np.float32)
-    blended = roi * (1.0 - alpha) + warped[:, :, :3].astype(np.float32) * alpha
-    out[y0:y1, x0:x1] = np.clip(blended, 0, 255).astype(np.uint8)
-    return out
+    mask = quad_to_mask(dst * supersample + half,
+                        roi_w * supersample, roi_h * supersample,
+                        feather=feather * supersample,
+                        offset=(x0 * supersample, y0 * supersample))
+    return _blend_into(out, box, warped, mask, opacity, occlusion, supersample)
 
 
 # --------------------------------------------------------------------------
@@ -689,40 +833,46 @@ def composite_region(base_bgr: np.ndarray, overlay: np.ndarray, region: Region,
         box = (x0, y0, x1, y1)
     x0, y0, x1, y1 = box
     roi_w, roi_h = x1 - x0, y1 - y0
+    supersample = _supersample_factor(roi_w, roi_h)
 
-    overlay = to_bgra(overlay)
-    oh, ow = overlay.shape[:2]
+    packed = _premultiplied(to_bgra(overlay))
+    quad_w, quad_h = _quad_pixel_size(region.corners)
+    packed = _prescaled_for(packed, quad_w, quad_h, supersample)
+    oh, ow = packed.shape[:2]
 
     grid_x, grid_y = np.meshgrid(np.arange(x0, x1, dtype=np.float64),
                                  np.arange(y0, y1, dtype=np.float64))
     uv = _region_inverse(region, np.stack([grid_x, grid_y], axis=-1))
+    uv = uv.astype(np.float32)
+    if supersample > 1:
+        # The surface mapping is smooth, so the supersampled sample points
+        # are interpolated from the plain-resolution solve instead of paying
+        # for the Newton iteration on four times the pixels. cv2.resize's
+        # centre-aligned sampling lands them exactly on the supersampled
+        # pixel centres.
+        uv = cv2.resize(uv, (roi_w * supersample, roi_h * supersample),
+                        interpolation=cv2.INTER_LINEAR)
 
-    map_x = (uv[..., 0] * ow).astype(np.float32)
-    map_y = (uv[..., 1] * oh).astype(np.float32)
-    warped = cv2.remap(overlay, map_x, map_y, interpolation=cv2.INTER_LINEAR,
+    # Surface coordinate 0..1 spans the content's extent [-0.5, ow-0.5] in
+    # sampling coordinates -- the same half-pixel convention as the straight
+    # path, so the two agree on where the artwork sits.
+    map_x = uv[..., 0] * ow - 0.5
+    map_y = uv[..., 1] * oh - 0.5
+    warped = cv2.remap(packed, map_x, map_y, interpolation=cv2.INTER_LINEAR,
                        borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0, 0))
 
-    mask = np.zeros((roi_h, roi_w), dtype=np.uint8)
+    mask = np.zeros((roi_h * supersample, roi_w * supersample), dtype=np.uint8)
     shift = 3
-    pts = np.round((polygon - np.float32([x0, y0])) * (1 << shift)).astype(np.int32)
+    half = (supersample - 1) / 2.0
+    pts = np.round(((polygon - np.float32([x0, y0])) * supersample + half)
+                   * (1 << shift)).astype(np.int32)
     cv2.fillPoly(mask, [pts.reshape(-1, 1, 2)], 255, lineType=cv2.LINE_AA, shift=shift)
     if feather > 0:
-        ksize = max(3, int(feather * 4) | 1)
-        mask = cv2.GaussianBlur(mask, (ksize, ksize), feather)
+        sigma = feather * supersample
+        ksize = max(3, int(sigma * 4) | 1)
+        mask = cv2.GaussianBlur(mask, (ksize, ksize), sigma)
 
-    alpha = warped[:, :, 3].astype(np.float32) / 255.0
-    alpha *= mask.astype(np.float32) / 255.0
-    if opacity < 1.0:
-        alpha *= float(max(0.0, opacity))
-    alpha = _apply_occlusion(alpha, occlusion, (x0, y0, x1, y1))
-    if not alpha.any():
-        return out
-
-    alpha = alpha[:, :, None]
-    roi = out[y0:y1, x0:x1].astype(np.float32)
-    blended = roi * (1.0 - alpha) + warped[:, :, :3].astype(np.float32) * alpha
-    out[y0:y1, x0:x1] = np.clip(blended, 0, 255).astype(np.uint8)
-    return out
+    return _blend_into(out, box, warped, mask, opacity, occlusion, supersample)
 
 
 # --------------------------------------------------------------------------
