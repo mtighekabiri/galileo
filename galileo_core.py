@@ -519,7 +519,7 @@ class Region:
     still compresses towards the far edge the way a flat one does.
     """
 
-    __slots__ = ("corners", "curvature", "curved")
+    __slots__ = ("corners", "curvature", "curved", "_homography_cache")
 
     def __init__(self, corners, curvature=None, curved: bool = False):
         """
@@ -537,6 +537,7 @@ class Region:
         self.curvature = (np.zeros((4, 2, 2), np.float32) if curvature is None
                           else np.asarray(curvature, np.float32).reshape(4, 2, 2))
         self.curved = bool(curved)
+        self._homography_cache = None
 
     # -- construction ------------------------------------------------------
 
@@ -610,8 +611,20 @@ class Region:
         return bool(np.all(np.abs(self.curvature) < tolerance))
 
     def homography(self) -> np.ndarray:
-        """Unit square -> corners, the perspective part of the mapping."""
-        return cv2.getPerspectiveTransform(UNIT_SQUARE, self.corners)
+        """Unit square -> corners, the perspective part of the mapping.
+
+        Memoised on the corner values: paint loops ask for this several
+        times per repaint of the same shape, and getPerspectiveTransform
+        solves a linear system each call. Every caller copies via astype
+        before touching the result, so sharing the array is safe.
+        """
+        key = self.corners.tobytes()
+        cached = self._homography_cache
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        matrix = cv2.getPerspectiveTransform(UNIT_SQUARE, self.corners)
+        self._homography_cache = (key, matrix)
+        return matrix
 
     # -- serialisation -----------------------------------------------------
 

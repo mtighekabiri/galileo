@@ -827,6 +827,11 @@ class MagnifierWidget(QWidget):
         self.region = None
         #: Which bend handle the keys are pointing at, as (edge, slot).
         self.selected_control = None
+        #: Geometry derived from the region, computed once per setData rather
+        #: than once per tile: with curving on there are twelve tiles, and
+        #: each was re-tracing the same outline.
+        self._boundary_cache = None
+        self._bounds_cache = None
 
         self.zoom_factor = 8.0
         #: Let each tile pick its own magnification from its size. Scrolling
@@ -914,6 +919,8 @@ class MagnifierWidget(QWidget):
         self.points = [MagnifierPoint.coerce(p, i)
                        for i, p in enumerate(overlay_points or [])]
         self.region = region
+        self._boundary_cache = None
+        self._bounds_cache = None
 
         if zoom_factor is not None:
             self.zoom_factor = float(np.clip(zoom_factor, self.MIN_ZOOM,
@@ -1130,6 +1137,8 @@ class MagnifierWidget(QWidget):
         Taken from the outline rather than the corners so a bend that swings
         wide of them is inside the view rather than cut off by it.
         """
+        if self._bounds_cache is not None:
+            return self._bounds_cache
         points = [(p.x, p.y) for p in self.points]
         if self.region is not None:
             try:
@@ -1141,7 +1150,8 @@ class MagnifierWidget(QWidget):
             return None
         xs = [p[0] for p in points]
         ys = [p[1] for p in points]
-        return min(xs), min(ys), max(xs), max(ys)
+        self._bounds_cache = (min(xs), min(ys), max(xs), max(ys))
+        return self._bounds_cache
 
     def whole_area_point(self):
         """A view of everything at once, centred on the marked area."""
@@ -1320,10 +1330,13 @@ class MagnifierWidget(QWidget):
         def to_tile(x, y):
             return (x * scale + offset_x, y * scale + offset_y)
 
-        try:
-            boundary = core.region_boundary(self.region, samples=48)
-        except Exception:                      # a half-drawn or folded shape
-            return
+        if self._boundary_cache is None:
+            try:
+                self._boundary_cache = core.region_boundary(self.region,
+                                                            samples=48)
+            except Exception:                  # a half-drawn or folded shape
+                return
+        boundary = self._boundary_cache
 
         painter.setPen(QPen(QColor(0, 230, 0, 200), 2))
         mapped = [to_tile(x, y) for x, y in boundary]
@@ -3752,7 +3765,10 @@ class CentralPanel(QWidget):
         # by falling back rather than holding a second reference to it.
         composited = (self.display_frame if overlay.ready_placements() else None)
         self.magnifier.setData(
-            base_frame=self.prev_frame.copy(),
+            # By reference, like composited: nothing mutates a frame in place
+            # -- read_frame replaces prev_frame wholesale -- and the copy here
+            # was a full-resolution memcpy per frame and per drag event.
+            base_frame=self.prev_frame,
             overlay_points=points,
             selected_index=selected,
             region=overlay.current_region() if len(overlay.points) == 4 else None,
