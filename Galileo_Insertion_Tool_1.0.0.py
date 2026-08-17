@@ -4575,6 +4575,7 @@ class MainWindow(QMainWindow):
         self.last_output_dir = ""
         self.refresh_title()
         self.refresh_placement_list()
+        logging.info("MainWindow constructed")
 
     # -- unsaved work ------------------------------------------------------
 
@@ -5937,4 +5938,8 @@ if __name__ == '__main__':
     window = MainWindow()
     window.show()
     logging.debug("Entering app event loop")
+    # Time-to-first-paint marker: fires once the event loop goes idle, which
+    # is only after the window has been laid out and painted.
+    QTimer.singleShot(
+        0, lambda: logging.info("Event loop first idle; window painted"))
     sys.exit(app.exec_())
