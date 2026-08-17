@@ -227,6 +227,14 @@ class BlendDialog(QDialog):
         self.on_change = on_change
         self.original = settings.to_dict()
 
+        # Coalesce slider drags: every preview refresh runs the photometric
+        # match, and a drag delivers far more value changes than anyone can
+        # see. A restartable timer turns a burst into one recomposite.
+        self._preview_timer = QTimer(self)
+        self._preview_timer.setSingleShot(True)
+        self._preview_timer.setInterval(40)
+        self._preview_timer.timeout.connect(lambda: self.on_change())
+
         self.setWindowTitle("Blend into Footage")
         self.setMinimumWidth(460)
         self.setStyleSheet("""
@@ -300,7 +308,7 @@ class BlendDialog(QDialog):
     def _on_slider(self, key, value):
         setattr(self.settings, key, value / 100.0)
         self.value_labels[key].setText(f"{value / 100.0:.2f}")
-        self.on_change()
+        self._preview_timer.start()
 
     def _defaults(self):
         fresh = blend.BlendSettings()
@@ -480,8 +488,11 @@ class MorphDialog(QDialog):
             value = getattr(self.morph, name)
             self.value_labels[name].setText(
                 f"{value:.2f}" if name in self.SCALED else f"{value:.0f}°")
-        self._draw_thumbnail()
+        # The stage first: refresh_display() composites the frame and keeps
+        # the result, and the thumbnail then crops that same composite. The
+        # other way round, both drew it -- two full composites per tick.
         self.on_change()
+        self._draw_thumbnail()
 
     def _draw_on_the_footage(self) -> bool:
         """Show the creative where it will actually be, on the shot itself."""
@@ -3024,15 +3035,13 @@ class CentralPanel(QWidget):
 
     def on_forward(self):
         if self.cap and self.cap.isOpened():
-            total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
-            # Get the index of the currently displayed frame
-            current_frame_index = int(self.cap.get(cv2.CAP_PROP_POS_FRAMES)) - 1
-            # Calculate the target frame, ensuring it doesn't exceed the total
-            new_frame_index = min(total_frames - 1, current_frame_index + 1)
-
-            # Only proceed if there is a change
-            if new_frame_index != current_frame_index:
-                self.cap.set(cv2.CAP_PROP_POS_FRAMES, new_frame_index)
+            # The capture already sits at the next frame after every read, so
+            # stepping forward is a bare read_frame(). Seeking to the position
+            # it was already at forced a keyframe seek and a GOP re-decode on
+            # long-GOP footage for a one-frame step.
+            new_frame_index = min(self.total_frames - 1,
+                                  self.current_frame_index + 1)
+            if new_frame_index != self.current_frame_index:
                 self.read_frame()
                 if self.tracking_mode:
                     self.tracking_overlay.setFocus()
@@ -5678,11 +5687,14 @@ class MainWindow(QMainWindow):
             return
 
         def on_the_footage():
-            """The creative as it currently sits on the shot, cropped to it."""
-            frame = panel.prev_frame
-            if frame is None or len(overlay.points) != 4:
+            """The creative as it currently sits on the shot, cropped to it.
+
+            Reads the composite refresh_display() just produced rather than
+            compositing again -- the dialog refreshes the stage first.
+            """
+            composited = panel.display_frame
+            if composited is None or len(overlay.points) != 4:
                 return None
-            composited = panel.composite_placements(frame)
             height, width = composited.shape[:2]
             # A generous margin: how a shape suits a panel is partly a
             # question about what surrounds the panel.
