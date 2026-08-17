@@ -2912,10 +2912,11 @@ class CentralPanel(QWidget):
         self.timer = QTimer()
         self.timer.timeout.connect(self.read_frame)
 
+        # Started when a video is loaded; ticking at 10 Hz with nothing to
+        # show was pure idle load.
         self.frame_timer = QTimer()
         self.frame_timer.setInterval(100)
         self.frame_timer.timeout.connect(self.update_frame_label)
-        self.frame_timer.start()
 
         # Focus
         self.setFocusPolicy(Qt.StrongFocus)
@@ -3274,16 +3275,19 @@ class CentralPanel(QWidget):
         self.update_magnifier()
 
     def update_frame_label(self):
-        if self.cap and self.cap.isOpened():
-            pos_msec = self.cap.get(cv2.CAP_PROP_POS_MSEC)
-            frame_idx = int(pos_msec / (1000.0 / self.fps)) if self.fps>0 else 0
-            self.frame_label.setText(f"Frame: {frame_idx}")
+        # From the cached position, not capture property queries: three
+        # cap.get() calls ten times a second added up, and the cached index
+        # is the single source of truth anyway. The +1 keeps the numbers the
+        # POS_MSEC derivation always displayed: the position after the shown
+        # frame was read.
+        if self.cap and self.cap.isOpened() and self.fps > 0:
+            shown = (self.current_frame_index + 1
+                     if self.prev_frame is not None else 0)
+            self.frame_label.setText(f"Frame: {shown}")
 
-            current_time = ms_to_mmss(int(pos_msec))
-            frame_count = self.cap.get(cv2.CAP_PROP_FRAME_COUNT)
-            if frame_count > 0 and self.fps > 0:
-                total_duration_ms = (frame_count / self.fps) * 1000
-                total_str = ms_to_mmss(int(total_duration_ms))
+            current_time = ms_to_mmss(int(shown * 1000.0 / self.fps))
+            if self.total_frames > 0:
+                total_str = ms_to_mmss(int(self.total_frames / self.fps * 1000))
             else:
                 total_str = "00:00"
             self.timestamp_label.setText(f"{current_time} / {total_str}")
@@ -3793,6 +3797,8 @@ class CentralPanel(QWidget):
 
         self.playing = False
         self.timer.stop()
+        if not self.frame_timer.isActive():
+            self.frame_timer.start()
         self.play_pause_btn.setIcon(self.style().standardIcon(QStyle.SP_MediaPlay))
         self.layout_video_stage()   # the aspect ratio is only known now
         logging.debug(f"Loaded {file_path}, FPS={self.fps}")
