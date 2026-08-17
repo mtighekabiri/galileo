@@ -3142,7 +3142,26 @@ class CentralPanel(QWidget):
             return
         display_frame = self.composite_placements(self.prev_frame)
         self.display_frame = display_frame
+        self._show_composite(display_frame)
 
+    def _show_composite(self, display_frame):
+        """Put a composited frame on the video label, scaled once on the way.
+
+        The label has setScaledContents on, and handing it the full-
+        resolution pixmap made Qt redo a full-frame smooth downscale on
+        every setPixmap -- its cache is invalidated each time. Shrinking to
+        the label's own size here does that work once with INTER_AREA, and
+        the colour conversion then runs on the small image too. Coordinate
+        mapping is untouched: display_to_raw derives its scale from
+        prev_frame's shape against the label width, never from the pixmap.
+        """
+        h, w = display_frame.shape[:2]
+        label_w = self.video_label.width()
+        label_h = self.video_label.height()
+        if 0 < label_w < w:
+            display_frame = cv2.resize(display_frame,
+                                       (label_w, max(1, label_h)),
+                                       interpolation=cv2.INTER_AREA)
         frame_rgb = cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB)
         h, w, ch = frame_rgb.shape
         q_img = QImage(frame_rgb.data, w, h, ch * w, QImage.Format_RGB888)
@@ -3273,12 +3292,7 @@ class CentralPanel(QWidget):
         self.prev_frame = frame.copy()
         display_frame = self.composite_placements(frame)
         self.display_frame = display_frame
-
-        frame_rgb = cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB)
-        h_frame, w_frame, ch = frame_rgb.shape
-        q_img = QImage(frame_rgb.data, w_frame, h_frame, ch * w_frame,
-                       QImage.Format_RGB888)
-        self.video_label.setPixmap(QPixmap.fromImage(q_img))
+        self._show_composite(display_frame)
 
         self.update_magnifier()
 
