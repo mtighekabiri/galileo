@@ -105,6 +105,21 @@ class TestEffects:
         after = abs(float(out[:, :, 0].mean()) - float(reference[:, :, 0].mean()))
         assert after < before
 
+    def test_colour_cast_lands_where_it_belongs(self):
+        """A surface lit warm on the left and cool on the right should tint
+        each side of the insert accordingly. A single global shift would
+        spread one average cast across both."""
+        reference = np.zeros((260, 420, 3), np.uint8)
+        reference[:, :210] = (40, 110, 190)             # warm side (BGR)
+        reference[:, 210:] = (190, 110, 40)             # cool side
+        grey = np.full((260, 420, 3), 128, np.uint8)
+        out = blend.match_colour(grey, reference, 1.0)
+
+        def redness(patch):
+            return float(patch[:, :, 2].mean()) - float(patch[:, :, 0].mean())
+
+        assert redness(out[:, :140]) > redness(out[:, 280:]) + 20
+
     def test_colour_strength_scales_the_shift(self, creative):
         scene = make_scene(tint=(1.6, 1.0, 0.6))
         reference = blend.base_in_creative_space(scene, QUAD, (420, 260))

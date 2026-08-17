@@ -125,17 +125,23 @@ def match_lighting(creative_bgr: np.ndarray, reference_bgr: np.ndarray,
 
 
 def match_colour(creative_bgr: np.ndarray, reference_bgr: np.ndarray,
-                 strength: float = 1.0) -> np.ndarray:
+                 strength: float = 1.0, sigma_fraction: float = 0.16) -> np.ndarray:
     """Pull the creative towards the ambient colour of what it covers.
 
-    Only the *mean* is shifted, not the spread. Matching the spread as a full
-    Reinhard transfer does will happily crush a punchy creative's contrast to
-    match a dull wall, which for an advertising test destroys the thing being
-    tested.
+    The pull is *local* rather than one global shift: both images are reduced
+    to heavily blurred low-frequency colour fields and the creative is moved
+    by the difference between them. A surface lit warm by a shopfront on one
+    side and cool daylight on the other then gets each cast where it belongs,
+    instead of the whole insert tinted with the average of the two.
+
+    Only those low frequencies move -- the creative's own detail and contrast
+    ride on top untouched. Matching the spread as a full Reinhard transfer
+    does will happily crush a punchy creative's contrast to match a dull
+    wall, which for an advertising test destroys the thing being tested.
     """
     if strength <= 0 or creative_bgr is None or reference_bgr is None:
         return creative_bgr
-    if reference_bgr.size == 0:
+    if creative_bgr.size == 0 or reference_bgr.size == 0:
         return creative_bgr
 
     source = cv2.cvtColor(creative_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
@@ -143,10 +149,31 @@ def match_colour(creative_bgr: np.ndarray, reference_bgr: np.ndarray,
         reference_bgr[:, :, :3] if reference_bgr.shape[-1] == 4 else reference_bgr,
         cv2.COLOR_BGR2LAB).astype(np.float32)
 
-    for channel in range(3):
-        shift = float(target[..., channel].mean() - source[..., channel].mean())
-        source[..., channel] += shift * float(strength)
+    height, width = source.shape[:2]
+    if min(height, width) < 4 or min(target.shape[:2]) < 4:
+        # Too small to carry a field; the plain global shift is all there is.
+        shift = (target.reshape(-1, 3).mean(axis=0)
+                 - source.reshape(-1, 3).mean(axis=0))
+        source += shift[None, None, :] * float(strength)
+        return cv2.cvtColor(np.clip(source, 0, 255).astype(np.uint8),
+                            cv2.COLOR_LAB2BGR)
 
+    # The reference is normally already rectified into the creative's own
+    # frame (base_in_creative_space); align it if a caller hands in another
+    # size. The heavy blur below swallows any resampling artefacts.
+    if target.shape[:2] != source.shape[:2]:
+        target = cv2.resize(target, (width, height),
+                            interpolation=cv2.INTER_LINEAR)
+
+    sigma = max(2.0, sigma_fraction * max(height, width))
+    ksize = int(sigma * 4) | 1
+    low_source = cv2.GaussianBlur(source, (ksize, ksize), sigma)
+    low_target = cv2.GaussianBlur(target, (ksize, ksize), sigma)
+
+    shift = (low_target - low_source) * float(strength)
+    # A shift free to run away would repaint the creative wherever the
+    # covered surface differs sharply from it; cap it at a strong cast.
+    source += np.clip(shift, -64.0, 64.0)
     return cv2.cvtColor(np.clip(source, 0, 255).astype(np.uint8), cv2.COLOR_LAB2BGR)
 
 
