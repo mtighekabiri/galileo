@@ -99,6 +99,22 @@ def quad_bounds(points, width: int, height: int, pad: int = 1):
     return x0, y0, x1, y1
 
 
+def union_quad(quads):
+    """The axis-aligned quad covering every quad given, or None for none.
+
+    For handing several placements to code that takes one quad -- the
+    person segmenter crops to a padded quad, and one crop around all the
+    inserts serves every one of them.
+    """
+    quads = [q for q in quads if q is not None]
+    if not quads:
+        return None
+    corners = np.concatenate([as_quad(q) for q in quads], axis=0)
+    x0, y0 = corners.min(axis=0)
+    x1, y1 = corners.max(axis=0)
+    return np.float32([[x0, y0], [x1, y0], [x1, y1], [x0, y1]])
+
+
 def quad_to_mask(points, width: int, height: int, feather: float = 0.0,
                  offset=(0, 0)) -> np.ndarray:
     """Anti-aliased coverage mask for a quad.

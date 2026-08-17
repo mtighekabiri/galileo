@@ -2746,9 +2746,11 @@ class CentralPanel(QWidget):
         self.current_frame_index = 0
         self.total_frames = 0
 
-        # Person segmentation for occlusion, built on first use.
+        # Person segmentation for occlusion, built on first use. The cache
+        # holds (frame, quantised-quad cell, mask) for the frame on screen.
         self.segmenter = None
         self.occlusion_enabled = False
+        self._occlusion_cache = None
 
         # 1) The container for video + overlay.
         #
@@ -3502,7 +3504,7 @@ class CentralPanel(QWidget):
 
         occlusion = None
         if self.occlusion_enabled:
-            occlusion = self.occlusion_mask(frame, None)
+            occlusion = self.occlusion_for_frame(frame, ready)
 
         out = frame
         for placement in ready:
@@ -3596,6 +3598,29 @@ class CentralPanel(QWidget):
             recorded = placement.tracking_history.get(frame_index)
             if recorded:
                 placement.points = recorded[:]
+
+    def occlusion_for_frame(self, frame, placements):
+        """The person mask for this frame, cropped near the inserts.
+
+        Two savings over segmenting the naked frame every composite. The
+        crop: the segmenter's own docstring says a padded crop around the
+        quad is both cheaper and better, because the fixed 192x192 network
+        input keeps a distant pedestrian visible at all -- and every
+        full-frame resize/dilate/blur it does afterwards shrinks with it.
+        The cache: a corner drag recomposites the same paused frame many
+        times, and the people in it have not moved between mouse events.
+        """
+        union = core.union_quad([p.points for p in placements
+                                 if len(p.points) == 4])
+        if union is None:
+            return self.occlusion_mask(frame, None)
+        cell = tuple(int(v) // 32 for v in union.reshape(-1))
+        cached = self._occlusion_cache
+        if (cached is not None and cached[0] is frame and cached[1] == cell):
+            return cached[2]
+        mask = self.occlusion_mask(frame, union)
+        self._occlusion_cache = (frame, cell, mask)
+        return mask
 
     def occlusion_mask(self, frame, quad):
         """A mask of people in front of the surface, or None if switched off."""
@@ -4542,10 +4567,16 @@ class RenderWorker(QObject):
 
                 # Segment once per frame and share the mask: the model is the
                 # slow part and it does not depend on which insert is drawn.
+                # Cropped to a quad around the frame's inserts, same as the
+                # preview -- better for distant people, cheaper everywhere.
                 occlusion = None
                 if segmenter is not None:
+                    union = core.union_quad(
+                        [np.float32(p.dense[frame_idx]) * p.scale
+                         for p in placements
+                         if p.dense.get(frame_idx) is not None])
                     try:
-                        occlusion = segmenter.mask(base_frame)
+                        occlusion = segmenter.mask(base_frame, union)
                     except cv2.error as exc:
                         logging.warning("Segmentation failed on frame %d: %s",
                                         frame_idx, exc)
