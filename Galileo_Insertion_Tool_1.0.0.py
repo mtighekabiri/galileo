@@ -22,7 +22,8 @@ from PyQt5.QtWidgets import (
     QProgressDialog, QScrollArea, QSpinBox, QComboBox, QLineEdit,
     QListWidget, QListWidgetItem, QWIDGETSIZE_MAX)
 from PyQt5.QtGui import (
-    QCursor, QPixmap, QColor, QPainter, QBrush, QPen, QImage, QPolygonF)
+    QCursor, QPixmap, QColor, QFont, QPainter, QBrush, QPen, QImage,
+    QPolygonF)
 
 def app_directory() -> str:
     """Where the application lives — the bundle folder when packaged."""
@@ -4572,8 +4573,6 @@ class MainWindow(QMainWindow):
         main_widget.setLayout(main_layout)
         self.setCentralWidget(main_widget)
         self._connect_signals()
-        self.showMaximized()
-        logging.debug("MainWindow shown maximized")
 
         self.inserted_overlay_widget = None
         self.dirty = False
@@ -5930,13 +5929,16 @@ class MainWindow(QMainWindow):
 if __name__ == '__main__':
     logging.info("Application about to start QApplication")
     app = QApplication(sys.argv)
-    app.setStyleSheet("""
-    * {
-        font-family: "Segoe UI", "Helvetica Neue", Arial, sans-serif;
-    }
-    """)
+    # The application font. Through app.setFont rather than a stylesheet: a
+    # universal * selector makes the style engine run rule matching for every
+    # widget ever constructed, which is pure overhead for setting one font.
+    font = QFont()
+    font.setFamilies(["Segoe UI", "Helvetica Neue", "Arial"])
+    app.setFont(font)
     window = MainWindow()
-    window.show()
+    # One show pass only. Showing from inside the constructor and again out
+    # here laid the whole window out twice.
+    window.showMaximized()
     logging.info("Entering app event loop")
     # Time-to-first-paint marker: fires once the event loop goes idle, which
     # is only after the window has been laid out and painted. The diagnostic
