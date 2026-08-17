@@ -1540,6 +1540,10 @@ class Placement:
         self.overlay_video_cap = None
         self.overlay_video_path = None
         self.inserted_overlay_start_frame = 0
+        # Sequential-decode bookkeeping: the frame count is queried once at
+        # open, and the cursor is the index the capture will read next.
+        self.overlay_video_total = 0
+        self.overlay_video_cursor = 0
 
         # Look
         self.brightness = 0
@@ -1720,6 +1724,8 @@ class TrackingOverlay(QWidget):
     inserted_overlay_is_video = _active_property("inserted_overlay_is_video")
     overlay_video_cap = _active_property("overlay_video_cap")
     overlay_video_path = _active_property("overlay_video_path")
+    overlay_video_total = _active_property("overlay_video_total")
+    overlay_video_cursor = _active_property("overlay_video_cursor")
     inserted_overlay_start_frame = _active_property("inserted_overlay_start_frame")
     brightness = _active_property("brightness")
     contrast = _active_property("contrast")
@@ -2074,6 +2080,9 @@ class TrackingOverlay(QWidget):
             self.inserted_overlay_is_video = False
             self.overlay_video_cap = None
             return
+        self.overlay_video_total = int(
+            self.overlay_video_cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        self.overlay_video_cursor = 0
 
         self.refresh_preview()
 
@@ -2096,18 +2105,27 @@ class TrackingOverlay(QWidget):
         if not self.inserted_overlay_is_video or not self.overlay_video_cap:
             return
 
-        total_overlay_frames = int(self.overlay_video_cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        if overlay_frame_idx < 0 or overlay_frame_idx >= total_overlay_frames:
+        if overlay_frame_idx < 0 or overlay_frame_idx >= self.overlay_video_total:
             self.overlay_bgra = None
             self.update()
             return
 
-        self.overlay_video_cap.set(cv2.CAP_PROP_POS_FRAMES, overlay_frame_idx)
+        # Playback asks for consecutive indices, and a plain read() is all
+        # that needs. Seeking per frame forced a keyframe seek and a GOP
+        # re-decode for every step on long-GOP creatives -- the renderer has
+        # advanced a cursor this way all along.
+        if overlay_frame_idx != self.overlay_video_cursor:
+            self.overlay_video_cap.set(cv2.CAP_PROP_POS_FRAMES,
+                                       overlay_frame_idx)
         ret, frame = self.overlay_video_cap.read()
         if not ret:
             self.overlay_bgra = None
+            # Force a real seek on the next request rather than trusting a
+            # cursor the failed read has made meaningless.
+            self.overlay_video_cursor = -1
             self.update()
             return
+        self.overlay_video_cursor = overlay_frame_idx + 1
 
         self.overlay_bgra = core.to_bgra(frame)
         self.update()
