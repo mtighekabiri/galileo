@@ -1938,8 +1938,19 @@ def register_model_dir(path: str) -> None:
         _MODEL_SEARCH_DIRS.insert(0, path)
 
 
+_FOUND_MODELS = {}
+
+
 def find_model(filename: str) -> str:
-    """Locate a model file beside the app, in ./models, or next to this file."""
+    """Locate a model file beside the app, in ./models, or next to this file.
+
+    Hits are remembered so repeated availability checks do not re-stat half a
+    dozen directories. Misses are not: the promise that a user can drop the
+    model in after launch and have occlusion light up has to keep holding.
+    """
+    cached = _FOUND_MODELS.get(filename)
+    if cached and os.path.isfile(cached):
+        return cached
     candidates = list(_MODEL_SEARCH_DIRS)
     here = os.path.dirname(os.path.abspath(__file__))
     candidates += [os.path.join(here, MODEL_DIR_NAME), here, os.getcwd(),
@@ -1947,6 +1958,7 @@ def find_model(filename: str) -> str:
     for directory in candidates:
         full = os.path.join(directory, filename)
         if os.path.isfile(full):
+            _FOUND_MODELS[filename] = full
             return full
     return None
 
@@ -2271,14 +2283,30 @@ def register_binary_dir(path: str) -> None:
         _BINARY_SEARCH_DIRS.insert(0, path)
 
 
+_FOUND_BINARIES = {}
+
+
 def find_binary(name: str) -> str:
-    """Locate a helper binary next to the app, else on PATH."""
+    """Locate a helper binary next to the app, else on PATH.
+
+    A hit is remembered, because the PATH walk behind :func:`shutil.which` is
+    the expensive part and a binary that was there does not move mid-session.
+    A miss keeps re-probing so dropping ffmpeg beside the app after launch
+    still gets picked up, exactly as documented.
+    """
+    cached = _FOUND_BINARIES.get(name)
+    if cached and os.path.isfile(cached):
+        return cached
     for directory in _BINARY_SEARCH_DIRS:
         for candidate in (name, f"{name}.exe"):
             full = os.path.join(directory, candidate)
             if os.path.isfile(full) and os.access(full, os.X_OK):
+                _FOUND_BINARIES[name] = full
                 return full
-    return shutil.which(name)
+    found = shutil.which(name)
+    if found:
+        _FOUND_BINARIES[name] = found
+    return found
 
 
 def has_ffmpeg() -> bool:

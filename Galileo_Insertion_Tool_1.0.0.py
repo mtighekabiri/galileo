@@ -82,14 +82,24 @@ for _directory in (app_directory(), resource_directory()):
     core.register_model_dir(_directory)
     core.register_model_dir(os.path.join(_directory, core.MODEL_DIR_NAME))
 
-# Record what optional pieces were found. This is the first thing to look at
-# when someone reports that occlusion is greyed out or a render came out silent.
 logging.debug("Frozen: %s | app dir: %s | resources: %s",
               bool(getattr(sys, "frozen", False)), app_directory(),
               resource_directory())
-logging.debug("Occlusion model: %s",
-              core.find_model(core.PersonSegmenter.MODEL_FILENAME) or "NOT FOUND")
-logging.debug("ffmpeg: %s", core.find_binary("ffmpeg") or "NOT FOUND")
+
+
+def log_optional_components():
+    """Record what optional pieces were found.
+
+    This is the first thing to look at when someone reports that occlusion is
+    greyed out or a render came out silent. It is not run at import time
+    because locating ffmpeg can mean walking every PATH entry -- on a slow
+    corporate PATH that is a real stall, paid before anything is on screen --
+    so the window goes up first and this runs on the first idle turn.
+    """
+    logging.info("Occlusion model: %s",
+                 core.find_model(core.PersonSegmenter.MODEL_FILENAME)
+                 or "NOT FOUND")
+    logging.info("ffmpeg: %s", core.find_binary("ffmpeg") or "NOT FOUND")
 
 def log_uncaught_exceptions(exctype, value, tb):
     import traceback
@@ -5928,7 +5938,10 @@ if __name__ == '__main__':
     window.show()
     logging.debug("Entering app event loop")
     # Time-to-first-paint marker: fires once the event loop goes idle, which
-    # is only after the window has been laid out and painted.
-    QTimer.singleShot(
-        0, lambda: logging.info("Event loop first idle; window painted"))
+    # is only after the window has been laid out and painted. The diagnostic
+    # probes run in the same turn, after the user already has a window.
+    def _first_idle():
+        logging.info("Event loop first idle; window painted")
+        log_optional_components()
+    QTimer.singleShot(0, _first_idle)
     sys.exit(app.exec_())
