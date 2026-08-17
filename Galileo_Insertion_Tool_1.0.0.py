@@ -2944,7 +2944,6 @@ class CentralPanel(QWidget):
         self.slider.valueChanged.connect(self.on_slider_scrub)
         self.slider.sliderPressed.connect(self.on_slider_pressed)
         self.slider.sliderReleased.connect(self.on_slider_released)
-        self.slider.valueChanged.connect(self.on_slider_value_changed)
 
         # Timers
         self.timer = QTimer()
@@ -2957,8 +2956,10 @@ class CentralPanel(QWidget):
         self.frame_timer.timeout.connect(self.update_frame_label)
 
         # Whether a coalesced shape refresh is already scheduled for this
-        # event-loop turn.
+        # event-loop turn, and the newest scrub position waiting to decode.
         self._shape_refresh_queued = False
+        self._scrub_queued = False
+        self._scrub_target = None
 
         # Focus
         self.setFocusPolicy(Qt.StrongFocus)
@@ -3061,17 +3062,20 @@ class CentralPanel(QWidget):
         elif frame_index >= total_frames:
             frame_index = total_frames - 1
 
-        self.cap.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
         self.playing = False
         self.timer.stop()
         self.play_pause_btn.setIcon(self.style().standardIcon(QStyle.SP_MediaPlay))
-        
+
         # Turn off tracking on jump.
         self.switch.setChecked(False)
         self.tracking_mode = False
         self.reset_tracker()
 
-        self.read_frame()
+        # A scrub usually decoded this exact frame moments ago on the way to
+        # the release; do not seek and decode it a second time.
+        if frame_index != self.current_frame_index or self.prev_frame is None:
+            self.cap.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
+            self.read_frame()
 
         # Show this frame's shape if it has one, otherwise keep what is on
         # screen so the user can carry it to a frame that needs marking.
@@ -3931,13 +3935,30 @@ class CentralPanel(QWidget):
             
         self.jump_to_frame(target_frame)
 
-    def on_slider_value_changed(self, value):
-        self.frame_label.setText(f"Frame: {value}")
-
     def on_slider_scrub(self, value):
-        if self.cap and self.cap.isOpened():
-            self.cap.set(cv2.CAP_PROP_POS_FRAMES, value)
-            self.read_frame()
+        # The one slot for a value change: show the number at once, note the
+        # newest target, and schedule a single decode for it at the end of
+        # the turn. Seeking and fully decoding for every pixel of a drag
+        # queued seeks faster than they could complete -- and valueChanged
+        # used to be connected twice on top of that.
+        self.frame_label.setText(f"Frame: {value}")
+        if not (self.cap and self.cap.isOpened()):
+            return
+        self._scrub_target = value
+        if not self._scrub_queued:
+            self._scrub_queued = True
+            QTimer.singleShot(0, self._flush_scrub)
+
+    def _flush_scrub(self):
+        self._scrub_queued = False
+        target = self._scrub_target
+        self._scrub_target = None
+        if target is None or not (self.cap and self.cap.isOpened()):
+            return
+        if target == self.current_frame_index and self.prev_frame is not None:
+            return   # already showing it
+        self.cap.set(cv2.CAP_PROP_POS_FRAMES, target)
+        self.read_frame()
 
     # -- flickering lighting ------------------------------------------------
 
