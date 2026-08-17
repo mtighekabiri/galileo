@@ -4986,8 +4986,11 @@ class MainWindow(QMainWindow):
             "deflicker": (self.central_panel.deflicker.mode
                           if self.central_panel.deflicker is not None else None),
         }
+        # Compact separators, not indent=2: the tracking history is one entry
+        # per frame of full-precision floats, and pretty-printing roughly
+        # doubled the file for nobody to read. Loading accepts either form.
         with open(path, "w") as f:
-            json.dump(data, f, indent=2)
+            json.dump(data, f, separators=(",", ":"))
         self.mark_clean()
         QMessageBox.information(self, "Saved", f"Project saved to:\n{path}")
 
@@ -5476,8 +5479,10 @@ class MainWindow(QMainWindow):
             return
         # Convert keys to strings so JSON doesn't break
         data = {str(k): v for k, v in self.central_panel.tracking_overlay.tracking_history.items()}
+        # Compact for the same reason as project files: per-frame data,
+        # nobody reads it by eye, half the bytes.
         with open(path, "w") as f:
-            json.dump(data, f, indent=2)
+            json.dump(data, f, separators=(",", ":"))
         QMessageBox.information(self, "Saved", f"Tracking saved to:\n{path}")
 
     def load_tracking_points(self):
