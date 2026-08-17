@@ -262,12 +262,26 @@ def add_grain(frame_bgr: np.ndarray, sigma: float, mask: np.ndarray = None,
         return frame_bgr
 
     rng = np.random.default_rng(seed)
-    noise = rng.normal(0.0, float(sigma), frame_bgr.shape[:2]).astype(np.float32)
-    if mask is not None:
-        noise *= (mask.astype(np.float32) / 255.0)
 
-    out = frame_bgr.astype(np.float32) + noise[:, :, None]
-    return np.clip(out, 0, 255).astype(np.uint8)
+    if mask is None:
+        noise = rng.normal(0.0, float(sigma),
+                           frame_bgr.shape[:2]).astype(np.float32)
+        out = frame_bgr.astype(np.float32) + noise[:, :, None]
+        return np.clip(out, 0, 255).astype(np.uint8)
+
+    # The noise is zero wherever the mask is, so the work is confined to the
+    # mask's bounding box: a small insert costs its own area, not a full-
+    # frame noise field and a full-frame widen to float.
+    x, y, w, h = cv2.boundingRect(mask)
+    if w == 0 or h == 0:
+        return frame_bgr
+
+    noise = rng.normal(0.0, float(sigma), (h, w)).astype(np.float32)
+    noise *= mask[y:y + h, x:x + w].astype(np.float32) / 255.0
+    patch = frame_bgr[y:y + h, x:x + w].astype(np.float32) + noise[:, :, None]
+    out = frame_bgr.copy()
+    out[y:y + h, x:x + w] = np.clip(patch, 0, 255).astype(np.uint8)
+    return out
 
 
 # --------------------------------------------------------------------------

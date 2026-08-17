@@ -3489,21 +3489,6 @@ class CentralPanel(QWidget):
                                       seed=self.current_frame_index)
         return out
 
-    def apply_grain(self, composited, source_frame, region):
-        """Lay matched sensor noise over the insert.
-
-        Applied after the warp, in frame space: grain added to the creative
-        beforehand would be resampled along with it and come out the wrong size
-        for the shot.
-        """
-        overlay = self.tracking_overlay
-        sigma = overlay.grain_for(source_frame, region.corners)
-        if sigma <= 0.1:
-            return composited
-        h, w = composited.shape[:2]
-        mask = core.quad_to_mask(region.corners, w, h)
-        return blend.add_grain(composited, sigma, mask, seed=self.current_frame_index)
-
     def track_placement(self, placement, frame, frame_index) -> bool:
         """Follow one placement's surface into this frame and record it.
 
