@@ -302,6 +302,17 @@ def _premultiplied(overlay_bgra: np.ndarray) -> np.ndarray:
     return cv2.merge(scaled + [alpha])
 
 
+def _prescale_target(shape, quad_w: float, quad_h: float,
+                     supersample: int) -> tuple:
+    """The size _prescaled_for will reduce to, for that function and for
+    keying the cache without doing the work."""
+    oh, ow = shape[:2]
+    headroom = 1.25   # perspective packs the far edge denser than the mean
+    target_w = min(ow, max(1, int(np.ceil(quad_w * supersample * headroom))))
+    target_h = min(oh, max(1, int(np.ceil(quad_h * supersample * headroom))))
+    return target_w, target_h
+
+
 def _prescaled_for(packed: np.ndarray, quad_w: float, quad_h: float,
                    supersample: int) -> np.ndarray:
     """Shrink an oversized creative towards its on-screen size first.
@@ -314,13 +325,46 @@ def _prescaled_for(packed: np.ndarray, quad_w: float, quad_h: float,
     which is what keeps fine detail smooth. Never upscales.
     """
     oh, ow = packed.shape[:2]
-    headroom = 1.25   # perspective packs the far edge denser than the mean
-    target_w = min(ow, max(1, int(np.ceil(quad_w * supersample * headroom))))
-    target_h = min(oh, max(1, int(np.ceil(quad_h * supersample * headroom))))
+    target_w, target_h = _prescale_target(packed.shape, quad_w, quad_h,
+                                          supersample)
     if target_w > ow * 0.8 and target_h > oh * 0.8:
         return packed             # too small a reduction to be worth a pass
     return cv2.resize(packed, (target_w, target_h),
                       interpolation=cv2.INTER_AREA)
+
+
+class _PackedCache:
+    """Remembers recently packed-and-prescaled creatives.
+
+    The same identity idiom as the morph's ShapeCache: sources are compared
+    with ``is`` and the reference is held, which is what makes identity safe.
+    A still creative resolves to the same array every frame, so the BGRA
+    conversion, the premultiply (with its full-image alpha scan) and the
+    area-filtered reduction all collapse to a lookup; a creative video hands
+    over a new array each frame and misses, which is real new work. A few
+    entries, because one frame can carry several placements.
+    """
+
+    LIMIT = 8
+
+    def __init__(self):
+        self._entries = {}   # id(source) -> (source, (w, h), result)
+
+    def packed(self, overlay, quad_w, quad_h, supersample):
+        target = _prescale_target(overlay.shape, quad_w, quad_h, supersample)
+        entry = self._entries.get(id(overlay))
+        if (entry is not None and entry[0] is overlay
+                and entry[1] == target):
+            return entry[2]
+        packed = _premultiplied(to_bgra(overlay))
+        packed = _prescaled_for(packed, quad_w, quad_h, supersample)
+        if len(self._entries) >= self.LIMIT and id(overlay) not in self._entries:
+            self._entries.pop(next(iter(self._entries)))
+        self._entries[id(overlay)] = (overlay, target, packed)
+        return packed
+
+
+_packed_cache = _PackedCache()
 
 
 def _blend_into(out: np.ndarray, box, warped: np.ndarray, mask: np.ndarray,
@@ -410,9 +454,8 @@ def composite_overlay(base_bgr: np.ndarray, overlay: np.ndarray, quad,
     roi_w, roi_h = x1 - x0, y1 - y0
     supersample = _supersample_factor(roi_w, roi_h)
 
-    packed = _premultiplied(to_bgra(overlay))
     quad_w, quad_h = _quad_pixel_size(quad)
-    packed = _prescaled_for(packed, quad_w, quad_h, supersample)
+    packed = _packed_cache.packed(overlay, quad_w, quad_h, supersample)
     oh, ow = packed.shape[:2]
 
     # OpenCV samples pixel *centres* at integer coordinates, so the content
@@ -835,9 +878,8 @@ def composite_region(base_bgr: np.ndarray, overlay: np.ndarray, region: Region,
     roi_w, roi_h = x1 - x0, y1 - y0
     supersample = _supersample_factor(roi_w, roi_h)
 
-    packed = _premultiplied(to_bgra(overlay))
     quad_w, quad_h = _quad_pixel_size(region.corners)
-    packed = _prescaled_for(packed, quad_w, quad_h, supersample)
+    packed = _packed_cache.packed(overlay, quad_w, quad_h, supersample)
     oh, ow = packed.shape[:2]
 
     grid_x, grid_y = np.meshgrid(np.arange(x0, x1, dtype=np.float64),
