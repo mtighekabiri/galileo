@@ -1,4 +1,13 @@
 -r requirements.txt
 
+# Exact pins for the shipping build, so two builds a month apart bundle the
+# same libraries and a startup or size regression stays attributable.
+# requirements.txt keeps the loose floors for day-to-day development; these
+# are the versions the packaged app was last verified against. To move them,
+# bump, rebuild, run the suite and the perf probes, then commit the change.
+opencv-python-headless==5.0.0.93
+PyQt5==5.15.11
+numpy==2.4.6
+
 # Packaging into a standalone application that needs no Python installed.
-pyinstaller>=6.0
+pyinstaller==6.22.1

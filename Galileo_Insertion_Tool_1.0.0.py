@@ -6286,6 +6286,16 @@ if __name__ == '__main__':
     # probes run in the same turn, after the user already has a window.
     def _first_idle():
         logging.info("Event loop first idle; window painted")
+        # In a packaged build the bootloader has been showing a splash since
+        # the double-click; the window is on screen now, so take it down.
+        # The env var is how the bootloader says a splash is actually up --
+        # importing pyi_splash without one logs a spurious warning.
+        if os.environ.get("_PYI_SPLASH_IPC"):
+            try:
+                import pyi_splash
+                pyi_splash.close()
+            except Exception:
+                pass
         log_optional_components()
     QTimer.singleShot(0, _first_idle)
     sys.exit(app.exec_())
