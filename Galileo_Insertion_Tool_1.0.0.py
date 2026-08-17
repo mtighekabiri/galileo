@@ -2687,8 +2687,13 @@ class CentralPanel(QWidget):
         # plate whose lighting holds still.
         self.deflicker = None
         #: What a quick look at the clip found when it was opened, so the
-        #: option can say what it would be correcting.
+        #: option can say what it would be correcting. Filled in by a worker
+        #: thread shortly after a load; media_generation stamps which video a
+        #: finished scan belongs to so a stale one is dropped.
         self.flicker_report = None
+        self.flicker_scan_thread = None
+        self.flicker_scan_worker = None
+        self.media_generation = 0
         self.fps = 30
 
         # The single source of truth for "which frame is on screen". Deriving
@@ -3892,23 +3897,64 @@ class CentralPanel(QWidget):
     # -- flickering lighting ------------------------------------------------
 
     def scan_for_flicker(self):
-        """Take a quick look at the clip for pulsing lighting.
+        """Start a quick look at the clip for pulsing lighting.
 
         A window from the middle rather than the whole clip: this runs on every
         video that is opened, and a full pass over a long one would be a stall
         on each load for footage that usually turns out to be fine. The full
         measurement only happens if the correction is actually switched on.
+
+        Even the bounded window is a stack of decodes, so it runs on a worker
+        thread; opening a video no longer freezes while it looks. The menu
+        learns the verdict when on_flicker_scanned lands.
         """
         self.deflicker = None
         self.flicker_report = None
+        self.media_generation += 1
         path = getattr(self, "current_video_path", None)
         if not path:
             return None
-        import galileo_deflicker as deflicker
+
+        thread = QThread(self)
+        worker = FlickerScanWorker(path, self.media_generation)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.finished.connect(self.on_flicker_scanned)
+        # Direct so the thread's loop is told to exit from the worker side
+        # the moment the work is done. Queued, the quit would sit in the GUI
+        # queue -- and anything blocked in thread.wait() would be waiting on
+        # itself to deliver it. QThread.quit is documented thread-safe.
+        worker.finished.connect(thread.quit, Qt.DirectConnection)
+        thread.finished.connect(thread.deleteLater)
+        self.flicker_scan_thread = thread
+        self.flicker_scan_worker = worker
+        thread.start()
+        return None
+
+    def on_flicker_scanned(self, generation, report):
+        if generation != self.media_generation:
+            return   # a different video is loaded now; verdict is stale
+        self.flicker_report = report
+        mw = self.window()
+        if isinstance(mw, QMainWindow) and hasattr(mw, "refresh_deflicker_action"):
+            mw.refresh_deflicker_action()
+
+    def wait_for_flicker_scan(self, timeout_ms=30000):
+        """Block until a pending lighting scan has landed, and return it.
+
+        For the few places that need the verdict right now: the deflicker
+        toggle picks its measurement mode from it, and the tests assert on
+        it. An ordinary video open never waits.
+        """
+        thread = self.flicker_scan_thread
         try:
-            self.flicker_report = deflicker.scan(path)
-        except cv2.error as exc:
-            logging.warning("Could not scan %s for flicker: %s", path, exc)
+            running = thread is not None and thread.isRunning()
+        except RuntimeError:      # already finished and deleted on the Qt side
+            running = False
+        if running:
+            thread.wait(timeout_ms)
+        # The verdict arrives as a queued signal; deliver it before returning.
+        QApplication.processEvents()
         return self.flicker_report
 
     def set_deflicker(self, on: bool, progress=None):
@@ -3930,12 +3976,20 @@ class CentralPanel(QWidget):
         path = getattr(self, "current_video_path", None)
         if not path:
             return None
-        mode = "auto"
-        if self.flicker_report is not None and self.flicker_report.kind != "steady":
-            mode = self.flicker_report.kind
+        mode = self.deflicker_mode()
         import galileo_deflicker as deflicker
-        self.deflicker = deflicker.Deflicker.measure(path, mode=mode,
-                                                     progress=progress)
+        return self.apply_deflicker(
+            deflicker.Deflicker.measure(path, mode=mode, progress=progress))
+
+    def deflicker_mode(self) -> str:
+        """Which measurement the load-time scan says this clip needs."""
+        if self.flicker_report is not None and self.flicker_report.kind != "steady":
+            return self.flicker_report.kind
+        return "auto"
+
+    def apply_deflicker(self, fixer):
+        """Install a measured corrector and bring the shown frame up to date."""
+        self.deflicker = fixer
         # The frame on screen was decoded before this existed, so re-read it
         # rather than leave the preview a frame behind the setting.
         if self.cap and self.cap.isOpened():
@@ -4465,6 +4519,72 @@ class RenderWorker(QObject):
     def cancel(self):
         self.is_canceled = True
 
+
+class FlickerScanWorker(QObject):
+    """Samples a clip's lighting off the GUI thread.
+
+    The quick look that powers the deflicker menu's verdict decodes a bounded
+    window of frames; run inline it froze the interface for most of a second
+    on every video open. Same shape as RenderWorker: plain data in, a signal
+    out, and the worker opens its own capture -- captures never cross threads.
+    The generation stamp lets a scan that finishes after another video was
+    loaded be recognised as stale and dropped.
+    """
+    finished = pyqtSignal(int, object)  # (generation, report or None)
+
+    def __init__(self, path, generation):
+        super().__init__()
+        self.path = path
+        self.generation = generation
+
+    def run(self):
+        import galileo_deflicker as deflicker
+        report = None
+        try:
+            report = deflicker.scan(self.path)
+        except cv2.error as exc:
+            logging.warning("Could not scan %s for flicker: %s",
+                            self.path, exc)
+        self.finished.emit(self.generation, report)
+
+
+class DeflickerMeasureWorker(QObject):
+    """Measures a clip's lighting gains off the GUI thread.
+
+    The whole-clip measurement behind the deflicker option took seconds and
+    was kept responsive only by pumping processEvents from its progress
+    callback, which could re-enter the frame loop.
+    """
+    progress = pyqtSignal(int, int)
+    finished = pyqtSignal(int, object)  # (generation, Deflicker or None)
+
+    def __init__(self, path, mode, generation):
+        super().__init__()
+        self.path = path
+        self.mode = mode
+        self.generation = generation
+        self.is_canceled = False
+
+    def run(self):
+        import galileo_deflicker as deflicker
+
+        def report(done, count):
+            self.progress.emit(done, count)
+            return not self.is_canceled
+
+        fixer = None
+        try:
+            fixer = deflicker.Deflicker.measure(self.path, mode=self.mode,
+                                                progress=report)
+        except cv2.error as exc:
+            logging.warning("Could not measure %s for deflicker: %s",
+                            self.path, exc)
+        self.finished.emit(self.generation, fixer)
+
+    def cancel(self):
+        self.is_canceled = True
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -4757,6 +4877,15 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         if self.confirm_discard("Close anyway?"):
+            # Let background measurement threads finish rather than tearing
+            # down Qt underneath them.
+            for thread in (getattr(self, "deflicker_measure_thread", None),
+                           self.central_panel.flicker_scan_thread):
+                try:
+                    if thread is not None and thread.isRunning():
+                        thread.wait(10000)
+                except RuntimeError:
+                    pass          # already finished and deleted on the Qt side
             event.accept()
         else:
             event.ignore()
@@ -5083,8 +5212,10 @@ class MainWindow(QMainWindow):
                                 f"Could not find the creative at:\n{overlay_path}")
 
         # Only the setting was saved, so the gains are measured again from the
-        # footage. Done through the same handler the menu uses, which is what
-        # puts a progress dialog on the pass rather than an unexplained pause.
+        # footage. Done through the same handler the menu uses: the measure
+        # runs on its worker thread with a progress dialog, so the project
+        # opens immediately and plays uncorrected for the few seconds until
+        # the correction lands, instead of freezing the whole app for them.
         mode = data.get("deflicker")
         action = getattr(self.title_bar, "deflicker_action", None)
         if mode and base_video and action is not None:
@@ -5383,7 +5514,12 @@ class MainWindow(QMainWindow):
                 f"Flicker found: {report.whole:.1f}% frame to frame{beat}.")
 
     def toggle_deflicker(self, enabled: bool):
-        """Even out lighting that pulses, before anything else sees the frame."""
+        """Even out lighting that pulses, before anything else sees the frame.
+
+        The whole-clip measurement runs on a worker thread; the progress
+        dialog is window-modal, so the app stays alive and cancellable while
+        it works instead of being held together with processEvents.
+        """
         panel = self.central_panel
         if not enabled:
             panel.set_deflicker(False)
@@ -5393,6 +5529,10 @@ class MainWindow(QMainWindow):
             self.title_bar.deflicker_action.setChecked(False)
             return
 
+        # The measurement mode comes from the load-time scan -- a bounded
+        # sample that has normally landed long before anyone reaches the menu.
+        panel.wait_for_flicker_scan()
+
         total = panel.total_frames or 0
         dialog = QProgressDialog("Measuring the lighting…", "Cancel", 0,
                                  max(total, 1), self)
@@ -5400,20 +5540,44 @@ class MainWindow(QMainWindow):
         dialog.setWindowModality(Qt.WindowModal)
         dialog.setMinimumDuration(400)
 
-        def progress(done, count):
+        thread = QThread(self)
+        worker = DeflickerMeasureWorker(panel.current_video_path,
+                                        panel.deflicker_mode(),
+                                        panel.media_generation)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+
+        def on_progress(done, count):
             dialog.setMaximum(max(count, done, 1))
             dialog.setValue(done)
-            QApplication.processEvents()
-            return not dialog.wasCanceled()
 
-        try:
-            fixer = panel.set_deflicker(True, progress=progress)
-        finally:
-            # Read this before closing: closing a QProgressDialog rejects it,
-            # which sets wasCanceled, so asking afterwards always says the
-            # user cancelled and the "nothing to correct" notice never showed.
-            cancelled = dialog.wasCanceled()
+        worker.progress.connect(on_progress)
+        # Direct on purpose: the worker thread's event loop is busy inside
+        # measure(), so a queued cancel would only arrive after the work it
+        # is meant to stop. This just sets a flag the callback polls.
+        dialog.canceled.connect(worker.cancel, Qt.DirectConnection)
+        worker.finished.connect(self.on_deflicker_measured)
+        # Direct for the same reason as the flicker scan: wait_for_ helpers
+        # block the GUI thread, which is where a queued quit would land.
+        worker.finished.connect(thread.quit, Qt.DirectConnection)
+        thread.finished.connect(thread.deleteLater)
+
+        self.deflicker_measure_dialog = dialog
+        self.deflicker_measure_thread = thread
+        self.deflicker_measure_worker = worker
+        thread.start()
+
+    def on_deflicker_measured(self, generation, fixer):
+        panel = self.central_panel
+        worker = getattr(self, "deflicker_measure_worker", None)
+        cancelled = bool(worker and worker.is_canceled)
+        dialog = getattr(self, "deflicker_measure_dialog", None)
+        if dialog is not None:
+            self.deflicker_measure_dialog = None
             dialog.close()
+
+        if generation != panel.media_generation:
+            return   # measured a clip that is no longer the one loaded
 
         if fixer is None:
             # Either nothing to correct or the user cancelled; either way the
@@ -5427,6 +5591,7 @@ class MainWindow(QMainWindow):
                     "nothing to even out.")
             return
 
+        panel.apply_deflicker(fixer)
         self.mark_dirty()
         kind = ("banding, row by row" if fixer.mode == "rows"
                 else "whole-frame flicker")
@@ -5434,6 +5599,17 @@ class MainWindow(QMainWindow):
         self.title_bar.deflicker_action.setToolTip(
             f"Steadying {kind} across {len(fixer)} frames. "
             "Untick to see the footage as shot.")
+
+    def wait_for_deflicker_measure(self, timeout_ms=120000):
+        """Block until a pending lighting measurement has been handled."""
+        thread = getattr(self, "deflicker_measure_thread", None)
+        try:
+            running = thread is not None and thread.isRunning()
+        except RuntimeError:      # already finished and deleted on the Qt side
+            running = False
+        if running:
+            thread.wait(timeout_ms)
+        QApplication.processEvents()
 
     def open_blend_dialog(self):
         """Tune how the creative is matched to the shot, with a live preview."""
