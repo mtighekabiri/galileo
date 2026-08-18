@@ -267,6 +267,9 @@ def app(qapp, tmp_path, flickering):
     path = clip(tmp_path, flickering, "loaded.mp4")
     window = galileo_app.MainWindow()
     window.central_panel.load_video(path)
+    # The look at the lighting happens on a worker now; these tests are
+    # about the verdict, so collect it before handing over.
+    window.central_panel.wait_for_flicker_scan()
     yield window, window.central_panel, path
     window.dirty = False
     window.close()
@@ -287,6 +290,20 @@ class TestWiredIntoTheApp:
     def test_it_is_off_until_asked_for(self, app):
         window, panel, path = app
         assert panel.deflicker is None
+
+    def test_a_scan_outlived_by_a_new_video_is_dropped(self, qapp, tmp_path,
+                                                       flickering, steady):
+        """A verdict landing after another clip was loaded must not stick."""
+        window = galileo_app.MainWindow()
+        try:
+            panel = window.central_panel
+            panel.load_video(clip(tmp_path, flickering, "first.mp4"))
+            panel.load_video(clip(tmp_path, steady, "second.mp4"))
+            report = panel.wait_for_flicker_scan()
+            assert report is not None and report.kind == "steady"
+        finally:
+            window.dirty = False
+            window.close()
 
     def test_switching_it_on_steadies_the_preview(self, app):
         window, panel, path = app
@@ -379,6 +396,9 @@ class TestWiredIntoTheApp:
         panel.set_deflicker(False)
         window.dirty = False
         window.load_project()
+        # The re-measure runs on its worker; the project opens uncorrected
+        # and the correction lands when the measurement does.
+        window.wait_for_deflicker_measure()
         assert panel.deflicker is not None
         assert panel.deflicker.mode == "frame"
 
@@ -390,8 +410,10 @@ class TestWiredIntoTheApp:
         window = galileo_app.MainWindow()
         try:
             window.central_panel.load_video(clip(tmp_path, steady, "ok.mp4"))
+            window.central_panel.wait_for_flicker_scan()
             assert window.central_panel.flicker_report.kind == "steady"
             window.toggle_deflicker(True)
+            window.wait_for_deflicker_measure()
             assert window.central_panel.deflicker is None
             assert window.title_bar.deflicker_action.isChecked() is False
             assert seen, "the user was told nothing"

@@ -25,9 +25,10 @@ Install `ffmpeg` too if you want the rendered video to keep its audio; see
 package it into a self-contained folder they can unzip and double-click. No
 install, no admin rights. See [BUILD.md](BUILD.md).
 
-Debug output goes to `app_debug.log` in a per-user folder
+Log output goes to `app_debug.log` in a per-user folder
 (`%LOCALAPPDATA%\Galileo` on Windows, `~/Library/Application Support/Galileo` on
-macOS, `~/.local/share/Galileo` on Linux).
+macOS, `~/.local/share/Galileo` on Linux). Set the environment variable
+`GALILEO_DEBUG=1` for full debug-level detail.
 
 ## Workflow
 

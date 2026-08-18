@@ -19,7 +19,8 @@ import logging
 import cv2
 import numpy as np
 
-from galileo_core import as_quad, quad_bounds, to_bgra
+from galileo_core import (as_quad, quad_bounds, to_bgra, _prescale_target,
+                          _quad_pixel_size, _supersample_factor)
 
 logger = logging.getLogger(__name__)
 
@@ -107,9 +108,25 @@ def match_lighting(creative_bgr: np.ndarray, reference_bgr: np.ndarray,
 
     reference_gray = _gray(reference_bgr).astype(np.float32)
     height, width = reference_gray.shape[:2]
-    sigma = max(2.0, sigma_fraction * max(height, width))
+
+    # The field is ultra-low-frequency by construction -- sigma is a fixed
+    # fraction of the image -- so it is measured on a decimated copy and
+    # resized back, the same shrunken-copy trick the deflicker uses for its
+    # row statistics. The blur cost stops growing with the creative.
+    scale = min(1.0, 256.0 / max(height, width))
+    if scale < 1.0:
+        small = cv2.resize(reference_gray,
+                           (max(4, int(round(width * scale))),
+                            max(4, int(round(height * scale)))),
+                           interpolation=cv2.INTER_AREA)
+    else:
+        small = reference_gray
+    sigma = max(2.0, sigma_fraction * max(small.shape[:2]))
     ksize = int(sigma * 4) | 1
-    low_frequency = cv2.GaussianBlur(reference_gray, (ksize, ksize), sigma)
+    low_frequency = cv2.GaussianBlur(small, (ksize, ksize), sigma)
+    if scale < 1.0:
+        low_frequency = cv2.resize(low_frequency, (width, height),
+                                   interpolation=cv2.INTER_LINEAR)
 
     mean = float(low_frequency.mean())
     if mean < 1e-3:
@@ -165,12 +182,29 @@ def match_colour(creative_bgr: np.ndarray, reference_bgr: np.ndarray,
         target = cv2.resize(target, (width, height),
                             interpolation=cv2.INTER_LINEAR)
 
-    sigma = max(2.0, sigma_fraction * max(height, width))
+    # Both fields are ultra-low-frequency -- sigma is a fixed fraction of
+    # the image -- so they are measured on decimated copies and the shift
+    # resized back up. Same field, a fraction of the blur cost, and the
+    # kernels stop growing with the creative.
+    scale = min(1.0, 256.0 / max(height, width))
+    if scale < 1.0:
+        small_size = (max(4, int(round(width * scale))),
+                      max(4, int(round(height * scale))))
+        small_source = cv2.resize(source, small_size,
+                                  interpolation=cv2.INTER_AREA)
+        small_target = cv2.resize(target, small_size,
+                                  interpolation=cv2.INTER_AREA)
+    else:
+        small_source, small_target = source, target
+    sigma = max(2.0, sigma_fraction * max(small_source.shape[:2]))
     ksize = int(sigma * 4) | 1
-    low_source = cv2.GaussianBlur(source, (ksize, ksize), sigma)
-    low_target = cv2.GaussianBlur(target, (ksize, ksize), sigma)
+    low_source = cv2.GaussianBlur(small_source, (ksize, ksize), sigma)
+    low_target = cv2.GaussianBlur(small_target, (ksize, ksize), sigma)
 
     shift = (low_target - low_source) * float(strength)
+    if scale < 1.0:
+        shift = cv2.resize(shift, (width, height),
+                           interpolation=cv2.INTER_LINEAR)
     # A shift free to run away would repaint the creative wherever the
     # covered surface differs sharply from it; cap it at a strong cast.
     source += np.clip(shift, -64.0, 64.0)
@@ -262,12 +296,26 @@ def add_grain(frame_bgr: np.ndarray, sigma: float, mask: np.ndarray = None,
         return frame_bgr
 
     rng = np.random.default_rng(seed)
-    noise = rng.normal(0.0, float(sigma), frame_bgr.shape[:2]).astype(np.float32)
-    if mask is not None:
-        noise *= (mask.astype(np.float32) / 255.0)
 
-    out = frame_bgr.astype(np.float32) + noise[:, :, None]
-    return np.clip(out, 0, 255).astype(np.uint8)
+    if mask is None:
+        noise = rng.normal(0.0, float(sigma),
+                           frame_bgr.shape[:2]).astype(np.float32)
+        out = frame_bgr.astype(np.float32) + noise[:, :, None]
+        return np.clip(out, 0, 255).astype(np.uint8)
+
+    # The noise is zero wherever the mask is, so the work is confined to the
+    # mask's bounding box: a small insert costs its own area, not a full-
+    # frame noise field and a full-frame widen to float.
+    x, y, w, h = cv2.boundingRect(mask)
+    if w == 0 or h == 0:
+        return frame_bgr
+
+    noise = rng.normal(0.0, float(sigma), (h, w)).astype(np.float32)
+    noise *= mask[y:y + h, x:x + w].astype(np.float32) / 255.0
+    patch = frame_bgr[y:y + h, x:x + w].astype(np.float32) + noise[:, :, None]
+    out = frame_bgr.copy()
+    out[y:y + h, x:x + w] = np.clip(patch, 0, 255).astype(np.uint8)
+    return out
 
 
 # --------------------------------------------------------------------------
@@ -349,6 +397,36 @@ def preserve_highlights(creative_bgr: np.ndarray, reference_bgr: np.ndarray,
     return np.clip(blended, 0, 255).astype(np.uint8)
 
 
+class _ReducedCache:
+    """Remembers recent creatives reduced to their matching size.
+
+    The identity idiom of the morph's ShapeCache: sources compared with
+    ``is`` and the reference held. A still creative resolves to the same
+    array every frame, so its area-filtered reduction happens once; a
+    creative video misses every frame, which is genuinely new work.
+    """
+
+    LIMIT = 8
+
+    def __init__(self):
+        self._entries = {}   # id(source) -> (source, (w, h), result)
+
+    def reduced(self, creative, target_w, target_h):
+        entry = self._entries.get(id(creative))
+        if (entry is not None and entry[0] is creative
+                and entry[1] == (target_w, target_h)):
+            return entry[2]
+        result = cv2.resize(creative, (target_w, target_h),
+                            interpolation=cv2.INTER_AREA)
+        if len(self._entries) >= self.LIMIT and id(creative) not in self._entries:
+            self._entries.pop(next(iter(self._entries)))
+        self._entries[id(creative)] = (creative, (target_w, target_h), result)
+        return result
+
+
+_reduced_cache = _ReducedCache()
+
+
 def photometric_match(creative, base_bgr: np.ndarray, quad,
                       settings: BlendSettings = None,
                       motion=None) -> np.ndarray:
@@ -372,6 +450,23 @@ def photometric_match(creative, base_bgr: np.ndarray, quad,
         return creative
 
     creative = to_bgra(creative)
+
+    # Match at the size the compositor is about to reduce the creative to
+    # anyway. At native resolution every measurement below ran over pixels
+    # destined to be averaged away, with Gaussian kernels that grow with the
+    # artwork -- a print-resolution creative cost seconds per frame. The
+    # reduction is the same area-filtered pass the compositor would apply,
+    # so the pixels that reach the screen are unchanged; it is cached by
+    # identity so a still creative pays for it once.
+    quad_w, quad_h = _quad_pixel_size(quad)
+    supersample = _supersample_factor(int(np.ceil(quad_w)) or 1,
+                                      int(np.ceil(quad_h)) or 1)
+    oh, ow = creative.shape[:2]
+    target_w, target_h = _prescale_target(creative.shape, quad_w, quad_h,
+                                          supersample)
+    if not (target_w > ow * 0.8 and target_h > oh * 0.8):
+        creative = _reduced_cache.reduced(creative, target_w, target_h)
+
     colour, alpha = creative[:, :, :3].copy(), creative[:, :, 3]
 
     height, width = creative.shape[:2]

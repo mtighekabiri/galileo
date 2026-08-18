@@ -9,7 +9,8 @@ import json
 import galileo_core as core
 import galileo_blend as blend
 import galileo_morph as morphlib
-import galileo_deflicker as deflicker
+# galileo_deflicker is imported where it is used: nothing needs it until a
+# video is loaded, so it stays off the startup path.
 
 from PyQt5.QtCore import (
     QObject, QThread, pyqtSignal, Qt, QSize, QUrl, QEvent, QTimer, QPoint, QRect,
@@ -22,9 +23,8 @@ from PyQt5.QtWidgets import (
     QProgressDialog, QScrollArea, QSpinBox, QComboBox, QLineEdit,
     QListWidget, QListWidgetItem, QWIDGETSIZE_MAX)
 from PyQt5.QtGui import (
-    QCursor, QPixmap, QColor, QPainter, QBrush, QPen, QImage, QPolygonF)
-from PyQt5.QtMultimedia import QMediaPlayer, QMediaContent
-from PyQt5.QtMultimediaWidgets import QVideoWidget
+    QCursor, QPixmap, QColor, QFont, QPainter, QBrush, QPen, QImage,
+    QPolygonF)
 
 def app_directory() -> str:
     """Where the application lives — the bundle folder when packaged."""
@@ -70,12 +70,15 @@ def user_data_directory() -> str:
 
 LOG_PATH = os.path.join(user_data_directory(), "app_debug.log")
 
+# INFO by default: the frame loop and the widgets log at DEBUG, and writing
+# every one of those lines to disk for a whole session is a per-frame cost
+# nobody reads. GALILEO_DEBUG=1 restores the full firehose for support.
 logging.basicConfig(
     filename=LOG_PATH,
     filemode='w',
-    level=logging.DEBUG,
+    level=logging.DEBUG if os.environ.get("GALILEO_DEBUG") else logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s')
-logging.debug("Application start; log at %s", LOG_PATH)
+logging.info("Application start; log at %s", LOG_PATH)
 
 # Let a bundled ffmpeg and the segmentation model sitting beside the
 # application be found, so audio and occlusion work without anything installed.
@@ -84,14 +87,24 @@ for _directory in (app_directory(), resource_directory()):
     core.register_model_dir(_directory)
     core.register_model_dir(os.path.join(_directory, core.MODEL_DIR_NAME))
 
-# Record what optional pieces were found. This is the first thing to look at
-# when someone reports that occlusion is greyed out or a render came out silent.
-logging.debug("Frozen: %s | app dir: %s | resources: %s",
-              bool(getattr(sys, "frozen", False)), app_directory(),
-              resource_directory())
-logging.debug("Occlusion model: %s",
-              core.find_model(core.PersonSegmenter.MODEL_FILENAME) or "NOT FOUND")
-logging.debug("ffmpeg: %s", core.find_binary("ffmpeg") or "NOT FOUND")
+logging.info("Frozen: %s | app dir: %s | resources: %s",
+             bool(getattr(sys, "frozen", False)), app_directory(),
+             resource_directory())
+
+
+def log_optional_components():
+    """Record what optional pieces were found.
+
+    This is the first thing to look at when someone reports that occlusion is
+    greyed out or a render came out silent. It is not run at import time
+    because locating ffmpeg can mean walking every PATH entry -- on a slow
+    corporate PATH that is a real stall, paid before anything is on screen --
+    so the window goes up first and this runs on the first idle turn.
+    """
+    logging.info("Occlusion model: %s",
+                 core.find_model(core.PersonSegmenter.MODEL_FILENAME)
+                 or "NOT FOUND")
+    logging.info("ffmpeg: %s", core.find_binary("ffmpeg") or "NOT FOUND")
 
 def log_uncaught_exceptions(exctype, value, tb):
     import traceback
@@ -214,6 +227,14 @@ class BlendDialog(QDialog):
         self.on_change = on_change
         self.original = settings.to_dict()
 
+        # Coalesce slider drags: every preview refresh runs the photometric
+        # match, and a drag delivers far more value changes than anyone can
+        # see. A restartable timer turns a burst into one recomposite.
+        self._preview_timer = QTimer(self)
+        self._preview_timer.setSingleShot(True)
+        self._preview_timer.setInterval(40)
+        self._preview_timer.timeout.connect(lambda: self.on_change())
+
         self.setWindowTitle("Blend into Footage")
         self.setMinimumWidth(460)
         self.setStyleSheet("""
@@ -287,7 +308,7 @@ class BlendDialog(QDialog):
     def _on_slider(self, key, value):
         setattr(self.settings, key, value / 100.0)
         self.value_labels[key].setText(f"{value / 100.0:.2f}")
-        self.on_change()
+        self._preview_timer.start()
 
     def _defaults(self):
         fresh = blend.BlendSettings()
@@ -467,8 +488,11 @@ class MorphDialog(QDialog):
             value = getattr(self.morph, name)
             self.value_labels[name].setText(
                 f"{value:.2f}" if name in self.SCALED else f"{value:.0f}°")
-        self._draw_thumbnail()
+        # The stage first: refresh_display() composites the frame and keeps
+        # the result, and the thumbnail then crops that same composite. The
+        # other way round, both drew it -- two full composites per tick.
         self.on_change()
+        self._draw_thumbnail()
 
     def _draw_on_the_footage(self) -> bool:
         """Show the creative where it will actually be, on the shot itself."""
@@ -614,7 +638,6 @@ class HoverButton(QPushButton):
         self.hover_effect = None
 
     def enterEvent(self, event):
-        logging.debug(f"Hover enter on button '{self.text()}'")
         self.setCursor(QCursor(Qt.PointingHandCursor))
         self.hover_effect = QGraphicsDropShadowEffect(self)
         self.hover_effect.setBlurRadius(15)
@@ -624,7 +647,6 @@ class HoverButton(QPushButton):
         super(HoverButton, self).enterEvent(event)
 
     def leaveEvent(self, event):
-        logging.debug(f"Hover leave on button '{self.text()}'")
         self.setGraphicsEffect(None)
         self.hover_effect = None
         super(HoverButton, self).leaveEvent(event)
@@ -805,6 +827,11 @@ class MagnifierWidget(QWidget):
         self.region = None
         #: Which bend handle the keys are pointing at, as (edge, slot).
         self.selected_control = None
+        #: Geometry derived from the region, computed once per setData rather
+        #: than once per tile: with curving on there are twelve tiles, and
+        #: each was re-tracing the same outline.
+        self._boundary_cache = None
+        self._bounds_cache = None
 
         self.zoom_factor = 8.0
         #: Let each tile pick its own magnification from its size. Scrolling
@@ -892,6 +919,8 @@ class MagnifierWidget(QWidget):
         self.points = [MagnifierPoint.coerce(p, i)
                        for i, p in enumerate(overlay_points or [])]
         self.region = region
+        self._boundary_cache = None
+        self._bounds_cache = None
 
         if zoom_factor is not None:
             self.zoom_factor = float(np.clip(zoom_factor, self.MIN_ZOOM,
@@ -1108,6 +1137,8 @@ class MagnifierWidget(QWidget):
         Taken from the outline rather than the corners so a bend that swings
         wide of them is inside the view rather than cut off by it.
         """
+        if self._bounds_cache is not None:
+            return self._bounds_cache
         points = [(p.x, p.y) for p in self.points]
         if self.region is not None:
             try:
@@ -1119,7 +1150,8 @@ class MagnifierWidget(QWidget):
             return None
         xs = [p[0] for p in points]
         ys = [p[1] for p in points]
-        return min(xs), min(ys), max(xs), max(ys)
+        self._bounds_cache = (min(xs), min(ys), max(xs), max(ys))
+        return self._bounds_cache
 
     def whole_area_point(self):
         """A view of everything at once, centred on the marked area."""
@@ -1298,10 +1330,13 @@ class MagnifierWidget(QWidget):
         def to_tile(x, y):
             return (x * scale + offset_x, y * scale + offset_y)
 
-        try:
-            boundary = core.region_boundary(self.region, samples=48)
-        except Exception:                      # a half-drawn or folded shape
-            return
+        if self._boundary_cache is None:
+            try:
+                self._boundary_cache = core.region_boundary(self.region,
+                                                            samples=48)
+            except Exception:                  # a half-drawn or folded shape
+                return
+        boundary = self._boundary_cache
 
         painter.setPen(QPen(QColor(0, 230, 0, 200), 2))
         mapped = [to_tile(x, y) for x, y in boundary]
@@ -1529,6 +1564,10 @@ class Placement:
         self.overlay_video_cap = None
         self.overlay_video_path = None
         self.inserted_overlay_start_frame = 0
+        # Sequential-decode bookkeeping: the frame count is queried once at
+        # open, and the cursor is the index the capture will read next.
+        self.overlay_video_total = 0
+        self.overlay_video_cursor = 0
 
         # Look
         self.brightness = 0
@@ -1709,6 +1748,8 @@ class TrackingOverlay(QWidget):
     inserted_overlay_is_video = _active_property("inserted_overlay_is_video")
     overlay_video_cap = _active_property("overlay_video_cap")
     overlay_video_path = _active_property("overlay_video_path")
+    overlay_video_total = _active_property("overlay_video_total")
+    overlay_video_cursor = _active_property("overlay_video_cursor")
     inserted_overlay_start_frame = _active_property("inserted_overlay_start_frame")
     brightness = _active_property("brightness")
     contrast = _active_property("contrast")
@@ -1791,9 +1832,10 @@ class TrackingOverlay(QWidget):
                     hover_idx = i
                     break
 
-            if hover_idx != self.active_point_index:
-                self.active_point_index = hover_idx
-                self.shape_changed.emit()
+            # Only note it. Nothing reads active_point_index to paint, and
+            # emitting shape_changed here recomposited the whole frame every
+            # time the pointer crossed a handle.
+            self.active_point_index = hover_idx
 
         super(TrackingOverlay, self).mouseMoveEvent(event)
 
@@ -2063,6 +2105,9 @@ class TrackingOverlay(QWidget):
             self.inserted_overlay_is_video = False
             self.overlay_video_cap = None
             return
+        self.overlay_video_total = int(
+            self.overlay_video_cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        self.overlay_video_cursor = 0
 
         self.refresh_preview()
 
@@ -2085,18 +2130,27 @@ class TrackingOverlay(QWidget):
         if not self.inserted_overlay_is_video or not self.overlay_video_cap:
             return
 
-        total_overlay_frames = int(self.overlay_video_cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        if overlay_frame_idx < 0 or overlay_frame_idx >= total_overlay_frames:
+        if overlay_frame_idx < 0 or overlay_frame_idx >= self.overlay_video_total:
             self.overlay_bgra = None
             self.update()
             return
 
-        self.overlay_video_cap.set(cv2.CAP_PROP_POS_FRAMES, overlay_frame_idx)
+        # Playback asks for consecutive indices, and a plain read() is all
+        # that needs. Seeking per frame forced a keyframe seek and a GOP
+        # re-decode for every step on long-GOP creatives -- the renderer has
+        # advanced a cursor this way all along.
+        if overlay_frame_idx != self.overlay_video_cursor:
+            self.overlay_video_cap.set(cv2.CAP_PROP_POS_FRAMES,
+                                       overlay_frame_idx)
         ret, frame = self.overlay_video_cap.read()
         if not ret:
             self.overlay_bgra = None
+            # Force a real seek on the next request rather than trusting a
+            # cursor the failed read has made meaningless.
+            self.overlay_video_cursor = -1
             self.update()
             return
+        self.overlay_video_cursor = overlay_frame_idx + 1
 
         self.overlay_bgra = core.to_bgra(frame)
         self.update()
@@ -2438,11 +2492,13 @@ class TitleBar(QWidget):
         self.title_label.setAlignment(Qt.AlignCenter)
         
         self.logo_label = QLabel()
-        # A missing file gives a null pixmap rather than raising, so the
-        # except this used to sit behind could never fire. Hidden rather than
-        # given placeholder text: the word "Logo" sitting beside the title is
-        # more obviously missing than a title with nothing after it.
-        logo = QPixmap(os.path.join(resource_directory(), "logo.png"))
+        # Hidden rather than given placeholder text when the file is absent:
+        # the word "Logo" sitting beside the title is more obviously missing
+        # than a title with nothing after it. The exists() check first --
+        # a missing file gives a null pixmap rather than raising, but only
+        # after QPixmap has tried every image plugin against it.
+        logo_path = os.path.join(resource_directory(), "logo.png")
+        logo = QPixmap(logo_path) if os.path.exists(logo_path) else QPixmap()
         if logo.isNull():
             logging.debug("no logo.png alongside the application")
             self.logo_label.hide()
@@ -2674,8 +2730,13 @@ class CentralPanel(QWidget):
         # plate whose lighting holds still.
         self.deflicker = None
         #: What a quick look at the clip found when it was opened, so the
-        #: option can say what it would be correcting.
+        #: option can say what it would be correcting. Filled in by a worker
+        #: thread shortly after a load; media_generation stamps which video a
+        #: finished scan belongs to so a stale one is dropped.
         self.flicker_report = None
+        self.flicker_scan_thread = None
+        self.flicker_scan_worker = None
+        self.media_generation = 0
         self.fps = 30
 
         # The single source of truth for "which frame is on screen". Deriving
@@ -2685,9 +2746,11 @@ class CentralPanel(QWidget):
         self.current_frame_index = 0
         self.total_frames = 0
 
-        # Person segmentation for occlusion, built on first use.
+        # Person segmentation for occlusion, built on first use. The cache
+        # holds (frame, quantised-quad cell, mask) for the frame on screen.
         self.segmenter = None
         self.occlusion_enabled = False
+        self._occlusion_cache = None
 
         # 1) The container for video + overlay.
         #
@@ -2726,7 +2789,7 @@ class CentralPanel(QWidget):
         self.tracking_overlay.setFocusPolicy(Qt.StrongFocus)
         self.tracking_overlay.raise_()
         self.tracking_overlay.hide()
-        self.tracking_overlay.shape_changed.connect(self.on_shape_changed)
+        self.tracking_overlay.shape_changed.connect(self._queue_shape_refresh)
         self.tracking_overlay.selection_changed.connect(self.update_magnifier)
 
         # Frame label
@@ -2896,16 +2959,22 @@ class CentralPanel(QWidget):
         self.slider.valueChanged.connect(self.on_slider_scrub)
         self.slider.sliderPressed.connect(self.on_slider_pressed)
         self.slider.sliderReleased.connect(self.on_slider_released)
-        self.slider.valueChanged.connect(self.on_slider_value_changed)
 
         # Timers
         self.timer = QTimer()
         self.timer.timeout.connect(self.read_frame)
 
+        # Started when a video is loaded; ticking at 10 Hz with nothing to
+        # show was pure idle load.
         self.frame_timer = QTimer()
         self.frame_timer.setInterval(100)
         self.frame_timer.timeout.connect(self.update_frame_label)
-        self.frame_timer.start()
+
+        # Whether a coalesced shape refresh is already scheduled for this
+        # event-loop turn, and the newest scrub position waiting to decode.
+        self._shape_refresh_queued = False
+        self._scrub_queued = False
+        self._scrub_target = None
 
         # Focus
         self.setFocusPolicy(Qt.StrongFocus)
@@ -2987,15 +3056,13 @@ class CentralPanel(QWidget):
 
     def on_forward(self):
         if self.cap and self.cap.isOpened():
-            total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
-            # Get the index of the currently displayed frame
-            current_frame_index = int(self.cap.get(cv2.CAP_PROP_POS_FRAMES)) - 1
-            # Calculate the target frame, ensuring it doesn't exceed the total
-            new_frame_index = min(total_frames - 1, current_frame_index + 1)
-
-            # Only proceed if there is a change
-            if new_frame_index != current_frame_index:
-                self.cap.set(cv2.CAP_PROP_POS_FRAMES, new_frame_index)
+            # The capture already sits at the next frame after every read, so
+            # stepping forward is a bare read_frame(). Seeking to the position
+            # it was already at forced a keyframe seek and a GOP re-decode on
+            # long-GOP footage for a one-frame step.
+            new_frame_index = min(self.total_frames - 1,
+                                  self.current_frame_index + 1)
+            if new_frame_index != self.current_frame_index:
                 self.read_frame()
                 if self.tracking_mode:
                     self.tracking_overlay.setFocus()
@@ -3010,17 +3077,20 @@ class CentralPanel(QWidget):
         elif frame_index >= total_frames:
             frame_index = total_frames - 1
 
-        self.cap.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
         self.playing = False
         self.timer.stop()
         self.play_pause_btn.setIcon(self.style().standardIcon(QStyle.SP_MediaPlay))
-        
+
         # Turn off tracking on jump.
         self.switch.setChecked(False)
         self.tracking_mode = False
         self.reset_tracker()
 
-        self.read_frame()
+        # A scrub usually decoded this exact frame moments ago on the way to
+        # the release; do not seek and decode it a second time.
+        if frame_index != self.current_frame_index or self.prev_frame is None:
+            self.cap.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
+            self.read_frame()
 
         # Show this frame's shape if it has one, otherwise keep what is on
         # screen so the user can carry it to a frame that needs marking.
@@ -3104,6 +3174,20 @@ class CentralPanel(QWidget):
         self.tracking_label.setMinimumWidth(
             max(150, self.tracking_label.sizeHint().width()))
 
+    def _queue_shape_refresh(self):
+        # Coalesce bursts. A corner drag emits shape_changed for every mouse
+        # position, and each one used to recomposite the whole frame; one
+        # composite at the end of the event-loop turn shows the same final
+        # geometry. Direct calls to on_shape_changed stay synchronous.
+        if self._shape_refresh_queued:
+            return
+        self._shape_refresh_queued = True
+        QTimer.singleShot(0, self._flush_shape_refresh)
+
+    def _flush_shape_refresh(self):
+        self._shape_refresh_queued = False
+        self.on_shape_changed()
+
     def on_shape_changed(self):
         # A hand edit invalidates the tracker's anchor, so drop it; it will be
         # rebuilt from the corrected shape on the next tracked frame.
@@ -3123,7 +3207,26 @@ class CentralPanel(QWidget):
             return
         display_frame = self.composite_placements(self.prev_frame)
         self.display_frame = display_frame
+        self._show_composite(display_frame)
 
+    def _show_composite(self, display_frame):
+        """Put a composited frame on the video label, scaled once on the way.
+
+        The label has setScaledContents on, and handing it the full-
+        resolution pixmap made Qt redo a full-frame smooth downscale on
+        every setPixmap -- its cache is invalidated each time. Shrinking to
+        the label's own size here does that work once with INTER_AREA, and
+        the colour conversion then runs on the small image too. Coordinate
+        mapping is untouched: display_to_raw derives its scale from
+        prev_frame's shape against the label width, never from the pixmap.
+        """
+        h, w = display_frame.shape[:2]
+        label_w = self.video_label.width()
+        label_h = self.video_label.height()
+        if 0 < label_w < w:
+            display_frame = cv2.resize(display_frame,
+                                       (label_w, max(1, label_h)),
+                                       interpolation=cv2.INTER_AREA)
         frame_rgb = cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB)
         h, w, ch = frame_rgb.shape
         q_img = QImage(frame_rgb.data, w, h, ch * w, QImage.Format_RGB888)
@@ -3254,26 +3357,24 @@ class CentralPanel(QWidget):
         self.prev_frame = frame.copy()
         display_frame = self.composite_placements(frame)
         self.display_frame = display_frame
-
-        frame_rgb = cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB)
-        h_frame, w_frame, ch = frame_rgb.shape
-        q_img = QImage(frame_rgb.data, w_frame, h_frame, ch * w_frame,
-                       QImage.Format_RGB888)
-        self.video_label.setPixmap(QPixmap.fromImage(q_img))
+        self._show_composite(display_frame)
 
         self.update_magnifier()
 
     def update_frame_label(self):
-        if self.cap and self.cap.isOpened():
-            pos_msec = self.cap.get(cv2.CAP_PROP_POS_MSEC)
-            frame_idx = int(pos_msec / (1000.0 / self.fps)) if self.fps>0 else 0
-            self.frame_label.setText(f"Frame: {frame_idx}")
+        # From the cached position, not capture property queries: three
+        # cap.get() calls ten times a second added up, and the cached index
+        # is the single source of truth anyway. The +1 keeps the numbers the
+        # POS_MSEC derivation always displayed: the position after the shown
+        # frame was read.
+        if self.cap and self.cap.isOpened() and self.fps > 0:
+            shown = (self.current_frame_index + 1
+                     if self.prev_frame is not None else 0)
+            self.frame_label.setText(f"Frame: {shown}")
 
-            current_time = ms_to_mmss(int(pos_msec))
-            frame_count = self.cap.get(cv2.CAP_PROP_FRAME_COUNT)
-            if frame_count > 0 and self.fps > 0:
-                total_duration_ms = (frame_count / self.fps) * 1000
-                total_str = ms_to_mmss(int(total_duration_ms))
+            current_time = ms_to_mmss(int(shown * 1000.0 / self.fps))
+            if self.total_frames > 0:
+                total_str = ms_to_mmss(int(self.total_frames / self.fps * 1000))
             else:
                 total_str = "00:00"
             self.timestamp_label.setText(f"{current_time} / {total_str}")
@@ -3403,7 +3504,7 @@ class CentralPanel(QWidget):
 
         occlusion = None
         if self.occlusion_enabled:
-            occlusion = self.occlusion_mask(frame, None)
+            occlusion = self.occlusion_for_frame(frame, ready)
 
         out = frame
         for placement in ready:
@@ -3425,21 +3526,6 @@ class CentralPanel(QWidget):
                                       core.quad_to_mask(region.corners, w, h),
                                       seed=self.current_frame_index)
         return out
-
-    def apply_grain(self, composited, source_frame, region):
-        """Lay matched sensor noise over the insert.
-
-        Applied after the warp, in frame space: grain added to the creative
-        beforehand would be resampled along with it and come out the wrong size
-        for the shot.
-        """
-        overlay = self.tracking_overlay
-        sigma = overlay.grain_for(source_frame, region.corners)
-        if sigma <= 0.1:
-            return composited
-        h, w = composited.shape[:2]
-        mask = core.quad_to_mask(region.corners, w, h)
-        return blend.add_grain(composited, sigma, mask, seed=self.current_frame_index)
 
     def track_placement(self, placement, frame, frame_index) -> bool:
         """Follow one placement's surface into this frame and record it.
@@ -3512,6 +3598,29 @@ class CentralPanel(QWidget):
             recorded = placement.tracking_history.get(frame_index)
             if recorded:
                 placement.points = recorded[:]
+
+    def occlusion_for_frame(self, frame, placements):
+        """The person mask for this frame, cropped near the inserts.
+
+        Two savings over segmenting the naked frame every composite. The
+        crop: the segmenter's own docstring says a padded crop around the
+        quad is both cheaper and better, because the fixed 192x192 network
+        input keeps a distant pedestrian visible at all -- and every
+        full-frame resize/dilate/blur it does afterwards shrinks with it.
+        The cache: a corner drag recomposites the same paused frame many
+        times, and the people in it have not moved between mouse events.
+        """
+        union = core.union_quad([p.points for p in placements
+                                 if len(p.points) == 4])
+        if union is None:
+            return self.occlusion_mask(frame, None)
+        cell = tuple(int(v) // 32 for v in union.reshape(-1))
+        cached = self._occlusion_cache
+        if (cached is not None and cached[0] is frame and cached[1] == cell):
+            return cached[2]
+        mask = self.occlusion_mask(frame, union)
+        self._occlusion_cache = (frame, cell, mask)
+        return mask
 
     def occlusion_mask(self, frame, quad):
         """A mask of people in front of the surface, or None if switched off."""
@@ -3681,7 +3790,10 @@ class CentralPanel(QWidget):
         # by falling back rather than holding a second reference to it.
         composited = (self.display_frame if overlay.ready_placements() else None)
         self.magnifier.setData(
-            base_frame=self.prev_frame.copy(),
+            # By reference, like composited: nothing mutates a frame in place
+            # -- read_frame replaces prev_frame wholesale -- and the copy here
+            # was a full-resolution memcpy per frame and per drag event.
+            base_frame=self.prev_frame,
             overlay_points=points,
             selected_index=selected,
             region=overlay.current_region() if len(overlay.points) == 4 else None,
@@ -3772,17 +3884,21 @@ class CentralPanel(QWidget):
         self.current_frame_index = 0
         self.reset_tracker()
 
-        ret, frame = self.cap.read()
-        if ret:
-            self.prev_frame = frame
-            self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-            self.read_frame()
-        else:
+        # One decode, not two: read_frame() decodes frame 0 and records it as
+        # prev_frame itself. The old pre-read-then-seek-back decoded the same
+        # frame twice on every load. prev_frame is cleared first so a clip
+        # whose first frame will not decode is caught rather than masked by
+        # the previous video's frame.
+        self.prev_frame = None
+        self.read_frame()
+        if self.prev_frame is None:
             logging.error("Failed to read initial frame from video.")
             return
 
         self.playing = False
         self.timer.stop()
+        if not self.frame_timer.isActive():
+            self.frame_timer.start()
         self.play_pause_btn.setIcon(self.style().standardIcon(QStyle.SP_MediaPlay))
         self.layout_video_stage()   # the aspect ratio is only known now
         logging.debug(f"Loaded {file_path}, FPS={self.fps}")
@@ -3860,33 +3976,92 @@ class CentralPanel(QWidget):
             
         self.jump_to_frame(target_frame)
 
-    def on_slider_value_changed(self, value):
-        self.frame_label.setText(f"Frame: {value}")
-
     def on_slider_scrub(self, value):
-        if self.cap and self.cap.isOpened():
-            self.cap.set(cv2.CAP_PROP_POS_FRAMES, value)
-            self.read_frame()
+        # The one slot for a value change: show the number at once, note the
+        # newest target, and schedule a single decode for it at the end of
+        # the turn. Seeking and fully decoding for every pixel of a drag
+        # queued seeks faster than they could complete -- and valueChanged
+        # used to be connected twice on top of that.
+        self.frame_label.setText(f"Frame: {value}")
+        if not (self.cap and self.cap.isOpened()):
+            return
+        self._scrub_target = value
+        if not self._scrub_queued:
+            self._scrub_queued = True
+            QTimer.singleShot(0, self._flush_scrub)
+
+    def _flush_scrub(self):
+        self._scrub_queued = False
+        target = self._scrub_target
+        self._scrub_target = None
+        if target is None or not (self.cap and self.cap.isOpened()):
+            return
+        if target == self.current_frame_index and self.prev_frame is not None:
+            return   # already showing it
+        self.cap.set(cv2.CAP_PROP_POS_FRAMES, target)
+        self.read_frame()
 
     # -- flickering lighting ------------------------------------------------
 
     def scan_for_flicker(self):
-        """Take a quick look at the clip for pulsing lighting.
+        """Start a quick look at the clip for pulsing lighting.
 
         A window from the middle rather than the whole clip: this runs on every
         video that is opened, and a full pass over a long one would be a stall
         on each load for footage that usually turns out to be fine. The full
         measurement only happens if the correction is actually switched on.
+
+        Even the bounded window is a stack of decodes, so it runs on a worker
+        thread; opening a video no longer freezes while it looks. The menu
+        learns the verdict when on_flicker_scanned lands.
         """
         self.deflicker = None
         self.flicker_report = None
+        self.media_generation += 1
         path = getattr(self, "current_video_path", None)
         if not path:
             return None
+
+        thread = QThread(self)
+        worker = FlickerScanWorker(path, self.media_generation)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.finished.connect(self.on_flicker_scanned)
+        # Direct so the thread's loop is told to exit from the worker side
+        # the moment the work is done. Queued, the quit would sit in the GUI
+        # queue -- and anything blocked in thread.wait() would be waiting on
+        # itself to deliver it. QThread.quit is documented thread-safe.
+        worker.finished.connect(thread.quit, Qt.DirectConnection)
+        thread.finished.connect(thread.deleteLater)
+        self.flicker_scan_thread = thread
+        self.flicker_scan_worker = worker
+        thread.start()
+        return None
+
+    def on_flicker_scanned(self, generation, report):
+        if generation != self.media_generation:
+            return   # a different video is loaded now; verdict is stale
+        self.flicker_report = report
+        mw = self.window()
+        if isinstance(mw, QMainWindow) and hasattr(mw, "refresh_deflicker_action"):
+            mw.refresh_deflicker_action()
+
+    def wait_for_flicker_scan(self, timeout_ms=30000):
+        """Block until a pending lighting scan has landed, and return it.
+
+        For the few places that need the verdict right now: the deflicker
+        toggle picks its measurement mode from it, and the tests assert on
+        it. An ordinary video open never waits.
+        """
+        thread = self.flicker_scan_thread
         try:
-            self.flicker_report = deflicker.scan(path)
-        except cv2.error as exc:
-            logging.warning("Could not scan %s for flicker: %s", path, exc)
+            running = thread is not None and thread.isRunning()
+        except RuntimeError:      # already finished and deleted on the Qt side
+            running = False
+        if running:
+            thread.wait(timeout_ms)
+        # The verdict arrives as a queued signal; deliver it before returning.
+        QApplication.processEvents()
         return self.flicker_report
 
     def set_deflicker(self, on: bool, progress=None):
@@ -3908,11 +4083,20 @@ class CentralPanel(QWidget):
         path = getattr(self, "current_video_path", None)
         if not path:
             return None
-        mode = "auto"
+        mode = self.deflicker_mode()
+        import galileo_deflicker as deflicker
+        return self.apply_deflicker(
+            deflicker.Deflicker.measure(path, mode=mode, progress=progress))
+
+    def deflicker_mode(self) -> str:
+        """Which measurement the load-time scan says this clip needs."""
         if self.flicker_report is not None and self.flicker_report.kind != "steady":
-            mode = self.flicker_report.kind
-        self.deflicker = deflicker.Deflicker.measure(path, mode=mode,
-                                                     progress=progress)
+            return self.flicker_report.kind
+        return "auto"
+
+    def apply_deflicker(self, fixer):
+        """Install a measured corrector and bring the shown frame up to date."""
+        self.deflicker = fixer
         # The frame on screen was decoded before this existed, so re-read it
         # rather than leave the preview a frame behind the setting.
         if self.cap and self.cap.isOpened():
@@ -4383,10 +4567,16 @@ class RenderWorker(QObject):
 
                 # Segment once per frame and share the mask: the model is the
                 # slow part and it does not depend on which insert is drawn.
+                # Cropped to a quad around the frame's inserts, same as the
+                # preview -- better for distant people, cheaper everywhere.
                 occlusion = None
                 if segmenter is not None:
+                    union = core.union_quad(
+                        [np.float32(p.dense[frame_idx]) * p.scale
+                         for p in placements
+                         if p.dense.get(frame_idx) is not None])
                     try:
-                        occlusion = segmenter.mask(base_frame)
+                        occlusion = segmenter.mask(base_frame, union)
                     except cv2.error as exc:
                         logging.warning("Segmentation failed on frame %d: %s",
                                         frame_idx, exc)
@@ -4441,6 +4631,72 @@ class RenderWorker(QObject):
 
     def cancel(self):
         self.is_canceled = True
+
+
+class FlickerScanWorker(QObject):
+    """Samples a clip's lighting off the GUI thread.
+
+    The quick look that powers the deflicker menu's verdict decodes a bounded
+    window of frames; run inline it froze the interface for most of a second
+    on every video open. Same shape as RenderWorker: plain data in, a signal
+    out, and the worker opens its own capture -- captures never cross threads.
+    The generation stamp lets a scan that finishes after another video was
+    loaded be recognised as stale and dropped.
+    """
+    finished = pyqtSignal(int, object)  # (generation, report or None)
+
+    def __init__(self, path, generation):
+        super().__init__()
+        self.path = path
+        self.generation = generation
+
+    def run(self):
+        import galileo_deflicker as deflicker
+        report = None
+        try:
+            report = deflicker.scan(self.path)
+        except cv2.error as exc:
+            logging.warning("Could not scan %s for flicker: %s",
+                            self.path, exc)
+        self.finished.emit(self.generation, report)
+
+
+class DeflickerMeasureWorker(QObject):
+    """Measures a clip's lighting gains off the GUI thread.
+
+    The whole-clip measurement behind the deflicker option took seconds and
+    was kept responsive only by pumping processEvents from its progress
+    callback, which could re-enter the frame loop.
+    """
+    progress = pyqtSignal(int, int)
+    finished = pyqtSignal(int, object)  # (generation, Deflicker or None)
+
+    def __init__(self, path, mode, generation):
+        super().__init__()
+        self.path = path
+        self.mode = mode
+        self.generation = generation
+        self.is_canceled = False
+
+    def run(self):
+        import galileo_deflicker as deflicker
+
+        def report(done, count):
+            self.progress.emit(done, count)
+            return not self.is_canceled
+
+        fixer = None
+        try:
+            fixer = deflicker.Deflicker.measure(self.path, mode=self.mode,
+                                                progress=report)
+        except cv2.error as exc:
+            logging.warning("Could not measure %s for deflicker: %s",
+                            self.path, exc)
+        self.finished.emit(self.generation, fixer)
+
+    def cancel(self):
+        self.is_canceled = True
+
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -4563,8 +4819,6 @@ class MainWindow(QMainWindow):
         main_widget.setLayout(main_layout)
         self.setCentralWidget(main_widget)
         self._connect_signals()
-        self.showMaximized()
-        logging.debug("MainWindow shown maximized")
 
         self.inserted_overlay_widget = None
         self.dirty = False
@@ -4573,8 +4827,40 @@ class MainWindow(QMainWindow):
         self.last_render = None
         self.pending_render = None
         self.last_output_dir = ""
+
+        # One timer animates every video card in the library, at a thumbnail
+        # rate. A timer per card at the clip's own fps meant three loaded
+        # creatives ran three full-rate decode loops on the GUI thread for
+        # 200-pixel previews.
+        self.card_preview_updaters = []
+        self.card_preview_timer = QTimer(self)
+        self.card_preview_timer.setInterval(100)
+        self.card_preview_timer.timeout.connect(self._tick_card_previews)
+
         self.refresh_title()
         self.refresh_placement_list()
+        logging.info("MainWindow constructed")
+
+    def register_card_preview(self, widget, advance):
+        """Animate a library card's thumbnail on the shared preview timer."""
+        self.card_preview_updaters.append((widget, advance))
+        if not self.card_preview_timer.isActive():
+            self.card_preview_timer.start()
+
+    def deregister_card_preview(self, widget):
+        self.card_preview_updaters = [
+            (w, fn) for w, fn in self.card_preview_updaters if w is not widget]
+        if not self.card_preview_updaters:
+            self.card_preview_timer.stop()
+
+    def _tick_card_previews(self):
+        # Thumbnails yield to real playback: while the main video runs, the
+        # GUI thread's spare time belongs to it, and the cards hold still.
+        if self.central_panel.playing:
+            return
+        for widget, advance in list(self.card_preview_updaters):
+            if getattr(widget, "preview_playing", False):
+                advance()
 
     # -- unsaved work ------------------------------------------------------
 
@@ -4704,6 +4990,15 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         if self.confirm_discard("Close anyway?"):
+            # Let background measurement threads finish rather than tearing
+            # down Qt underneath them.
+            for thread in (getattr(self, "deflicker_measure_thread", None),
+                           self.central_panel.flicker_scan_thread):
+                try:
+                    if thread is not None and thread.isRunning():
+                        thread.wait(10000)
+                except RuntimeError:
+                    pass          # already finished and deleted on the Qt side
             event.accept()
         else:
             event.ignore()
@@ -4964,8 +5259,11 @@ class MainWindow(QMainWindow):
             "deflicker": (self.central_panel.deflicker.mode
                           if self.central_panel.deflicker is not None else None),
         }
+        # Compact separators, not indent=2: the tracking history is one entry
+        # per frame of full-precision floats, and pretty-printing roughly
+        # doubled the file for nobody to read. Loading accepts either form.
         with open(path, "w") as f:
-            json.dump(data, f, indent=2)
+            json.dump(data, f, separators=(",", ":"))
         self.mark_clean()
         QMessageBox.information(self, "Saved", f"Project saved to:\n{path}")
 
@@ -5027,8 +5325,10 @@ class MainWindow(QMainWindow):
                                 f"Could not find the creative at:\n{overlay_path}")
 
         # Only the setting was saved, so the gains are measured again from the
-        # footage. Done through the same handler the menu uses, which is what
-        # puts a progress dialog on the pass rather than an unexplained pause.
+        # footage. Done through the same handler the menu uses: the measure
+        # runs on its worker thread with a progress dialog, so the project
+        # opens immediately and plays uncorrected for the few seconds until
+        # the correction lands, instead of freezing the whole app for them.
         mode = data.get("deflicker")
         action = getattr(self.title_bar, "deflicker_action", None)
         if mode and base_video and action is not None:
@@ -5327,7 +5627,12 @@ class MainWindow(QMainWindow):
                 f"Flicker found: {report.whole:.1f}% frame to frame{beat}.")
 
     def toggle_deflicker(self, enabled: bool):
-        """Even out lighting that pulses, before anything else sees the frame."""
+        """Even out lighting that pulses, before anything else sees the frame.
+
+        The whole-clip measurement runs on a worker thread; the progress
+        dialog is window-modal, so the app stays alive and cancellable while
+        it works instead of being held together with processEvents.
+        """
         panel = self.central_panel
         if not enabled:
             panel.set_deflicker(False)
@@ -5337,6 +5642,10 @@ class MainWindow(QMainWindow):
             self.title_bar.deflicker_action.setChecked(False)
             return
 
+        # The measurement mode comes from the load-time scan -- a bounded
+        # sample that has normally landed long before anyone reaches the menu.
+        panel.wait_for_flicker_scan()
+
         total = panel.total_frames or 0
         dialog = QProgressDialog("Measuring the lighting…", "Cancel", 0,
                                  max(total, 1), self)
@@ -5344,20 +5653,44 @@ class MainWindow(QMainWindow):
         dialog.setWindowModality(Qt.WindowModal)
         dialog.setMinimumDuration(400)
 
-        def progress(done, count):
+        thread = QThread(self)
+        worker = DeflickerMeasureWorker(panel.current_video_path,
+                                        panel.deflicker_mode(),
+                                        panel.media_generation)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+
+        def on_progress(done, count):
             dialog.setMaximum(max(count, done, 1))
             dialog.setValue(done)
-            QApplication.processEvents()
-            return not dialog.wasCanceled()
 
-        try:
-            fixer = panel.set_deflicker(True, progress=progress)
-        finally:
-            # Read this before closing: closing a QProgressDialog rejects it,
-            # which sets wasCanceled, so asking afterwards always says the
-            # user cancelled and the "nothing to correct" notice never showed.
-            cancelled = dialog.wasCanceled()
+        worker.progress.connect(on_progress)
+        # Direct on purpose: the worker thread's event loop is busy inside
+        # measure(), so a queued cancel would only arrive after the work it
+        # is meant to stop. This just sets a flag the callback polls.
+        dialog.canceled.connect(worker.cancel, Qt.DirectConnection)
+        worker.finished.connect(self.on_deflicker_measured)
+        # Direct for the same reason as the flicker scan: wait_for_ helpers
+        # block the GUI thread, which is where a queued quit would land.
+        worker.finished.connect(thread.quit, Qt.DirectConnection)
+        thread.finished.connect(thread.deleteLater)
+
+        self.deflicker_measure_dialog = dialog
+        self.deflicker_measure_thread = thread
+        self.deflicker_measure_worker = worker
+        thread.start()
+
+    def on_deflicker_measured(self, generation, fixer):
+        panel = self.central_panel
+        worker = getattr(self, "deflicker_measure_worker", None)
+        cancelled = bool(worker and worker.is_canceled)
+        dialog = getattr(self, "deflicker_measure_dialog", None)
+        if dialog is not None:
+            self.deflicker_measure_dialog = None
             dialog.close()
+
+        if generation != panel.media_generation:
+            return   # measured a clip that is no longer the one loaded
 
         if fixer is None:
             # Either nothing to correct or the user cancelled; either way the
@@ -5371,6 +5704,7 @@ class MainWindow(QMainWindow):
                     "nothing to even out.")
             return
 
+        panel.apply_deflicker(fixer)
         self.mark_dirty()
         kind = ("banding, row by row" if fixer.mode == "rows"
                 else "whole-frame flicker")
@@ -5378,6 +5712,17 @@ class MainWindow(QMainWindow):
         self.title_bar.deflicker_action.setToolTip(
             f"Steadying {kind} across {len(fixer)} frames. "
             "Untick to see the footage as shot.")
+
+    def wait_for_deflicker_measure(self, timeout_ms=120000):
+        """Block until a pending lighting measurement has been handled."""
+        thread = getattr(self, "deflicker_measure_thread", None)
+        try:
+            running = thread is not None and thread.isRunning()
+        except RuntimeError:      # already finished and deleted on the Qt side
+            running = False
+        if running:
+            thread.wait(timeout_ms)
+        QApplication.processEvents()
 
     def open_blend_dialog(self):
         """Tune how the creative is matched to the shot, with a live preview."""
@@ -5414,11 +5759,14 @@ class MainWindow(QMainWindow):
             return
 
         def on_the_footage():
-            """The creative as it currently sits on the shot, cropped to it."""
-            frame = panel.prev_frame
-            if frame is None or len(overlay.points) != 4:
+            """The creative as it currently sits on the shot, cropped to it.
+
+            Reads the composite refresh_display() just produced rather than
+            compositing again -- the dialog refreshes the stage first.
+            """
+            composited = panel.display_frame
+            if composited is None or len(overlay.points) != 4:
                 return None
-            composited = panel.composite_placements(frame)
             height, width = composited.shape[:2]
             # A generous margin: how a shape suits a panel is partly a
             # question about what surrounds the panel.
@@ -5454,8 +5802,10 @@ class MainWindow(QMainWindow):
             return
         # Convert keys to strings so JSON doesn't break
         data = {str(k): v for k, v in self.central_panel.tracking_overlay.tracking_history.items()}
+        # Compact for the same reason as project files: per-frame data,
+        # nobody reads it by eye, half the bytes.
         with open(path, "w") as f:
-            json.dump(data, f, indent=2)
+            json.dump(data, f, separators=(",", ":"))
         QMessageBox.information(self, "Saved", f"Tracking saved to:\n{path}")
 
     def load_tracking_points(self):
@@ -5661,7 +6011,7 @@ class MainWindow(QMainWindow):
         overlay_widget.video_path = None
         overlay_widget.image_path = None
         overlay_widget.pixmap = None
-        overlay_widget.preview_timer = None
+        overlay_widget.preview_playing = False
         overlay_widget.preview_cap = None
 
         # This is the main vertical layout for the entire widget card.
@@ -5766,42 +6116,43 @@ class MainWindow(QMainWindow):
             preview_label.setCursor(QCursor(Qt.PointingHandCursor))
             overlay_layout.addWidget(preview_label)
 
-            # Create a VideoCapture and QTimer specific to this widget
+            # A VideoCapture specific to this widget, advanced by the shared
+            # card timer rather than a timer of its own.
             overlay_widget.preview_cap = cv2.VideoCapture(file_path)
-            overlay_widget.preview_timer = QTimer(overlay_widget) # Parent to the widget
+            overlay_widget.preview_playing = True
 
             def update_preview_frame():
-                if not overlay_widget.preview_cap or not overlay_widget.preview_cap.isOpened():
+                cap = overlay_widget.preview_cap
+                if not cap or not cap.isOpened():
                     return
-                
-                ret, frame = overlay_widget.preview_cap.read()
+
+                ret, frame = cap.read()
                 if not ret: # If end of video, loop back to the start
-                    overlay_widget.preview_cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                    ret, frame = overlay_widget.preview_cap.read()
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                    ret, frame = cap.read()
                     if not ret: return
 
+                # Shrink to the card first: colour-converting and smooth-
+                # scaling the full-resolution frame per tick was the bulk of
+                # the cost of having a video in the library at all.
+                h, w = frame.shape[:2]
+                if w > 200:
+                    frame = cv2.resize(frame, (200, max(1, round(h * 200 / w))),
+                                       interpolation=cv2.INTER_AREA)
                 frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 h, w, ch = frame_rgb.shape
-                bytes_per_line = ch * w
-                q_img = QImage(frame_rgb.data, w, h, bytes_per_line, QImage.Format_RGB888)
-                pixmap = QPixmap.fromImage(q_img)
-                preview_label.setPixmap(pixmap.scaledToWidth(200, Qt.SmoothTransformation))
+                q_img = QImage(frame_rgb.data, w, h, ch * w,
+                               QImage.Format_RGB888)
+                preview_label.setPixmap(QPixmap.fromImage(q_img))
 
             def toggle_preview_playback(event):
-                if overlay_widget.preview_timer.isActive():
-                    overlay_widget.preview_timer.stop()
-                else:
-                    overlay_widget.preview_timer.start()
+                overlay_widget.preview_playing = not overlay_widget.preview_playing
                 event.accept()
 
             preview_label.mousePressEvent = toggle_preview_playback
 
             if overlay_widget.preview_cap.isOpened():
-                fps = overlay_widget.preview_cap.get(cv2.CAP_PROP_FPS)
-                interval = int(1000 / fps) if fps > 0 else 40 # Default to 25fps
-                overlay_widget.preview_timer.setInterval(interval)
-                overlay_widget.preview_timer.timeout.connect(update_preview_frame)
-                overlay_widget.preview_timer.start()
+                self.register_card_preview(overlay_widget, update_preview_frame)
             else:
                 preview_label.setText("Preview failed")
 
@@ -5813,8 +6164,7 @@ class MainWindow(QMainWindow):
             if confirm == QMessageBox.Yes:
                 if overlay_widget.inserted:
                     uninsert_overlay()
-                if overlay_widget.preview_timer:
-                    overlay_widget.preview_timer.stop()
+                self.deregister_card_preview(overlay_widget)
                 if overlay_widget.preview_cap:
                     overlay_widget.preview_cap.release()
                 overlay_widget.deleteLater()
@@ -5917,24 +6267,35 @@ class MainWindow(QMainWindow):
         if self.inserted_overlay_widget is not None:
             self.inserted_overlay_widget = None
 
-    def make_video_click_handler(self, player, original_event):
-        def handler(event):
-            if player.state() == QMediaPlayer.PlayingState:
-                player.pause()
-            else:
-                player.play()
-            original_event(event)
-        return handler
-
 if __name__ == '__main__':
-    logging.debug("Application about to start QApplication")
+    logging.info("Application about to start QApplication")
     app = QApplication(sys.argv)
-    app.setStyleSheet("""
-    * {
-        font-family: "Segoe UI", "Helvetica Neue", Arial, sans-serif;
-    }
-    """)
+    # The application font. Through app.setFont rather than a stylesheet: a
+    # universal * selector makes the style engine run rule matching for every
+    # widget ever constructed, which is pure overhead for setting one font.
+    font = QFont()
+    font.setFamilies(["Segoe UI", "Helvetica Neue", "Arial"])
+    app.setFont(font)
     window = MainWindow()
-    window.show()
-    logging.debug("Entering app event loop")
+    # One show pass only. Showing from inside the constructor and again out
+    # here laid the whole window out twice.
+    window.showMaximized()
+    logging.info("Entering app event loop")
+    # Time-to-first-paint marker: fires once the event loop goes idle, which
+    # is only after the window has been laid out and painted. The diagnostic
+    # probes run in the same turn, after the user already has a window.
+    def _first_idle():
+        logging.info("Event loop first idle; window painted")
+        # In a packaged build the bootloader has been showing a splash since
+        # the double-click; the window is on screen now, so take it down.
+        # The env var is how the bootloader says a splash is actually up --
+        # importing pyi_splash without one logs a spurious warning.
+        if os.environ.get("_PYI_SPLASH_IPC"):
+            try:
+                import pyi_splash
+                pyi_splash.close()
+            except Exception:
+                pass
+        log_optional_components()
+    QTimer.singleShot(0, _first_idle)
     sys.exit(app.exec_())

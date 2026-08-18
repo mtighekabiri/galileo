@@ -406,6 +406,7 @@ class TestFillingTheStage:
         window = galileo_app.MainWindow()
         try:
             window.resize(1280, 800)
+            window.show()   # the constructor builds but does not show
             panel = window.central_panel
             panel.load_video(path)
             panel.tracking_overlay.points = [tuple(map(float, p)) for p in truth[0]]
@@ -432,6 +433,7 @@ class TestFillingTheStage:
         window = galileo_app.MainWindow()
         try:
             window.resize(1280, 800)
+            window.show()   # the constructor builds but does not show
             panel = window.central_panel
             panel.load_video(path)
             panel.magnifier.set_expanded(True)

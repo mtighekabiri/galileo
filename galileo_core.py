@@ -99,6 +99,22 @@ def quad_bounds(points, width: int, height: int, pad: int = 1):
     return x0, y0, x1, y1
 
 
+def union_quad(quads):
+    """The axis-aligned quad covering every quad given, or None for none.
+
+    For handing several placements to code that takes one quad -- the
+    person segmenter crops to a padded quad, and one crop around all the
+    inserts serves every one of them.
+    """
+    quads = [q for q in quads if q is not None]
+    if not quads:
+        return None
+    corners = np.concatenate([as_quad(q) for q in quads], axis=0)
+    x0, y0 = corners.min(axis=0)
+    x1, y1 = corners.max(axis=0)
+    return np.float32([[x0, y0], [x1, y0], [x1, y1], [x0, y1]])
+
+
 def quad_to_mask(points, width: int, height: int, feather: float = 0.0,
                  offset=(0, 0)) -> np.ndarray:
     """Anti-aliased coverage mask for a quad.
@@ -302,6 +318,17 @@ def _premultiplied(overlay_bgra: np.ndarray) -> np.ndarray:
     return cv2.merge(scaled + [alpha])
 
 
+def _prescale_target(shape, quad_w: float, quad_h: float,
+                     supersample: int) -> tuple:
+    """The size _prescaled_for will reduce to, for that function and for
+    keying the cache without doing the work."""
+    oh, ow = shape[:2]
+    headroom = 1.25   # perspective packs the far edge denser than the mean
+    target_w = min(ow, max(1, int(np.ceil(quad_w * supersample * headroom))))
+    target_h = min(oh, max(1, int(np.ceil(quad_h * supersample * headroom))))
+    return target_w, target_h
+
+
 def _prescaled_for(packed: np.ndarray, quad_w: float, quad_h: float,
                    supersample: int) -> np.ndarray:
     """Shrink an oversized creative towards its on-screen size first.
@@ -314,13 +341,46 @@ def _prescaled_for(packed: np.ndarray, quad_w: float, quad_h: float,
     which is what keeps fine detail smooth. Never upscales.
     """
     oh, ow = packed.shape[:2]
-    headroom = 1.25   # perspective packs the far edge denser than the mean
-    target_w = min(ow, max(1, int(np.ceil(quad_w * supersample * headroom))))
-    target_h = min(oh, max(1, int(np.ceil(quad_h * supersample * headroom))))
+    target_w, target_h = _prescale_target(packed.shape, quad_w, quad_h,
+                                          supersample)
     if target_w > ow * 0.8 and target_h > oh * 0.8:
         return packed             # too small a reduction to be worth a pass
     return cv2.resize(packed, (target_w, target_h),
                       interpolation=cv2.INTER_AREA)
+
+
+class _PackedCache:
+    """Remembers recently packed-and-prescaled creatives.
+
+    The same identity idiom as the morph's ShapeCache: sources are compared
+    with ``is`` and the reference is held, which is what makes identity safe.
+    A still creative resolves to the same array every frame, so the BGRA
+    conversion, the premultiply (with its full-image alpha scan) and the
+    area-filtered reduction all collapse to a lookup; a creative video hands
+    over a new array each frame and misses, which is real new work. A few
+    entries, because one frame can carry several placements.
+    """
+
+    LIMIT = 8
+
+    def __init__(self):
+        self._entries = {}   # id(source) -> (source, (w, h), result)
+
+    def packed(self, overlay, quad_w, quad_h, supersample):
+        target = _prescale_target(overlay.shape, quad_w, quad_h, supersample)
+        entry = self._entries.get(id(overlay))
+        if (entry is not None and entry[0] is overlay
+                and entry[1] == target):
+            return entry[2]
+        packed = _premultiplied(to_bgra(overlay))
+        packed = _prescaled_for(packed, quad_w, quad_h, supersample)
+        if len(self._entries) >= self.LIMIT and id(overlay) not in self._entries:
+            self._entries.pop(next(iter(self._entries)))
+        self._entries[id(overlay)] = (overlay, target, packed)
+        return packed
+
+
+_packed_cache = _PackedCache()
 
 
 def _blend_into(out: np.ndarray, box, warped: np.ndarray, mask: np.ndarray,
@@ -410,9 +470,8 @@ def composite_overlay(base_bgr: np.ndarray, overlay: np.ndarray, quad,
     roi_w, roi_h = x1 - x0, y1 - y0
     supersample = _supersample_factor(roi_w, roi_h)
 
-    packed = _premultiplied(to_bgra(overlay))
     quad_w, quad_h = _quad_pixel_size(quad)
-    packed = _prescaled_for(packed, quad_w, quad_h, supersample)
+    packed = _packed_cache.packed(overlay, quad_w, quad_h, supersample)
     oh, ow = packed.shape[:2]
 
     # OpenCV samples pixel *centres* at integer coordinates, so the content
@@ -476,7 +535,7 @@ class Region:
     still compresses towards the far edge the way a flat one does.
     """
 
-    __slots__ = ("corners", "curvature", "curved")
+    __slots__ = ("corners", "curvature", "curved", "_homography_cache")
 
     def __init__(self, corners, curvature=None, curved: bool = False):
         """
@@ -494,6 +553,7 @@ class Region:
         self.curvature = (np.zeros((4, 2, 2), np.float32) if curvature is None
                           else np.asarray(curvature, np.float32).reshape(4, 2, 2))
         self.curved = bool(curved)
+        self._homography_cache = None
 
     # -- construction ------------------------------------------------------
 
@@ -567,8 +627,20 @@ class Region:
         return bool(np.all(np.abs(self.curvature) < tolerance))
 
     def homography(self) -> np.ndarray:
-        """Unit square -> corners, the perspective part of the mapping."""
-        return cv2.getPerspectiveTransform(UNIT_SQUARE, self.corners)
+        """Unit square -> corners, the perspective part of the mapping.
+
+        Memoised on the corner values: paint loops ask for this several
+        times per repaint of the same shape, and getPerspectiveTransform
+        solves a linear system each call. Every caller copies via astype
+        before touching the result, so sharing the array is safe.
+        """
+        key = self.corners.tobytes()
+        cached = self._homography_cache
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        matrix = cv2.getPerspectiveTransform(UNIT_SQUARE, self.corners)
+        self._homography_cache = (key, matrix)
+        return matrix
 
     # -- serialisation -----------------------------------------------------
 
@@ -835,9 +907,8 @@ def composite_region(base_bgr: np.ndarray, overlay: np.ndarray, region: Region,
     roi_w, roi_h = x1 - x0, y1 - y0
     supersample = _supersample_factor(roi_w, roi_h)
 
-    packed = _premultiplied(to_bgra(overlay))
     quad_w, quad_h = _quad_pixel_size(region.corners)
-    packed = _prescaled_for(packed, quad_w, quad_h, supersample)
+    packed = _packed_cache.packed(overlay, quad_w, quad_h, supersample)
     oh, ow = packed.shape[:2]
 
     grid_x, grid_y = np.meshgrid(np.arange(x0, x1, dtype=np.float64),
@@ -1938,8 +2009,19 @@ def register_model_dir(path: str) -> None:
         _MODEL_SEARCH_DIRS.insert(0, path)
 
 
+_FOUND_MODELS = {}
+
+
 def find_model(filename: str) -> str:
-    """Locate a model file beside the app, in ./models, or next to this file."""
+    """Locate a model file beside the app, in ./models, or next to this file.
+
+    Hits are remembered so repeated availability checks do not re-stat half a
+    dozen directories. Misses are not: the promise that a user can drop the
+    model in after launch and have occlusion light up has to keep holding.
+    """
+    cached = _FOUND_MODELS.get(filename)
+    if cached and os.path.isfile(cached):
+        return cached
     candidates = list(_MODEL_SEARCH_DIRS)
     here = os.path.dirname(os.path.abspath(__file__))
     candidates += [os.path.join(here, MODEL_DIR_NAME), here, os.getcwd(),
@@ -1947,6 +2029,7 @@ def find_model(filename: str) -> str:
     for directory in candidates:
         full = os.path.join(directory, filename)
         if os.path.isfile(full):
+            _FOUND_MODELS[filename] = full
             return full
     return None
 
@@ -2271,14 +2354,30 @@ def register_binary_dir(path: str) -> None:
         _BINARY_SEARCH_DIRS.insert(0, path)
 
 
+_FOUND_BINARIES = {}
+
+
 def find_binary(name: str) -> str:
-    """Locate a helper binary next to the app, else on PATH."""
+    """Locate a helper binary next to the app, else on PATH.
+
+    A hit is remembered, because the PATH walk behind :func:`shutil.which` is
+    the expensive part and a binary that was there does not move mid-session.
+    A miss keeps re-probing so dropping ffmpeg beside the app after launch
+    still gets picked up, exactly as documented.
+    """
+    cached = _FOUND_BINARIES.get(name)
+    if cached and os.path.isfile(cached):
+        return cached
     for directory in _BINARY_SEARCH_DIRS:
         for candidate in (name, f"{name}.exe"):
             full = os.path.join(directory, candidate)
             if os.path.isfile(full) and os.access(full, os.X_OK):
+                _FOUND_BINARIES[name] = full
                 return full
-    return shutil.which(name)
+    found = shutil.which(name)
+    if found:
+        _FOUND_BINARIES[name] = found
+    return found
 
 
 def has_ffmpeg() -> bool:

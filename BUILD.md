@@ -63,9 +63,11 @@ Tell users to **unzip before running**. Launching the `.exe` from inside
 Windows' built-in zip viewer appears to work, but the supporting libraries are
 never extracted and it fails with an opaque error.
 
-Expect roughly **350 MB unzipped, 195 MB zipped**. Most of that is Qt and
-OpenCV; there is no meaningful way to shrink it while keeping both. It fits
-comfortably on a share or a memory stick.
+Expect roughly **305 MB unzipped** (measured on Linux; Windows is in the same
+region). Most of that is Qt and OpenCV, which have to stay whole — the spec
+already prunes what does not: Qt's translations, the plugin families behind Qt
+modules the app does not ship, and the QtMultimedia stack nothing uses. It
+fits comfortably on a share or a memory stick.
 
 ## Audio in the packaged build
 
@@ -106,10 +108,27 @@ Two ways to avoid putting users through it:
 The spec deliberately disables UPX compression, which is the single most common
 reason corporate antivirus quarantines a PyInstaller bundle.
 
+## The startup splash
+
+The spec adds a PyInstaller splash screen (`splash.png`) on Windows and Linux:
+it paints within moments of the double-click, while Python is still loading —
+on a cold start with antivirus scanning the freshly-unzipped folder, that gap
+is otherwise several blank seconds — and the app takes it down as soon as the
+window has painted.
+
+Building the splash needs `tkinter` importable in the **build** environment
+(PyInstaller harvests Tcl/Tk for its bootloader; nothing Tk-related ships in
+the bundle). The python.org installers include it; on Debian/Ubuntu install
+`python3-tk`. Without it the build still succeeds and says so — you just get
+no splash.
+
 ## Where the log goes
 
 `app_debug.log` is written to a per-user folder, not next to the executable, so
-the app still starts from a read-only share:
+the app still starts from a read-only share. It logs at INFO by default; set
+the environment variable `GALILEO_DEBUG=1` before launching for full
+debug-level detail. The startup lines stamp construction and first paint, so
+"it takes ages to open" reports can be read straight off the timestamps:
 
 | Platform | Location |
 | --- | --- |
@@ -124,7 +143,7 @@ Ask for that file when a user reports a problem.
 | Option | Why not |
 | --- | --- |
 | **MSI / setup.exe installer** | Installing per-machine is the thing that needs an administrator. A zipped folder sidesteps the whole problem. |
-| **PyInstaller `--onefile`** | One tidy `.exe`, but it unpacks ~350 MB to a temp folder on *every* launch, so startup is slow, and single-file bundles are flagged by antivirus far more often. |
+| **PyInstaller `--onefile`** | One tidy `.exe`, but it unpacks ~300 MB to a temp folder on *every* launch, so startup is slow, and single-file bundles are flagged by antivirus far more often. |
 | **Nuitka** | Compiles to C and can be faster, but the build is fussier and gains little for a GUI app that spends its time inside OpenCV and Qt. |
 | **Embedded Python + `.bat`** | Works without admin, but exposes the source tree and is easy for a user to break by moving files. |
 | **Web app** | Would remove client install entirely, but means uploading footage to a server and rebuilding the whole interface — a different project, not a packaging change. |
