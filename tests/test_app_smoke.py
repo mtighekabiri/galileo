@@ -344,6 +344,63 @@ class TestScreenAndOcclusionToggles:
             assert not isinstance(value, cv2.dnn.Net)
 
 
+class TestThePreviousFrameToggle:
+    """The Options menu can mark, in each magnifier tile, where the corner
+    sat on the frame before."""
+
+    def test_the_menu_switch_reaches_the_magnifier(self, loaded):
+        window, path, truth = loaded
+        assert window.central_panel.magnifier.show_previous is False
+        window.title_bar.previous_positions_action.setChecked(True)
+        assert window.central_panel.magnifier.show_previous is True
+        window.title_bar.previous_positions_action.setChecked(False)
+        assert window.central_panel.magnifier.show_previous is False
+
+    def test_tracking_feeds_the_magnifier_yesterdays_corners(self, loaded):
+        window, path, truth = loaded
+        panel = window.central_panel
+        overlay = panel.tracking_overlay
+        overlay.points = [tuple(map(float, p)) for p in truth[0]]
+        panel.tracking_mode = True
+        for _ in range(4):
+            panel.read_frame()
+
+        panel.update_magnifier(force=True)
+        index = panel.get_current_frame_index()
+        expected = overlay.tracking_history[index - 1]
+        ghosts = panel.magnifier.previous_points
+        assert set(ghosts) == {0, 1, 2, 3}
+        for corner in range(4):
+            assert ghosts[corner] == pytest.approx(expected[corner])
+
+    def test_frame_zero_has_no_yesterday(self, loaded):
+        window, path, truth = loaded
+        assert window.central_panel.magnifier_previous_points() == {}
+
+    def test_an_untracked_predecessor_gives_no_ghost(self, loaded):
+        """Falling back to some older recorded frame would draw a ghost that
+        looks like one frame of motion but is really many, which misleads
+        exactly the judgement the ghost exists to serve."""
+        window, path, truth = loaded
+        panel = window.central_panel
+        panel.tracking_overlay.tracking_history = {
+            0: [tuple(map(float, p)) for p in truth[0]]}
+        panel.jump_to_frame(5)
+        assert panel.magnifier_previous_points() == {}
+
+    def test_curving_keeps_each_ghost_with_its_corner(self, loaded):
+        """With curving on, corner i sits at index 3i between its bend
+        handles, and its ghost has to move there with it."""
+        window, path, truth = loaded
+        panel = window.central_panel
+        overlay = panel.tracking_overlay
+        overlay.tracking_history = {0: [tuple(map(float, p)) for p in truth[0]]}
+        panel.jump_to_frame(1)
+        overlay.curved_enabled = True
+        overlay.points = [tuple(map(float, p)) for p in truth[1]]
+        assert set(panel.magnifier_previous_points()) == {0, 3, 6, 9}
+
+
 class TestAoiExport:
     """The AOI CSV is what the eye-tracking analysis is run against."""
 

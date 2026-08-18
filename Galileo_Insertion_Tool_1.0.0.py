@@ -868,6 +868,13 @@ class MagnifierWidget(QWidget):
         #: keep showing base_frame.
         self.composited = None
         self._single_lit = False
+        #: Where each handle sat on the previous frame, as
+        #: ``{point_index: (x, y)}``. Corners only: the tracking history
+        #: records the four corners, so bend handles have no yesterday.
+        self.previous_points = {}
+        #: Whether the tiles mark those previous positions. Off unless asked
+        #: for -- it is one more thing drawn over the pixels being judged.
+        self.show_previous = False
         # Set here as well as on the first manual resize: update_magnifier_dimensions
         # reads it as soon as a second corner exists, which is long before the
         # user has had any reason to drag the magnifier.
@@ -897,6 +904,7 @@ class MagnifierWidget(QWidget):
         focus_index=-1,
         selected_control=-1,
         composited=None,
+        previous_points=None,
     ):
         """
         Update the magnifier data and refresh.
@@ -913,9 +921,14 @@ class MagnifierWidget(QWidget):
         :param composited:     the same frame with the creatives drawn in, used
                                by the whole-area view. None falls back to
                                ``base_frame``.
+        :param previous_points: ``{point_index: (x, y)}`` -- where each handle
+                               sat on the previous frame, drawn as a ghost in
+                               that handle's tile when show_previous is on.
+                               None means there is nothing to show.
         """
         self.base_frame = base_frame
         self.composited = composited
+        self.previous_points = dict(previous_points or {})
         self.points = [MagnifierPoint.coerce(p, i)
                        for i, p in enumerate(overlay_points or [])]
         self.region = region
@@ -974,6 +987,12 @@ class MagnifierWidget(QWidget):
         if bool(whole) == self.whole_area:
             return
         self.whole_area = bool(whole)
+        self.update()
+
+    def set_show_previous(self, show: bool):
+        if bool(show) == self.show_previous:
+            return
+        self.show_previous = bool(show)
         self.update()
 
     def set_expanded(self, expanded: bool):
@@ -1287,6 +1306,8 @@ class MagnifierWidget(QWidget):
         if zoom >= self.GRID_ABOVE:
             self._draw_pixel_grid(painter, rect, point, zoom)
         self._draw_geometry(painter, rect, point, zoom)
+        if self.show_previous and not self.whole_area and index >= 0:
+            self._draw_previous_position(painter, rect, point, index)
         if index >= 0:
             self._draw_crosshair(painter, rect, point, index)
         self._draw_label(painter, rect, point, index)
@@ -1390,6 +1411,46 @@ class MagnifierWidget(QWidget):
                 size = 5 if chosen else 4
                 painter.drawRect(int(x) - size, int(y) - size, size * 2, size * 2)
         painter.setBrush(Qt.NoBrush)
+
+    def _draw_previous_position(self, painter, rect, point, index):
+        """Where this handle sat on the frame before, as an amber ghost.
+
+        The tile is centred on the handle's current position, so the ghost
+        lands off-centre by exactly how far tracking moved it this frame:
+        one glance says which way the surface is travelling and how fast,
+        and a ghost nowhere near the crosshair says the tracker jumped.
+        Grid tiles only -- the whole-area view already shows the shape, and
+        a second faint quad there reads as a mistake, not a memory.
+        """
+        prev = self.previous_points.get(index)
+        if prev is None:
+            return
+        scale, offset_x, offset_y = self.tile_mapping(rect, point)
+        ghost_x = int(prev[0] * scale + offset_x)
+        ghost_y = int(prev[1] * scale + offset_y)
+        centre_x = rect.x() + rect.width() // 2
+        centre_y = rect.y() + rect.height() // 2
+
+        # Amber: red and green already mean corner, blue and cyan mean bend
+        # handle, so the past needs a colour of its own.
+        colour = QColor(255, 190, 60)
+        painter.setBrush(Qt.NoBrush)
+
+        # The trail from there to here, dashed so it cannot be mistaken for
+        # the area's outline. Skipped when the handle has barely moved --
+        # a two-pixel dash under the crosshair is smudge, not information.
+        if abs(ghost_x - centre_x) + abs(ghost_y - centre_y) > 4:
+            for width, shade in ((3, QColor(0, 0, 0, 130)), (1, colour)):
+                pen = QPen(shade, width)
+                pen.setStyle(Qt.DashLine)
+                painter.setPen(pen)
+                painter.drawLine(ghost_x, ghost_y, centre_x, centre_y)
+
+        # The ghost itself, with the same dark under-stroke as the crosshair
+        # so it stays legible over pale footage.
+        for width, shade in ((3, QColor(0, 0, 0, 130)), (1, colour)):
+            painter.setPen(QPen(shade, width))
+            painter.drawEllipse(ghost_x - 4, ghost_y - 4, 8, 8)
 
     def _draw_crosshair(self, painter, rect, point, index):
         """The mark is always the true position of the handle.
@@ -2469,6 +2530,15 @@ class TitleBar(QWidget):
             "Even out pulsing from fluorescent or LED lighting")
         self.deflicker_action.toggled.connect(self.parent.toggle_deflicker)
         options_menu.addAction(self.deflicker_action)
+
+        self.previous_positions_action = QAction(
+            "Last frame's corners in magnifier", self, checkable=True)
+        self.previous_positions_action.setToolTip(
+            "Mark in each magnifier tile where the corner sat on the frame "
+            "before, so a tracking jump shows itself")
+        self.previous_positions_action.toggled.connect(
+            self.parent.toggle_previous_positions)
+        options_menu.addAction(self.previous_positions_action)
 
         self.menu.addMenu(load_menu)
         self.menu.addMenu(save_menu)
@@ -3800,11 +3870,36 @@ class CentralPanel(QWidget):
             focus_index=focus,
             selected_control=overlay.drag_control or overlay.selected_control,
             composited=composited,
+            previous_points=self.magnifier_previous_points(),
         )
         # Sized after the views are set, not before: the grid it has to fit
         # depends on how many handles there are, and the widget only learns
         # that from the call above.
         self.update_magnifier_dimensions()
+
+    def magnifier_previous_points(self):
+        """Where each corner sat on the frame before: ``{point_index: (x, y)}``.
+
+        Read from the tracking history, so there is only an answer on frames
+        whose predecessor was actually tracked (or copied by hand). Falling
+        back to some older recorded frame would draw a ghost that looks like
+        one frame of motion but is really twenty, which misleads exactly the
+        judgement -- did the tracker jump? -- the ghost exists to serve.
+
+        Keys follow :meth:`magnifier_points` order: with curving on, corner
+        ``i`` sits at index ``3 * i`` between its bend handles. The bend
+        handles themselves get no ghost, since history records corners only.
+        """
+        index = self.get_current_frame_index()
+        if not index:
+            return {}
+        recorded = self.tracking_overlay.tracking_history.get(index - 1)
+        if not recorded:
+            return {}
+        overlay = self.tracking_overlay
+        step = 3 if (overlay.curved_enabled and len(overlay.points) == 4) else 1
+        return {i * step: (float(x), float(y))
+                for i, (x, y) in enumerate(recorded[:4])}
 
     def magnifier_points(self):
         """What the magnifier should show: ``(points, selected, focus)``.
@@ -5595,6 +5690,15 @@ class MainWindow(QMainWindow):
         if not enabled:
             panel.segmenter = None
         panel.refresh_display()
+
+    def toggle_previous_positions(self, enabled: bool):
+        """Mark each corner's previous-frame position in the magnifier tiles."""
+        panel = self.central_panel
+        panel.magnifier.set_show_previous(enabled)
+        # Push fresh data as well as repainting: the previous positions are
+        # gathered by update_magnifier, which has had no reason to run since
+        # the frame last changed.
+        panel.update_magnifier()
 
     # -- flickering lighting ------------------------------------------------
 

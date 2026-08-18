@@ -274,6 +274,83 @@ class TestWhatItDrawsOverThePicture:
         assert grab(magnifier).shape[:2] == (320, 320)
 
 
+class TestThePreviousFrameGhost:
+    """Optionally, each tile marks where its corner sat on the frame before.
+
+    The tile is centred on the corner's current position, so the ghost lands
+    off-centre by exactly one frame of motion: one glance says which way the
+    surface is travelling, and a ghost nowhere near the crosshair says the
+    tracker jumped.
+    """
+
+    PREVIOUS = {i: (x - 3.0, y - 2.0) for i, (x, y) in enumerate(CORNERS)}
+
+    def amber(self, image):
+        """Pixels wearing the ghost's colour, which nothing else uses: the
+        crosshairs are red or green, the bends blue, the outline green."""
+        blue, green, red = (image[:, :, c].astype(int) for c in range(3))
+        return (red - blue > 120) & (green - blue > 80)
+
+    def test_it_is_off_by_default(self, magnifier):
+        assert magnifier.show_previous is False
+
+    def test_nothing_is_drawn_until_asked_for(self, magnifier):
+        magnifier.setData(screen_frame(), CORNERS, zoom_factor=8,
+                          previous_points=self.PREVIOUS)
+        assert not self.amber(grab(magnifier)).any()
+
+    def test_the_ghost_appears_when_switched_on(self, magnifier):
+        magnifier.setData(screen_frame(), CORNERS, zoom_factor=8,
+                          previous_points=self.PREVIOUS)
+        magnifier.set_show_previous(True)
+        assert self.amber(grab(magnifier)).any()
+
+    def test_the_ghost_lands_where_the_corner_was(self, magnifier):
+        """A corner that moved +4 in x at 8x leaves its ghost 32 widget
+        pixels left of the crosshair -- anywhere else is a lie about the
+        motion the ghost exists to show."""
+        magnifier.setData(
+            screen_frame(), [CORNERS[0]], zoom_factor=8,
+            previous_points={0: (CORNERS[0][0] - 4.0, CORNERS[0][1])})
+        magnifier.set_show_previous(True)
+        marks = np.argwhere(self.amber(grab(magnifier)))
+        assert len(marks), "no ghost drawn at all"
+        rect, _ = magnifier.tiles()[0]
+        centre_x = rect.x() + rect.width() / 2.0
+        centre_y = rect.y() + rect.height() / 2.0
+        # The ring's far edge: its centre minus its radius, give or take
+        # the pen and antialiasing.
+        assert marks[:, 1].min() == pytest.approx(centre_x - 32 - 4, abs=3)
+        assert marks[:, 0].mean() == pytest.approx(centre_y, abs=6)
+
+    def test_the_whole_area_view_stays_clean(self, magnifier):
+        """That view already shows the shape; a second faint quad there
+        reads as a mistake, not a memory."""
+        magnifier.setData(screen_frame(), CORNERS, zoom_factor=8,
+                          previous_points=self.PREVIOUS)
+        magnifier.set_show_previous(True)
+        magnifier.set_whole_area(True)
+        assert not self.amber(grab(magnifier)).any()
+
+    def test_handles_without_a_yesterday_are_left_alone(self, magnifier):
+        """History records the four corners only, so with curving on the
+        bend handles have no ghost to draw -- and must not crash for it."""
+        region = curved_region()
+        magnifier.setData(screen_frame(), handle_points(region), region=region,
+                          zoom_factor=8,
+                          previous_points={0: CORNERS[0], 3: CORNERS[1]})
+        magnifier.set_show_previous(True)
+        assert grab(magnifier).shape[:2] == (320, 320)
+
+    def test_yesterday_is_cleared_when_data_arrives_without_one(self, magnifier):
+        """Stepping to a frame whose predecessor was never tracked must not
+        keep showing some older frame's ghost as if it were yesterday's."""
+        magnifier.setData(screen_frame(), CORNERS,
+                          previous_points=self.PREVIOUS)
+        magnifier.setData(screen_frame(), CORNERS)
+        assert magnifier.previous_points == {}
+
+
 class TestOlderCallers:
     def test_bare_coordinate_pairs_are_still_accepted(self, magnifier):
         magnifier.setData(screen_frame(), CORNERS)
