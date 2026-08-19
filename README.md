@@ -473,6 +473,35 @@ against a control needs.
 The AOI export writes **one CSV per placement**, named after it, because an
 eye-tracking analysis has to tell the adverts apart.
 
+## A creative that is itself a video
+
+A still fills its area on every frame the area is tracked. A video has to be
+told which of *its* frames belongs on which frame of the base clip, and the
+answer is the simple one: **its first frame lands on the first frame the area
+was tracked on**, and it plays forward from there, mapped by time rather than
+by frame count so a creative shot at 30 fps into a 25 fps clip plays at its own
+speed rather than 20% fast.
+
+> This used to be anchored to wherever the playhead was sitting when *Insert*
+> was pressed. In the ordinary order of work — mark the area, track the clip
+> through, then fill it — that is the *last* frame of the shot, so every frame
+> before it drew nothing and the render came back looking like the untouched
+> base video with the advert visible only in its closing moments. Stills were
+> never affected, which is what made it read as "video creatives do not
+> render". The anchor is now worked out from the tracking, so tracking done
+> after the creative went in moves it too.
+
+A creative **shorter than the shot holds on its last frame** rather than
+disappearing part-way through, and the render says so when it finishes:
+
+> Completed (the creative video for Screen is shorter than the rendered range,
+> so its last frame was held)
+
+Rendering part of a clip picks the creative up where that part of the clip left
+it, so frame 900 of the film carries the same frame of the advert whether you
+rendered the whole thing or only the last hundred frames — what you scrubbed
+past in the preview is what lands in the file.
+
 ## Blending the creative into the shot
 
 A creative pasted in with correct geometry still reads as fake, because it is
@@ -628,7 +657,12 @@ drives the actual Qt widgets through loading, tracking and a full render, and
 its fix. `tests/test_offscreen.py` slides a window over a wide scene so the
 camera's motion and the surface's position are both known exactly, and asserts
 the area neither stalls at the edge of frame nor runs away while out of it.
-`tests/test_deflicker.py` builds both kinds of flicker over the same footage
+`tests/test_creative_video.py` renders a creative whose every frame states
+which frame it is, so the frame that landed can be read straight back out of
+the file, and pins down where a video creative starts, that a render of part of
+a clip picks it up in the right place, and that one shorter than the shot holds
+rather than vanishing. `tests/test_deflicker.py` builds both kinds of flicker
+over the same footage
 and asserts the right correction is chosen for each — including that the
 whole-frame one demonstrably does *not* fix banding, which is why the choice
 is made rather than offered — and that a preview that has been steadied is

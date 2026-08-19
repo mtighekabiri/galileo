@@ -1596,6 +1596,28 @@ class MagnifierWidget(QWidget):
         for offset in (4, 9, 14):
             painter.drawLine(right - offset, bottom, right, bottom - offset)
 
+
+def creative_anchor(history, fallback=0) -> int:
+    """The base-video frame an inserted creative video's first frame lands on.
+
+    An insert lives for as long as its area is tracked, so that is where its
+    creative starts: the first tracked frame. The anchor used to be whichever
+    frame the playhead happened to be sitting on when *Insert* was clicked,
+    which in the ordinary order of work -- mark, track the clip through, then
+    fill the area -- was the *last* frame of the shot. Every frame before it
+    drew nothing, so a render came back as the untouched base video with the
+    creative visible only in its final moments. A still creative was never
+    affected, because it fills the area whatever the frame, which is exactly
+    the behaviour recovered here.
+
+    Derived rather than stored so that tracking done *after* the creative was
+    inserted moves it too: the creative starts where the insert does, not
+    where it did when the button was pressed. ``fallback`` covers a placement
+    with no tracking yet, where the insert frame is all there is to go on.
+    """
+    return min(history) if history else int(fallback)
+
+
 class Placement:
     """One insertion: an area tracked through the clip, and what goes in it.
 
@@ -1629,6 +1651,10 @@ class Placement:
         # open, and the cursor is the index the capture will read next.
         self.overlay_video_total = 0
         self.overlay_video_cursor = 0
+        # The creative frame currently in overlay_bgra, or -1 for none. What
+        # keeps a held frame -- a creative shorter than the shot -- from being
+        # seeked and decoded again on every frame of playback.
+        self.overlay_video_shown = -1
 
         # Look
         self.brightness = 0
@@ -1658,6 +1684,91 @@ class Placement:
     def is_ready(self) -> bool:
         """True if this placement can actually draw something."""
         return self.enabled and len(self.points) == 4 and self.has_overlay()
+
+    def creative_frame_for(self, base_frame_index: int) -> int:
+        """Which frame of the creative video belongs on this base frame.
+
+        The render works this out the same way, from the same anchor, so what
+        is previewed is what is written to the file.
+        """
+        anchor = creative_anchor(self.tracking_history,
+                                 self.inserted_overlay_start_frame)
+        return max(0, int(base_frame_index) - anchor)
+
+    def open_creative_video(self, path: str = None) -> bool:
+        """Open the creative video this placement plays, ready to decode.
+
+        Inserting a creative and reopening a project that already had one both
+        come through here. The load used to record the path and stop there,
+        with no capture behind it, so a reopened project previewed no creative
+        at all -- which reads as one that never went in -- while rendering it
+        perfectly well.
+        """
+        path = path or self.overlay_video_path
+        self.release()
+        self.overlay_video_total = 0
+        self.overlay_video_cursor = 0
+        self.overlay_video_shown = -1
+        if not path:
+            return False
+
+        capture = cv2.VideoCapture(path)
+        if not capture.isOpened():
+            logging.error("Cannot open overlay video: %s", path)
+            return False
+        self.overlay_video_cap = capture
+        self.overlay_video_path = path
+        self.overlay_video_total = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
+        return True
+
+    def decode_creative_frame(self, creative_index: int) -> bool:
+        """Put one frame of the creative video into ``overlay_bgra``.
+
+        Returns whether the picture changed, so the caller knows whether a
+        repaint is owed.
+        """
+        if not self.inserted_overlay_is_video or not self.overlay_video_cap:
+            return False
+
+        # A creative shorter than the shot holds on its last frame rather than
+        # vanishing. Blanking the insert instead read as "the creative did not
+        # go in at all". Not every container reports a frame count, so a total
+        # of zero means "unknown" and the read below decides where it ends.
+        creative_index = max(0, int(creative_index))
+        if self.overlay_video_total > 0:
+            creative_index = min(creative_index, self.overlay_video_total - 1)
+        if (creative_index == self.overlay_video_shown
+                and self.overlay_bgra is not None):
+            return False                 # already decoded, and still wanted
+
+        # Playback asks for consecutive indices, and a plain read() is all
+        # that needs. Seeking per frame forced a keyframe seek and a GOP
+        # re-decode for every step on long-GOP creatives -- the renderer has
+        # advanced a cursor this way all along.
+        if creative_index != self.overlay_video_cursor:
+            self.overlay_video_cap.set(cv2.CAP_PROP_POS_FRAMES, creative_index)
+        ret, frame = self.overlay_video_cap.read()
+        if not ret:
+            # Hold whatever was last decoded; only a creative that has never
+            # yielded a frame leaves the area empty. Force a real seek on the
+            # next request rather than trusting a cursor the failed read has
+            # made meaningless, and bring the frame count the container
+            # claimed down to what actually decoded, so the held frame is
+            # recognised as already in hand rather than sought again on every
+            # frame that follows.
+            self.overlay_video_cursor = -1
+            if self.overlay_video_shown >= 0:
+                self.overlay_video_total = self.overlay_video_shown + 1
+            return False
+        self.overlay_video_cursor = creative_index + 1
+        self.overlay_video_shown = creative_index
+        self.overlay_bgra = core.to_bgra(frame)
+        return True
+
+    def show_creative_frame(self, base_frame_index: int) -> bool:
+        """Advance the creative video to what belongs on this base frame."""
+        return self.decode_creative_frame(
+            self.creative_frame_for(base_frame_index))
 
     def reset_tracker(self):
         self.tracker = None
@@ -1811,6 +1922,7 @@ class TrackingOverlay(QWidget):
     overlay_video_path = _active_property("overlay_video_path")
     overlay_video_total = _active_property("overlay_video_total")
     overlay_video_cursor = _active_property("overlay_video_cursor")
+    overlay_video_shown = _active_property("overlay_video_shown")
     inserted_overlay_start_frame = _active_property("inserted_overlay_start_frame")
     brightness = _active_property("brightness")
     contrast = _active_property("contrast")
@@ -2146,6 +2258,7 @@ class TrackingOverlay(QWidget):
             self.overlay_video_cap.release()
         self.overlay_video_cap = None
         self.overlay_video_path = None
+        self.overlay_video_shown = -1
         self.inserted_overlay_start_frame = start_frame_index
         self.refresh_preview()
 
@@ -2156,19 +2269,9 @@ class TrackingOverlay(QWidget):
         self.overlay_video_path = video_path
         self.inserted_overlay_start_frame = start_frame_index
 
-        if self.overlay_video_cap:
-            self.overlay_video_cap.release()
-            self.overlay_video_cap = None
-
-        self.overlay_video_cap = cv2.VideoCapture(video_path)
-        if not self.overlay_video_cap.isOpened():
-            logging.error(f"Cannot open overlay video: {video_path}")
+        if not self.active.open_creative_video(video_path):
             self.inserted_overlay_is_video = False
-            self.overlay_video_cap = None
             return
-        self.overlay_video_total = int(
-            self.overlay_video_cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        self.overlay_video_cursor = 0
 
         self.refresh_preview()
 
@@ -2176,6 +2279,7 @@ class TrackingOverlay(QWidget):
         self.overlay_bgra = None
         self.overlay_source_path = None
         self.inserted_overlay_is_video = False
+        self.overlay_video_shown = -1
         if self.overlay_video_cap:
             self.overlay_video_cap.release()
             self.overlay_video_cap = None
@@ -2186,35 +2290,6 @@ class TrackingOverlay(QWidget):
         mw = self.get_main_window()
         if mw and mw.central_panel and mw.central_panel.tracking_mode:
             self.setFocus()
-
-    def update_overlay_video_frame_by_index(self, overlay_frame_idx: int):
-        if not self.inserted_overlay_is_video or not self.overlay_video_cap:
-            return
-
-        if overlay_frame_idx < 0 or overlay_frame_idx >= self.overlay_video_total:
-            self.overlay_bgra = None
-            self.update()
-            return
-
-        # Playback asks for consecutive indices, and a plain read() is all
-        # that needs. Seeking per frame forced a keyframe seek and a GOP
-        # re-decode for every step on long-GOP creatives -- the renderer has
-        # advanced a cursor this way all along.
-        if overlay_frame_idx != self.overlay_video_cursor:
-            self.overlay_video_cap.set(cv2.CAP_PROP_POS_FRAMES,
-                                       overlay_frame_idx)
-        ret, frame = self.overlay_video_cap.read()
-        if not ret:
-            self.overlay_bgra = None
-            # Force a real seek on the next request rather than trusting a
-            # cursor the failed read has made meaningless.
-            self.overlay_video_cursor = -1
-            self.update()
-            return
-        self.overlay_video_cursor = overlay_frame_idx + 1
-
-        self.overlay_bgra = core.to_bgra(frame)
-        self.update()
 
     def styled_for(self, placement, base_frame, quad, motion=None) -> np.ndarray:
         """One placement's creative, adapted to the frame it is going into."""
@@ -3416,10 +3491,14 @@ class CentralPanel(QWidget):
             # this frame.
             self.replay_recorded_shapes(current_frame_index)
 
-        # If an overlay video is inserted, advance it to the matching frame.
-        if overlay.inserted_overlay_is_video:
-            overlay_index = current_frame_index - overlay.inserted_overlay_start_frame
-            overlay.update_overlay_video_frame_by_index(overlay_index)
+        # Advance every inserted creative video to the frame that belongs on
+        # this one. Every placement, not only the one being edited: the rest
+        # render their own creatives too, so a preview that left them frozen
+        # on whichever frame they were last active for was not showing what
+        # the file would hold.
+        for placement in overlay.placements:
+            if placement.inserted_overlay_is_video:
+                placement.show_creative_frame(current_frame_index)
 
         # --- DISPLAY ----------------------------------------------------
         # Composite through the same code path the renderer uses, so the
@@ -4416,7 +4495,11 @@ class PlacementSnapshot:
                          and not placement.inserted_overlay_is_video else None)
         self.video_path = (placement.overlay_video_path
                            if placement.inserted_overlay_is_video else None)
-        self.start_frame = placement.inserted_overlay_start_frame
+        # Where the creative video's first frame lands. Derived from the
+        # tracking, not from the playhead position the insert was made at --
+        # see creative_anchor.
+        self.start_frame = creative_anchor(
+            self.history, placement.inserted_overlay_start_frame)
         self.brightness = placement.brightness
         self.contrast = placement.contrast
         self.colourise = placement.colourise_enabled
@@ -4485,6 +4568,12 @@ class RenderWorker(QObject):
     progress = pyqtSignal(int)
     finished = pyqtSignal(str)  # Emits a final status message or error
 
+    # How far a creative video may be behind the frame wanted before it is
+    # seeked rather than read forward to. About a second of footage: long
+    # enough that ordinary playback never seeks, short enough that starting a
+    # render deep into a clip does not decode its way there.
+    SEEK_GAP = 30
+
     def __init__(self, settings: RenderSettings):
         super().__init__()
         self.settings = settings
@@ -4532,13 +4621,22 @@ class RenderWorker(QObject):
             return base_frame
 
         creative = placement.creative
-        if placement.capture is not None and not placement.exhausted:
-            # Map by time, not by frame count, so a creative shot at a
-            # different frame rate plays at the right speed.
-            elapsed = frame_idx - placement.start_frame
-            if elapsed >= 0:
+        if placement.capture is not None:
+            if not placement.exhausted:
+                # Map by time, not by frame count, so a creative shot at a
+                # different frame rate plays at the right speed.
+                elapsed = max(0, frame_idx - placement.start_frame)
                 wanted = int(round(elapsed * getattr(placement, "fps", settings.fps)
                                    / max(settings.fps, 1e-6)))
+                # Reading frame by frame is right for the step of one or two a
+                # frame costs, and only for that: rendering a range that starts
+                # well into the clip would otherwise decode the whole creative
+                # up to that point before writing a single frame. A jump that
+                # large is seeked, exactly as the preview does.
+                if (wanted - placement.cursor > self.SEEK_GAP
+                        and placement.capture.set(cv2.CAP_PROP_POS_FRAMES,
+                                                  wanted)):
+                    placement.cursor = wanted - 1
                 while placement.cursor < wanted:
                     got, next_frame = placement.capture.read()
                     if not got:
@@ -4546,7 +4644,10 @@ class RenderWorker(QObject):
                         break
                     placement.frame = next_frame
                     placement.cursor += 1
-                creative = placement.frame
+            # Whatever was last decoded, including once the creative has run
+            # out: a creative shorter than the range holds on its last frame
+            # rather than dropping the insert and leaving untouched footage.
+            creative = placement.frame
         if creative is None:
             return base_frame
 
@@ -4687,6 +4788,20 @@ class RenderWorker(QObject):
 
             base_cap.release()
             base_cap = None
+
+            # A creative video that ran short changes what is in the file, so
+            # it is reported rather than left for the user to spot.
+            for placement in placements:
+                if not placement.exhausted:
+                    continue
+                if placement.frame is None:
+                    caveats.append(
+                        f"no frames could be read from the creative video for "
+                        f"{placement.name}, so it was not inserted")
+                else:
+                    caveats.append(
+                        f"the creative video for {placement.name} is shorter "
+                        "than the rendered range, so its last frame was held")
 
             if self.is_canceled:
                 out_writer.abort()
@@ -5386,7 +5501,8 @@ class MainWindow(QMainWindow):
                 if not path_ or not os.path.exists(path_):
                     continue
                 if placement.inserted_overlay_is_video:
-                    placement.overlay_video_path = path_
+                    if not placement.open_creative_video(path_):
+                        placement.inserted_overlay_is_video = False
                 else:
                     try:
                         placement.overlay_bgra = core.load_image_bgra(path_)
@@ -5430,6 +5546,9 @@ class MainWindow(QMainWindow):
             action.setChecked(True)      # fires toggle_deflicker
 
         current = self.central_panel.get_current_frame_index()
+        for placement in overlay.placements:
+            if placement.inserted_overlay_is_video:
+                placement.show_creative_frame(current)
         points = overlay.tracking_history.get(current) or data.get("tracking_points", [])
         overlay.points = [tuple(p) for p in points]
         self.central_panel.reset_tracker()
@@ -6309,7 +6428,13 @@ class MainWindow(QMainWindow):
                     overlay.insert_video_overlay(
                         start_frame_index=frame_index,
                         video_path=overlay_widget.video_path)
-                    overlay.update_overlay_video_frame_by_index(0)
+                    # Decode what belongs on the frame being looked at and
+                    # repaint it. Opening the creative is not enough on its
+                    # own: inserting a video used to leave the area untouched
+                    # until the video happened to step to another frame, while
+                    # a still appeared the moment it was inserted.
+                    overlay.active.show_creative_frame(frame_index)
+                    overlay.refresh_preview()
                 else:
                     # Prefer the file path: reading it directly keeps the
                     # creative's alpha channel intact.
