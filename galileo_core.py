@@ -2598,6 +2598,264 @@ class DepthOcclusionSegmenter:
                    dilate=settings.dilate, feather=settings.feather, **kwargs)
 
 
+# --------------------------------------------------------------------------
+# Occlusion from the surface's own artwork
+# --------------------------------------------------------------------------
+
+#: How many tracked frames the plate is built from. Spread evenly over the
+#: recording so the same history always gives the same plate -- the render
+#: rebuilds it independently and has to land on identical numbers.
+PLATE_SAMPLES = 24
+
+#: The plate's width in pixels. Height follows the marked area's own aspect.
+PLATE_WIDTH = 480
+
+#: Median grey-level disagreement between the sampled frames and the finished
+#: plate, above which the artwork is not usable as a reference. A printed
+#: hoarding disagrees only where something crossed it -- measured 1.5 on the
+#: synthetic approach with a post sweeping the panel -- while a screen playing
+#: its own advert disagrees everywhere, measured 23 with modest scene changes.
+#: The cut sits between the two, nearer the printed side: refusing a usable
+#: plate merely falls back to depth, while accepting a screen's would eat the
+#: creative on every frame.
+PLATE_UNSTEADY = 8.0
+
+
+def _fit_gain(source_gray: np.ndarray, target_gray: np.ndarray):
+    """Gain and offset taking ``source`` onto ``target``, by their moments.
+
+    Whole-frame exposure and lighting drift is the ordinary condition of this
+    footage (see :func:`level_gray`); fitting it out before any comparison is
+    what keeps a camera hunting its exposure from reading as change.
+    """
+    spread = float(source_gray.std())
+    if spread < 1e-3:
+        return 1.0, float(target_gray.mean() - source_gray.mean())
+    gain = float(target_gray.std()) / spread
+    gain = float(np.clip(gain, 0.5, 2.0))
+    return gain, float(target_gray.mean() - gain * source_gray.mean())
+
+
+def _plate_gray(image: np.ndarray) -> np.ndarray:
+    return image.mean(axis=2) if image.ndim == 3 else image
+
+
+class SurfacePlate:
+    """The marked surface's own artwork, learned from the shot, as a reference.
+
+    A printed hoarding's artwork is fixed to the panel, so rectifying the
+    tracked quad to one canonical rectangle makes the artwork identical frame
+    after frame -- while anything standing in front of it, being nearer, slides
+    across it as the viewpoint moves. A per-pixel median over the shot is
+    therefore a clean plate of the artwork, and whatever disagrees with it on
+    a given frame is something in front.
+
+    This is the second cue the depth model needs. Measured on a drive-up with
+    a post crossing the hoarding: the depth model finds the post on 0-7% of
+    its pixels between 18% and 45% of frame width -- it simply does not read
+    it as nearer -- and never sees railing bars thinner than about a sixtieth
+    of its crop. Through the same footage compressed to file, this cue finds
+    that post on 75-100% of its pixels at every distance (100% everywhere on
+    clean frames), and finds 2 px bars, because it compares pictures at the
+    panel's own resolution instead of asking a 256-wide network about
+    geometry. What it under-reads is an obstruction with nearly the artwork's
+    own colour -- measured no lower than 53% of a dark post over dark artwork
+    -- which is exactly where a depth step is large, so the two cues cover
+    each other's blind sides.
+
+    Its limits are the mirror image, which is why the two run together rather
+    than either replacing the other: it knows nothing outside the quad, it
+    cannot work where the artwork itself changes (a digital screen playing
+    content -- :func:`build_surface_plate` refuses those), and a hard shadow
+    crossing the panel is a photometric change it will mark as if it were an
+    object, where depth correctly would not.
+    """
+
+    def __init__(self, plate: np.ndarray, abs_floor: float = 8.0,
+                 k: float = 6.0, dilate: int = 4, feather: float = 2.5):
+        """
+        Args:
+            plate: the canonical artwork, float32 HxWx3.
+            abs_floor: smallest grey-level difference that can count, however
+                clean the frame reads.
+            k: the difference demanded, in multiples of the frame's own median
+                difference from the plate -- its compression and focus noise.
+            dilate: grow the mask by this many pixels, matching the other
+                segmenters.
+            feather: blur the mask edge by this sigma, likewise.
+        """
+        self.plate = np.asarray(plate, np.float32)
+        self.abs_floor = float(abs_floor)
+        self.k = float(k)
+        self.dilate = int(dilate)
+        self.feather = float(feather)
+        self._shrunk = {}
+
+    def _plate_at(self, width: int, height: int) -> np.ndarray:
+        cached = self._shrunk.get((width, height))
+        if cached is None:
+            cached = cv2.resize(self.plate, (width, height),
+                                interpolation=cv2.INTER_AREA)
+            self._shrunk[(width, height)] = cached
+        return cached
+
+    def mask(self, frame_bgr: np.ndarray, quad) -> np.ndarray:
+        """A frame-sized mask, 255 where this frame disagrees with the plate.
+
+        The comparison runs at the panel's on-screen resolution, not the
+        plate's. A distant panel's fine artwork detail exists in the plate but
+        literally not in the frame, and comparing sharp against soft marks
+        every line of the artwork: measured on the far end of an approach,
+        differencing at the plate's resolution falsely masked 47% of the
+        panel, at the panel's own 9%.
+
+        The difference taken is the smallest over one-pixel shifts of the
+        plate. Tracked corners are good to about a pixel, not exactly, and
+        that misregistration lights every artwork edge: at 0.7 px of quad
+        error, plain differencing falsely masked up to 30%, the shift-tolerant
+        version 10% -- with the obstruction itself still found in full, since
+        no one-pixel slide makes a post look like the artwork behind it.
+
+        The noise the threshold scales from is the median difference,
+        deliberately: any upper quantile includes the obstruction itself once
+        it covers a real share of the panel, and raises the bar exactly for
+        the thing being looked for -- swapping in the 75th to 90th percentile
+        was measured to drop a plainly visible post from 53% found to 0%.
+        """
+        height, width = frame_bgr.shape[:2]
+        out = np.zeros((height, width), np.uint8)
+        corners = as_quad(quad)
+
+        plate_h, plate_w = self.plate.shape[:2]
+        on_screen = (np.linalg.norm(corners[1] - corners[0])
+                     + np.linalg.norm(corners[2] - corners[3])) / 2.0
+        native_w = int(np.clip(on_screen, 24, plate_w))
+        native_h = max(14, int(round(native_w * plate_h / plate_w)))
+
+        target = np.float32([[0, 0], [native_w, 0],
+                             [native_w, native_h], [0, native_h]])
+        try:
+            transform = cv2.getPerspectiveTransform(corners, target)
+        except cv2.error:
+            return out
+        source = frame_bgr
+        if on_screen > 1.2 * native_w:
+            # The warp is about to shrink the panel, and warpPerspective can
+            # only sample, not average -- filter to the destination's scale
+            # first or the aliasing reads as disagreement with the plate.
+            sigma = 0.5 * on_screen / native_w
+            ksize = int(sigma * 4) | 1
+            source = cv2.GaussianBlur(frame_bgr, (ksize, ksize), sigma)
+        rectified = cv2.warpPerspective(
+            source, transform, (native_w, native_h)).astype(np.float32)
+        plate = self._plate_at(native_w, native_h)
+
+        gain, offset = _fit_gain(_plate_gray(rectified), _plate_gray(plate))
+        rectified = rectified * gain + offset
+
+        difference = None
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                shifted = np.abs(rectified - np.roll(plate, (dy, dx),
+                                                     axis=(0, 1))).mean(axis=2)
+                difference = shifted if difference is None \
+                    else np.minimum(difference, shifted)
+
+        noise = float(np.median(difference))
+        binary = ((difference > max(self.abs_floor, self.k * noise))
+                  .astype(np.uint8)) * 255
+        binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN,
+                                  np.ones((3, 3), np.uint8))
+
+        back = cv2.warpPerspective(binary, transform, (width, height),
+                                   flags=cv2.WARP_INVERSE_MAP)
+        back = np.where(back > 127, 255, 0).astype(np.uint8)
+        if self.dilate > 0:
+            span = self.dilate * 2 + 1
+            back = cv2.dilate(back, np.ones((span, span), np.uint8))
+        if self.feather > 0:
+            ksize = max(3, int(self.feather * 4) | 1)
+            back = cv2.GaussianBlur(back, (ksize, ksize), self.feather)
+        out[:] = back
+        return out
+
+
+def build_surface_plate(video_path: str, history: dict,
+                        samples: int = PLATE_SAMPLES,
+                        width: int = PLATE_WIDTH):
+    """Learn a :class:`SurfacePlate` from the tracked shot, or refuse.
+
+    Deterministic on its inputs -- the same history over the same video gives
+    the same plate to the last bit, which is what lets the preview and the
+    renderer each build their own and be showing the same thing.
+
+    Returns None when there is not enough tracking to learn from, the video
+    cannot be read, or the artwork fails the steadiness check -- a digital
+    screen playing its own content disagrees with any plate everywhere, and
+    refusing it here is what keeps this cue from eating the creative on
+    footage it cannot serve. The caller falls back to depth alone.
+    """
+    tracked = {int(k): as_quad(v) for k, v in (history or {}).items()
+               if v is not None and len(v) == 4}
+    if len(tracked) < 3:
+        return None
+    keys = sorted(tracked)
+    picks = sorted(set(np.linspace(0, len(keys) - 1,
+                                   min(samples, len(keys))).round().astype(int)))
+
+    capture = cv2.VideoCapture(video_path)
+    if not capture.isOpened():
+        return None
+    try:
+        aspects, gathered = [], []
+        for index in picks:
+            frame_index = keys[index]
+            quad = tracked[frame_index]
+            capture.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
+            ok, frame = capture.read()
+            if not ok:
+                continue
+            top = np.linalg.norm(quad[1] - quad[0])
+            side = np.linalg.norm(quad[3] - quad[0])
+            if top < 8 or side < 8:
+                continue
+            aspects.append(side / top)
+            gathered.append((frame, quad))
+    finally:
+        capture.release()
+
+    if len(gathered) < 3:
+        return None
+
+    height = int(np.clip(round(width * float(np.median(aspects))), 32, width))
+    target = np.float32([[0, 0], [width, 0], [width, height], [0, height]])
+
+    rectified = []
+    for frame, quad in gathered:
+        transform = cv2.getPerspectiveTransform(quad, target)
+        rectified.append(cv2.warpPerspective(frame, transform, (width, height))
+                         .astype(np.float32))
+
+    # Exposure drifts over a shot; fold each sample onto the first before the
+    # median, or a slow brightening reads as half the panel changing.
+    reference = _plate_gray(rectified[0])
+    for i in range(1, len(rectified)):
+        gain, offset = _fit_gain(_plate_gray(rectified[i]), reference)
+        rectified[i] = rectified[i] * gain + offset
+
+    plate = np.median(np.stack(rectified), axis=0)
+
+    disagreement = np.median([
+        float(np.median(np.abs(_plate_gray(r) - _plate_gray(plate))))
+        for r in rectified])
+    if disagreement > PLATE_UNSTEADY:
+        logger.info("surface plate refused: median disagreement %.1f "
+                    "(artwork is not steady enough to be a reference)",
+                    disagreement)
+        return None
+    return SurfacePlate(plate)
+
+
 VIDEO_SUFFIXES = (".mp4", ".avi", ".mkv", ".mov", ".m4v", ".webm")
 
 

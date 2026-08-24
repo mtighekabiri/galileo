@@ -232,6 +232,48 @@ obstructions on plain artwork. *Restore Defaults* puts every dial back to the
 measured setting, and *Cancel* puts back whatever you started the session with
 — the dials change the preview as they move, so cancel has real work to do.
 
+### The panel as its own reference
+
+The depth model is one witness; the artwork is another. For a printed
+hoarding, whatever is on the panel is fixed to it — so rectifying the tracked
+area to one canonical rectangle makes the artwork identical frame after frame,
+while anything standing in front of it, being nearer, slides across it as the
+viewpoint moves. A per-pixel median over the tracked shot is therefore a clean
+plate of the artwork, and wherever a frame disagrees with the plate, something
+is in front. The comparison happens at the panel's own on-screen resolution,
+with a one-pixel tolerance for tracking error, and it costs no download and no
+model.
+
+This cue exists because the depth model measurably cannot cover two things,
+and it covers both. Measured on the drive-up, through codec compression:
+
+| | depth model | artwork cue |
+| --- | --- | --- |
+| post at 18–45% of frame width | 0–7% of its pixels | 75–100% |
+| railing bars of 2–14 px | not seen | 55–75% |
+
+Its blind side is the mirror image, which is why the two run together rather
+than either replacing the other: an obstruction with nearly the artwork's own
+colour under-reads (measured no lower than 53%, a dark post over equally dark
+artwork — exactly where a depth step is large), it knows nothing outside the
+marked area, and a hard shadow crossing the panel is a photometric change it
+will mark as if it were an object.
+
+It refuses footage it cannot serve. A digital screen playing its own content
+disagrees with any plate everywhere; `build_surface_plate` measures that
+disagreement and returns nothing — measured 1.5 grey levels of median
+disagreement for a printed hoarding against 23 for a screen with modest scene
+changes, cut at 8 — and a placement in *Digital screen (track surroundings)*
+mode is never tried at all. Either way those fall back to depth alone, and a
+render says so in its completion notes. The checkbox in the *Behind* dialog
+turns the cue off entirely for shots where it misjudges.
+
+The plate is learned once from up to 24 tracked frames (about half a second),
+deterministically — the preview and the render each build their own from the
+same tracking and land on identical numbers, which is what keeps the file
+matching the screen. It refreshes when the tracking it was learned from
+changes, but never in the middle of a tracking pass.
+
 ### Driving or walking past
 
 The footage this is pointed at is shot from a moving viewpoint, so a panel can
@@ -253,15 +295,18 @@ only 61% of the post found. It is gradual rather than a cliff, so a shot walks
 through it without the mask lurching on one frame, and a panel with room around
 it is judged exactly as before.
 
-**What this does not fix.** Behaviour still varies with distance more than one
-setting can absorb. On that same approach the post was found on 53% of its
-pixels at 10% of frame width, essentially missed between 18% and 45%, and found
-in full at 65%. That middle stretch is the depth model failing to see the post
-as meaningfully nearer at all, not a threshold being wrong, and no amount of
-tuning recovers it — measured against four different ways of normalising the
-step, the steadiest still swung 18-fold across the approach. For a long
-drive-up, expect to use the dials on the stretch you care about, or to insert
-across a shorter range.
+**What this does not fix.** The depth model's behaviour still varies with
+distance more than one setting can absorb. On that same approach the post was
+found on 53% of its pixels at 10% of frame width, essentially missed between
+18% and 45%, and found in full at 65%. That middle stretch is the model
+failing to see the post as meaningfully nearer at all, not a threshold being
+wrong, and no amount of tuning recovers it — measured against four different
+ways of normalising the step, the steadiest still swung 18-fold across the
+approach. **On a printed hoarding that stretch is now covered by the artwork
+cue above**, which found the same post on 75–100% of its pixels at every
+distance. On a digital screen playing its own content the artwork cue cannot
+run, so there the blind stretch stands: expect to use the dials on the part of
+the approach you care about, or to insert across a shorter range.
 
 ### Where it stops
 
@@ -851,6 +896,7 @@ file, and the algorithms can be tested without a display.
 | `galileo_core.Region` | Four corners plus per-edge curvature |
 | `galileo_core.composite_region` | Alpha-correct perspective/curved warp and blend |
 | `galileo_core.DepthSettings` | The dials behind *Draw behind obstructions* |
+| `galileo_core.SurfacePlate` | The panel's own artwork as an occlusion reference |
 | `galileo_core.smooth_tracking` | Fits a smooth path through the recorded corners |
 | `galileo_core.interpolate_tracking` | Fills the gaps between tracked frames |
 | `galileo_core.remux_audio` | Copies the source audio onto a finished render |

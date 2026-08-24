@@ -1023,3 +1023,99 @@ class TestTheKeyboardStaysWithTheDrawingTools:
         panel.slider.setFocus()
         panel.on_forward()
         assert window.focusWidget() is not overlay
+
+
+class TestTheArtworkCue:
+    """The plate's plumbing: who may use it, when it renews, and that the
+    preview and the render are provably looking at the same one."""
+
+    def tracked(self, window, truth, path):
+        panel = window.central_panel
+        placement = panel.tracking_overlay.placements[0]
+        placement.points = [tuple(map(float, p)) for p in truth[0]]
+        placement.tracking_history = {
+            i: [tuple(map(float, p)) for p in quad]
+            for i, quad in enumerate(truth)}
+        panel.obstruction_enabled = True
+        return panel, placement
+
+    def test_preview_and_render_build_the_same_plate(self, loaded):
+        """Each side builds its own from the history and the video; they must
+        agree to the last bit or the file differs from what was approved."""
+        window, path, truth = loaded
+        panel, placement = self.tracked(window, truth, path)
+
+        preview_mask = panel.plate_mask(panel.prev_frame, placement)
+        assert preview_mask is not None, "the preview never built a plate"
+
+        render_plate = core.build_surface_plate(path, placement.tracking_history)
+        render_mask = render_plate.mask(panel.prev_frame,
+                                        np.float32(placement.points))
+        assert np.array_equal(preview_mask, render_mask)
+
+    def test_a_digital_screen_placement_is_left_to_depth(self, loaded):
+        window, path, truth = loaded
+        panel, placement = self.tracked(window, truth, path)
+        placement.feature_source = core.PlanarTracker.SURROUND
+        assert panel.plate_mask(panel.prev_frame, placement) is None
+
+    def test_switching_the_cue_off_switches_it_off(self, loaded):
+        window, path, truth = loaded
+        panel, placement = self.tracked(window, truth, path)
+        panel.plate_enabled = False
+        assert panel.plate_mask(panel.prev_frame, placement) is None
+
+    def test_the_plate_is_not_rebuilt_mid_pass(self, loaded):
+        """A tracking pass rewrites the history on every frame; rebuilding a
+        half-second plate per frame would end playback. The one already
+        learned keeps serving until the pass is over."""
+        window, path, truth = loaded
+        panel, placement = self.tracked(window, truth, path)
+
+        panel.plate_mask(panel.prev_frame, placement)
+        first = placement.surface_plate
+        assert first is not None
+
+        panel.tracking_mode = True
+        placement.tracking_history[999] = placement.tracking_history[0]
+        panel.plate_mask(panel.prev_frame, placement)
+        assert placement.surface_plate is first, "rebuilt during the pass"
+
+        panel.tracking_mode = False
+        panel.plate_mask(panel.prev_frame, placement)
+        assert placement.surface_plate is not first, "never refreshed after it"
+
+    def test_a_refusal_is_remembered_rather_than_retried(self, loaded, monkeypatch):
+        window, path, truth = loaded
+        panel, placement = self.tracked(window, truth, path)
+        calls = []
+        monkeypatch.setattr(core, "build_surface_plate",
+                            lambda *a, **k: calls.append(1))
+        panel.plate_mask(panel.prev_frame, placement)
+        panel.plate_mask(panel.prev_frame, placement)
+        assert len(calls) == 1, "an unusable plate was re-learned per frame"
+
+    def test_the_flag_reaches_the_render_settings(self, loaded, logo_bgra, tmp_path):
+        window, path, truth = loaded
+        overlay = window.central_panel.tracking_overlay
+        overlay.overlay_bgra = logo_bgra
+        overlay.points = [tuple(map(float, p)) for p in truth[0]]
+        overlay.tracking_history = {0: [tuple(map(float, p)) for p in truth[0]]}
+
+        window.central_panel.plate_enabled = False
+        settings = window.build_render_settings(0, 2, 1.0, str(tmp_path / "o.mp4"))
+        assert settings.plate_enabled is False
+        snapshot = settings.placements[0]
+        assert snapshot.feature_source == core.PlanarTracker.INTERIOR
+        assert snapshot.plate is None
+
+    def test_the_dialog_checkbox_round_trips(self, loaded):
+        window, path, truth = loaded
+        panel = window.central_panel
+        dialog = galileo_app.ObstructionDialog(
+            panel.depth_settings, True, lambda: None, plate_enabled=True)
+        assert dialog.is_plate_enabled() is True
+        dialog.plate_box.setChecked(False)
+        assert dialog.is_plate_enabled() is False
+        dialog._revert_and_reject()
+        assert dialog.is_plate_enabled() is True, "cancel did not restore it"

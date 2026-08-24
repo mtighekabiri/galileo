@@ -53,17 +53,21 @@ Two mechanisms, both structural rather than artefacts of the synthetic scene:
 little of the crop is anything but panel, taking the worst false masking from
 46% to 26%. See `DEPTH_MIN_CONTEXT` and `DEPTH_CONTEXT_FIRMNESS`.
 
-**(1) is not, and looks unfixable by tuning.** Scaling the threshold by the
-panel's apparent size was tried and does not work: the depth step a real post
-produces is erratic rather than a smooth function of distance (15, 31, 400, 95,
-332 across the approach), and measured against four candidate yardsticks --
-whole crop, context only, the panel's own tilt, the fit residual -- the
-steadiest ratio still swung 18-fold. An Otsu-style split of the residuals was
-tried too: better in places, worse in others, and it does not recover the
-mid-distance stretch either. That stretch is the depth model not seeing the
-obstruction at all, so it is a model limit rather than a threshold one. Do not
-re-derive this; if it is revisited, the lever is a better depth model or a
-second cue, not arithmetic on this one.
+**(1) is not fixable by tuning, and is now covered by a second cue instead.**
+Scaling the threshold by the panel's apparent size was tried and does not
+work: the depth step a real post produces is erratic rather than a smooth
+function of distance (15, 31, 400, 95, 332 across the approach), and measured
+against four candidate yardsticks -- whole crop, context only, the panel's own
+tilt, the fit residual -- the steadiest ratio still swung 18-fold. An
+Otsu-style split of the residuals was no better, and a zoomed second pass of
+the same model does nothing (30-45% fill stays at 0-7% found). Do not
+re-derive any of this. The lever that worked is `core.build_surface_plate` /
+`SurfacePlate`: the panel's own artwork as the reference, which finds the same
+post on 75-100% at every distance and 2 px bars through codec compression --
+valid only where the artwork is fixed (printed hoardings; screens are refused
+by its steadiness check and by the SURROUND gate). The depth model's blind
+stretch therefore still stands on digital screens, where the honest remaining
+lever is a better depth model.
 
 `STEADY_WINDOW` (11 frames) has the same smell and has *not* been measured
 across an approach: a fixed window in frames, smoothing a path in pixels,

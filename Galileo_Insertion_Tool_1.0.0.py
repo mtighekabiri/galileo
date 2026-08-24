@@ -332,12 +332,14 @@ class ObstructionDialog(QDialog):
     painted over, and only the shot itself answers that.
     """
 
-    def __init__(self, settings, enabled, on_change, parent=None):
+    def __init__(self, settings, enabled, on_change, plate_enabled=True,
+                 parent=None):
         super().__init__(parent)
         self.settings = settings
         self.on_change = on_change
         self.original = settings.to_dict()
         self.original_enabled = enabled
+        self.original_plate = plate_enabled
 
         # A drag delivers far more values than anyone can see, and each one
         # costs a pass of the depth model over the frame -- much the most
@@ -379,6 +381,18 @@ class ObstructionDialog(QDialog):
         note.setStyleSheet("color: #9A9A9A; font-size: 11px;")
         note.setWordWrap(True)
         layout.addWidget(note)
+
+        self.plate_box = QCheckBox(
+            "Also compare against the panel's own artwork (printed surfaces)")
+        self.plate_box.setChecked(plate_enabled)
+        self.plate_box.setToolTip(
+            "Learn what the panel itself looks like from the tracked shot and "
+            "hold the creative back wherever a frame disagrees with it.\n"
+            "Catches what the depth model cannot -- thin railings, and "
+            "obstructions at mid distance -- but only where the artwork is "
+            "fixed;\na screen playing its own content is detected and skipped.")
+        self.plate_box.toggled.connect(lambda _checked: self.on_change())
+        layout.addWidget(self.plate_box)
 
         self.sliders = {}
         self.value_labels = {}
@@ -466,10 +480,14 @@ class ObstructionDialog(QDialog):
     def is_enabled(self) -> bool:
         return self.enabled_box.isChecked()
 
+    def is_plate_enabled(self) -> bool:
+        return self.plate_box.isChecked()
+
     def _revert_and_reject(self):
         for key, value in self.original.items():
             setattr(self.settings, key, value)
         self.enabled_box.setChecked(self.original_enabled)
+        self.plate_box.setChecked(self.original_plate)
         self.on_change()
         self.reject()
 
@@ -1794,6 +1812,13 @@ class Placement:
         # tracking pass keeps these and re-anchors itself to them instead of
         # writing over them; see CentralPanel.track_placement.
         self.manual_frames = set()
+        # The panel's own artwork as an occlusion reference, learned from the
+        # tracked shot (core.build_surface_plate). Derived data: never saved,
+        # rebuilt whenever the fingerprint of what it was learned from stops
+        # matching. A fingerprint with no plate records a refusal, so a
+        # screen's moving picture is not re-tested on every frame.
+        self.surface_plate = None
+        self.plate_fingerprint = None
 
         # Creative
         self.overlay_bgra = None
@@ -3102,6 +3127,10 @@ class CentralPanel(QWidget):
         # the picture already on the billboard, and how much depth that picture
         # depicts is not something the tool can know.
         self.depth_settings = core.DepthSettings()
+        # The artwork cue runs alongside depth wherever it can serve --
+        # printed surfaces with enough tracking to learn from. One switch for
+        # the user; the per-placement gates live in plate_for.
+        self.plate_enabled = True
         self._occlusion_cache = None
 
         # Fitting a smooth path through the recorded corners, for both the
@@ -4049,30 +4078,84 @@ class CentralPanel(QWidget):
         union = core.union_quad([p.points for p in placements
                                  if len(p.points) == 4])
         if union is None:
-            return self.combined_occlusion(frame, None)
+            return self.combined_occlusion(frame, None, placements)
         cell = (tuple(int(v) // 32 for v in union.reshape(-1)),
-                self.occlusion_enabled, self.obstruction_enabled)
+                self.occlusion_enabled, self.obstruction_enabled,
+                self.plate_enabled,
+                tuple(self._history_fingerprint(p) for p in placements))
         cached = self._occlusion_cache
         if (cached is not None and cached[0] is frame and cached[1] == cell):
             return cached[2]
-        mask = self.combined_occlusion(frame, union)
+        mask = self.combined_occlusion(frame, union, placements)
         self._occlusion_cache = (frame, cell, mask)
         return mask
 
-    def combined_occlusion(self, frame, quad):
-        """Both kinds of occlusion in one mask, or None when neither applies.
+    def combined_occlusion(self, frame, quad, placements=()):
+        """Every occlusion source in one mask, or None when none applies.
 
-        They overlap happily -- a pedestrian behind a railing is found twice --
-        so the two are merged by taking whichever holds the creative back more
-        at each pixel, and a placement is drawn behind the union of them.
+        They overlap happily -- a pedestrian behind a railing is found by two
+        of them -- so the sources are merged by taking whichever holds the
+        creative back more at each pixel, and a placement is drawn behind the
+        union of them.
         """
-        person = self.occlusion_mask(frame, quad)
-        depth = self.obstruction_mask(frame, quad)
-        if person is None:
-            return depth
-        if depth is None:
-            return person
-        return cv2.max(person, depth)
+        combined = None
+        for source in (self.occlusion_mask(frame, quad),
+                       self.obstruction_mask(frame, quad),
+                       *(self.plate_mask(frame, p) for p in placements)):
+            if source is None:
+                continue
+            combined = source if combined is None else cv2.max(combined, source)
+        return combined
+
+    def _history_fingerprint(self, placement):
+        """A cheap stand-in for "has what the plate was learned from changed".
+
+        Checked on every composite, so it has to cost nearly nothing; missing
+        an exotic edit merely leaves a slightly stale plate until the next
+        real change. The video path is part of it -- a plate learned from one
+        clip must not survive into another.
+        """
+        history = placement.tracking_history
+        if not history:
+            return (getattr(self, "current_video_path", None), 0)
+        keys = sorted(history)
+        middle = history[keys[len(keys) // 2]]
+        return (getattr(self, "current_video_path", None), len(keys),
+                keys[0], keys[-1],
+                int(sum(x + y for x, y in middle)) if middle else 0)
+
+    def plate_mask(self, frame, placement):
+        """The artwork cue's mask for one placement, or None where it cannot serve.
+
+        It cannot serve a digital screen (the artwork moves -- that is what
+        SURROUND tracking mode means, and build_surface_plate refuses such
+        footage on its own evidence too), a placement with too little
+        tracking, or a frame while a tracking pass is actively rewriting the
+        history -- the plate already learned keeps serving through the pass
+        and is refreshed at the first composite after it.
+        """
+        if (not self.obstruction_enabled or not self.plate_enabled
+                or frame is None
+                or placement.feature_source == core.PlanarTracker.SURROUND
+                or not getattr(self, "current_video_path", "")):
+            return None
+
+        fingerprint = self._history_fingerprint(placement)
+        stale = placement.plate_fingerprint != fingerprint
+        if stale and not (self.tracking_mode
+                          and placement.surface_plate is not None):
+            placement.surface_plate = core.build_surface_plate(
+                self.current_video_path, placement.tracking_history)
+            placement.plate_fingerprint = fingerprint
+
+        plate = placement.surface_plate
+        if plate is None or len(placement.points) != 4:
+            return None
+        try:
+            return plate.mask(frame, placement.points)
+        except cv2.error as exc:
+            logging.warning("Artwork comparison failed on this frame: %s", exc)
+            return None
 
     def occlusion_mask(self, frame, quad):
         """A mask of people in front of the surface, or None if switched off."""
@@ -4828,6 +4911,10 @@ class PlacementSnapshot:
         self.morph = morphlib.Morph.from_dict(placement.morph.to_dict())
         self.shape_cache = morphlib.ShapeCache()
         self.scale = scale
+        self.feature_source = getattr(placement, "feature_source",
+                                      core.PlanarTracker.INTERIOR)
+        # The artwork reference, built by the worker once the range is known.
+        self.plate = None
         # Per-placement decode state, filled in by the worker.
         self.capture = None
         self.cursor = -1
@@ -4854,7 +4941,7 @@ class RenderSettings:
                  blend_settings=None, placements=None, morph=None,
                  deflicker_gains=None, obstructions=False,
                  steady_tracking=False, steady_window=core.STEADY_WINDOW,
-                 depth_settings=None):
+                 depth_settings=None, plate_enabled=True):
         self.base_video_path = base_video_path
         self.out_path = out_path
         self.start_frame = int(start_frame)
@@ -4879,6 +4966,9 @@ class RenderSettings:
         # written; the same reason everything else here is detached.
         self.depth = core.DepthSettings.from_dict(
             (depth_settings or core.DepthSettings()).to_dict())
+        # Whether the artwork cue may run; the plates themselves are built by
+        # the worker from each placement's history, not carried across.
+        self.plate_enabled = bool(plate_enabled)
         # Steadying is applied to the recorded corners here rather than left to
         # the preview, or the file would be written from the raw path the
         # preview had already stopped showing.
@@ -5095,6 +5185,18 @@ class RenderWorker(QObject):
                     caveats.append("the depth model is missing, so obstructions "
                                    "in front of the surface were painted over")
 
+            if settings.obstructions and settings.plate_enabled:
+                for placement in placements:
+                    if placement.feature_source == core.PlanarTracker.SURROUND:
+                        continue
+                    placement.plate = core.build_surface_plate(
+                        settings.base_video_path, placement.history)
+                    if placement.plate is None:
+                        caveats.append(
+                            f"the artwork of {placement.name} could not serve "
+                            "as an occlusion reference, so obstructions there "
+                            "rely on the depth model alone")
+
             frame_counter = 0
 
             for frame_idx in range(settings.start_frame, settings.end_frame + 1):
@@ -5139,6 +5241,20 @@ class RenderWorker(QObject):
                         except cv2.error as exc:
                             logging.warning("Depth estimation failed on frame "
                                             "%d: %s", frame_idx, exc)
+
+                for placement in placements:
+                    quad = placement.dense.get(frame_idx)
+                    if placement.plate is None or quad is None:
+                        continue
+                    try:
+                        from_plate = placement.plate.mask(
+                            base_frame, np.float32(quad) * placement.scale)
+                    except cv2.error as exc:
+                        logging.warning("Artwork comparison failed on frame "
+                                        "%d: %s", frame_idx, exc)
+                        continue
+                    occlusion = (from_plate if occlusion is None
+                                 else cv2.max(occlusion, from_plate))
 
                 for placement in placements:
                     base_frame = self._draw_placement(
@@ -5761,6 +5877,7 @@ class MainWindow(QMainWindow):
             occlusion=panel.occlusion_enabled,
             obstructions=panel.obstruction_enabled,
             depth_settings=panel.depth_settings,
+            plate_enabled=panel.plate_enabled,
             steady_tracking=panel.steady_tracking,
             steady_window=panel.steady_window,
             blend_settings=blend.BlendSettings.from_dict(overlay.blend.to_dict()),
@@ -6200,10 +6317,14 @@ class MainWindow(QMainWindow):
             return
 
         dialog = ObstructionDialog(panel.depth_settings, panel.obstruction_enabled,
-                                   self._preview_obstructions, parent=self)
+                                   self._preview_obstructions,
+                                   plate_enabled=panel.plate_enabled, parent=self)
         before = panel.obstruction_enabled
+        before_plate = panel.plate_enabled
         accepted = dialog.exec_() == QDialog.Accepted
         panel.obstruction_enabled = dialog.is_enabled() if accepted else before
+        panel.plate_enabled = (dialog.is_plate_enabled() if accepted
+                               else before_plate)
         if not panel.obstruction_enabled:
             panel.depth_segmenter = None
         self.refresh_obstruction_lamp()
@@ -6212,7 +6333,11 @@ class MainWindow(QMainWindow):
     def _preview_obstructions(self):
         """What the dialog calls as a dial moves: show it on this frame."""
         panel = self.central_panel
-        panel.obstruction_enabled = self.obstruction_dialog_enabled()
+        dialog = self.findChild(ObstructionDialog)
+        panel.obstruction_enabled = (dialog.is_enabled() if dialog
+                                     else panel.obstruction_enabled)
+        panel.plate_enabled = (dialog.is_plate_enabled() if dialog
+                               else panel.plate_enabled)
         self.apply_depth_settings()
 
     def obstruction_dialog_enabled(self) -> bool:
