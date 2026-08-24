@@ -137,7 +137,7 @@ creative back where they are, so they pass in front of it.
 This needs a model file, which is not committed to the repository:
 
 ```bash
-python fetch_model.py      # both models, once
+python fetch_model.py      # all three models, once
 ```
 
 It runs through OpenCV's own DNN module, so there is no extra dependency to
@@ -180,14 +180,32 @@ The two occlusion options are independent and combine — with both on, a
 pedestrian behind a railing is drawn in front of the creative once, from
 whichever source found more of them.
 
-Measured on an ordinary four-core desktop: **66 ms per frame at 1080p**, plus
-about 170 ms once when the model is first used. That is well below real-time
-playback, so the preview slows down noticeably while it is on; renders are
+Two depth models can serve, and the tool prefers the better one when its file
+is present. **Depth Anything V2 small** (Apache-2.0, about 99 MB — the exact
+export OpenCV pins in its own dnn test suite) sees what **MiDaS v2.1 small**
+(MIT, about 64 MB) structurally cannot. Measured across the drive-up, at the
+same dial settings:
+
+| | MiDaS v2.1 small | Depth Anything V2 small |
+| --- | --- | --- |
+| post crossing the hoarding | dips to 19% at one distance | 100% throughout |
+| railing bars of 2–14 px | 0% at every distance | 91–100% |
+| cost per frame, four-core desktop | ~66 ms | ~440 ms |
+
+Depth Anything is a transformer and loads on OpenCV 5's dnn engine only; on an
+older OpenCV, or when its file has not been fetched, MiDaS serves exactly as
+before — the fallback is automatic and logged. Both run through OpenCV's own
+DNN module, so neither adds a dependency. The preview slows down noticeably
+while the depth cue is on (more so under Depth Anything); renders are
 unaffected beyond taking longer.
 
-The model is MiDaS v2.1 small (MIT licensed, about 64 MB), fetched by
-`fetch_model.py` alongside the person model and run through the same OpenCV DNN
-module, so it adds no dependency either.
+One caution, measured and mutual: each model misreads a different kind of
+*depicted* content as standing off the panel. Giant flat lettering read as
+popped to Depth Anything on 45% of a synthetic test panel at any threshold,
+and banded gradient artwork read as off-plane to MiDaS on 46% — while
+photographic artwork sat at 2–3% for both. The artwork cue above and the
+sensitivity dials are the remedies; deleting `depth_anything_v2_small.onnx`
+from `models/` forces the MiDaS behaviour if a particular clip prefers it.
 
 ### The dials
 
@@ -304,9 +322,12 @@ wrong, and no amount of tuning recovers it — measured against four different
 ways of normalising the step, the steadiest still swung 18-fold across the
 approach. **On a printed hoarding that stretch is now covered by the artwork
 cue above**, which found the same post on 75–100% of its pixels at every
-distance. On a digital screen playing its own content the artwork cue cannot
-run, so there the blind stretch stands: expect to use the dials on the part of
-the approach you care about, or to insert across a shorter range.
+distance — and with the Depth Anything model fetched, by the depth cue as
+well, which holds 100% throughout the approach where MiDaS dipped to 19%. On
+a digital screen playing its own content the artwork cue cannot run, so a
+screen on an old-OpenCV machine still carrying only MiDaS keeps the blind
+stretch: there, expect to use the dials on the part of the approach you care
+about, or to insert across a shorter range.
 
 ### Where it stops
 

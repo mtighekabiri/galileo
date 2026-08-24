@@ -2461,12 +2461,32 @@ class DepthOcclusionSegmenter:
     move with the surface" flags the advert being replaced. Depth does not care
     what is playing -- the panel is flat either way.
 
-    Runs MiDaS v2.1 small through OpenCV's own DNN module, one 64 MB file and
-    no extra runtime, exactly like the person model. See fetch_model.py.
+    Two models can serve, and the better one is preferred. Depth Anything V2
+    small (99 MB, Apache-2.0, the exact file OpenCV pins in its own dnn test
+    suite) sees what MiDaS v2.1 small structurally cannot: measured across a
+    drive-up, MiDaS found 2-14 px railing bars on 0% of their pixels at every
+    distance and dropped to 19% on a post at one, where Depth Anything found
+    the bars on 91-100% and the post on 100% throughout, at the same dial
+    settings. It is a transformer, so it loads on OpenCV 5's dnn engine and
+    not the classic 4.x one -- when it cannot load, or its file has not been
+    fetched, MiDaS serves as before. ``model_name`` says which one answered.
+
+    Costs, measured on this 4-core class of machine: MiDaS ~66 ms a frame,
+    Depth Anything ~440 ms at its 518 input (392 halves that but was measured
+    losing a third of the thin bars at one distance, so quality keeps the
+    default). Both run through OpenCV's own DNN module -- no extra runtime.
+    See fetch_model.py.
     """
 
+    #: Preferred: Depth Anything V2 small, when its file is present and the
+    #: dnn engine can load it.
+    PREFERRED_FILENAME = "depth_anything_v2_small.onnx"
+    #: Multiple of 14 (the ViT patch size). 518 is the size the model was
+    #: trained at and the size OpenCV's own perf suite runs it at.
+    PREFERRED_INPUT = 518
+    #: Fallback: MiDaS v2.1 small, which loads on any supported OpenCV.
     MODEL_FILENAME = "midas_v21_small_256.onnx"
-    #: Fixed by the exported graph. Feeding it another size is not an option.
+    #: Fixed by the MiDaS export. Feeding it another size is not an option.
     INPUT_SIZE = (256, 256)
 
     def __init__(self, model_path: str = None, k: float = 5.0,
@@ -2490,26 +2510,48 @@ class DepthOcclusionSegmenter:
                 context that tells the network the screen is flat, whatever is
                 playing on it.
         """
-        path = model_path or find_model(self.MODEL_FILENAME)
-        if not path:
-            raise FileNotFoundError(
-                f"Could not find {self.MODEL_FILENAME}. Run fetch_model.py to "
-                "download it, or place it in a 'models' folder beside the "
-                "application.")
-        try:
-            self.net = cv2.dnn.readNetFromONNX(path)
-        except cv2.error as exc:
-            # OpenCV 5 picks an engine for itself and falls back to the 4.x one
-            # on its own, but say so explicitly rather than rely on it: this
-            # model is known to load on the classic engine.
-            if not hasattr(cv2.dnn, "ENGINE_CLASSIC"):
-                raise IOError(f"Could not load the depth model: {exc}") from exc
-            try:
-                self.net = cv2.dnn.readNetFromONNX(path, cv2.dnn.ENGINE_CLASSIC)
-            except cv2.error as retry:
-                raise IOError(f"Could not load the depth model: {retry}") from retry
+        self.net = None
+        self.model_name = None
+        self.model_path = None
 
-        self.model_path = path
+        if model_path is None:
+            preferred = find_model(self.PREFERRED_FILENAME)
+            if preferred:
+                try:
+                    self.net = cv2.dnn.readNetFromONNX(preferred)
+                    self.model_name = "depth-anything-v2-small"
+                    self.model_path = preferred
+                except cv2.error as exc:
+                    # Expected on OpenCV 4.x, whose engine has no transformer
+                    # support: fall back to MiDaS rather than fail a machine
+                    # that worked yesterday.
+                    logger.warning("Preferred depth model would not load "
+                                   "(%s); falling back to MiDaS", exc)
+
+        if self.net is None:
+            path = model_path or find_model(self.MODEL_FILENAME)
+            if not path:
+                raise FileNotFoundError(
+                    f"Could not find {self.MODEL_FILENAME} (or "
+                    f"{self.PREFERRED_FILENAME}). Run fetch_model.py to "
+                    "download them, or place one in a 'models' folder beside "
+                    "the application.")
+            try:
+                self.net = cv2.dnn.readNetFromONNX(path)
+            except cv2.error as exc:
+                # OpenCV 5 picks an engine for itself and falls back to the
+                # 4.x one on its own, but say so explicitly rather than rely
+                # on it: MiDaS is known to load on the classic engine.
+                if not hasattr(cv2.dnn, "ENGINE_CLASSIC"):
+                    raise IOError(f"Could not load the depth model: {exc}") from exc
+                try:
+                    self.net = cv2.dnn.readNetFromONNX(path,
+                                                       cv2.dnn.ENGINE_CLASSIC)
+                except cv2.error as retry:
+                    raise IOError(
+                        f"Could not load the depth model: {retry}") from retry
+            self.model_name = "midas-v21-small"
+            self.model_path = path
         self.k = k
         self.floor_rel = floor_rel
         self.dilate = dilate
@@ -2518,21 +2560,36 @@ class DepthOcclusionSegmenter:
 
     @classmethod
     def is_available(cls) -> bool:
-        """True if the model file can be found."""
-        return find_model(cls.MODEL_FILENAME) is not None
+        """True if either depth model's file can be found."""
+        return (find_model(cls.PREFERRED_FILENAME) is not None
+                or find_model(cls.MODEL_FILENAME) is not None)
+
+    #: What Depth Anything expects OUTSIDE the graph. The two models disagree
+    #: here in exactly the way that bites silently: MiDaS bakes its ImageNet
+    #: normalisation into the export and wants plain [0, 1] RGB, Depth
+    #: Anything leaves it to the caller. Feeding either the other's recipe
+    #: produces a plausible-looking, quietly wrong depth map.
+    _DA_MEAN = np.float32([0.485, 0.456, 0.406])
+    _DA_STD = np.float32([0.229, 0.224, 0.225])
 
     def _infer(self, patch_bgr: np.ndarray) -> np.ndarray:
         """Relative inverse depth for one patch, at the network's own size.
 
-        The mean and standard deviation this model was trained with are baked
-        into the exported graph, so the input wanted here is plain [0, 1] RGB.
-        Subtracting them again -- which most examples of driving this model
-        through OpenCV do -- normalises it twice and quietly degrades the
-        result rather than failing outright.
+        Larger means nearer for both models, so everything downstream is
+        indifferent to which one answered.
         """
-        blob = cv2.dnn.blobFromImage(
-            patch_bgr, scalefactor=1 / 255.0, size=self.INPUT_SIZE,
-            mean=(0, 0, 0), swapRB=True, crop=False)
+        if self.model_name == "depth-anything-v2-small":
+            side = self.PREFERRED_INPUT
+            resized = cv2.resize(patch_bgr, (side, side),
+                                 interpolation=cv2.INTER_CUBIC)
+            pixels = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
+            pixels = (pixels.astype(np.float32) / 255.0 - self._DA_MEAN) \
+                / self._DA_STD
+            blob = pixels.transpose(2, 0, 1)[None]
+        else:
+            blob = cv2.dnn.blobFromImage(
+                patch_bgr, scalefactor=1 / 255.0, size=self.INPUT_SIZE,
+                mean=(0, 0, 0), swapRB=True, crop=False)
         self.net.setInput(blob)
         output = np.asarray(self.net.forward(), np.float32)
         return output.reshape(output.shape[-2], output.shape[-1])

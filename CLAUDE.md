@@ -65,9 +65,16 @@ re-derive any of this. The lever that worked is `core.build_surface_plate` /
 `SurfacePlate`: the panel's own artwork as the reference, which finds the same
 post on 75-100% at every distance and 2 px bars through codec compression --
 valid only where the artwork is fixed (printed hoardings; screens are refused
-by its steadiness check and by the SURROUND gate). The depth model's blind
-stretch therefore still stands on digital screens, where the honest remaining
-lever is a better depth model.
+by its steadiness check and by the SURROUND gate). That better depth model
+now exists too: Depth Anything V2 small is preferred when present (OpenCV 5
+only; MiDaS stays the fallback), measured 100% on the post throughout the
+approach and 91-100% on 2-14 px bars where MiDaS had 19% at worst and 0%
+everywhere respectively -- so the stretch is covered on screens as well,
+except on old-OpenCV machines that can only run MiDaS. Caution, measured and
+mutual: each model misreads a different class of depicted artwork as popped
+(flat giant lettering for Depth Anything, 45%; banded gradients for MiDaS,
+46%; photographic content 2-3% for both). Choose test artwork for depth tests
+by measurement, not intuition.
 
 `STEADY_WINDOW` (11 frames) has the same smell and has *not* been measured
 across an approach: a fixed window in frames, smoothing a path in pixels,

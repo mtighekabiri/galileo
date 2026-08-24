@@ -6386,8 +6386,9 @@ class MainWindow(QMainWindow):
         """Said the same way wherever the option is reached from."""
         QMessageBox.warning(
             self, "Model Not Found",
-            "The depth model is missing.\n\n"
-            "Run fetch_model.py to download it (about 64 MB), or place "
+            "No depth model is present.\n\n"
+            "Run fetch_model.py to download them, or place "
+            f"{core.DepthOcclusionSegmenter.PREFERRED_FILENAME} or "
             f"{core.DepthOcclusionSegmenter.MODEL_FILENAME} in a 'models' "
             "folder beside the application.")
 

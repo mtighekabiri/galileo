@@ -12,15 +12,20 @@ inside the folder.
 python fetch_model.py
 ```
 
-Downloads the two occlusion models into `models/` — person segmentation (about
-6 MB) and depth (about 64 MB) — which the spec then bundles so occlusion works
-for whoever receives the build. Skip it and everything else still works, but
-**Draw behind people** and **Draw behind obstructions** will be unavailable to
-them with no way to switch them on. Fetching only one is fine: each menu item
-depends on its own model, and the build bundles whatever is there.
+Downloads the occlusion models into `models/` — person segmentation (about
+6 MB) and two depth models: Depth Anything V2 small (about 99 MB, preferred,
+needs the OpenCV 5 this build pins) and MiDaS v2.1 small (about 64 MB, the
+fallback for machines running an older OpenCV). The spec bundles whatever is
+there, so occlusion works for whoever receives the build. Skip the fetch and
+everything else still works, but **Draw behind people** and **Draw behind
+obstructions** will be unavailable with no way to switch them on. Fetching a
+subset is fine: people needs its own file, obstructions needs either depth
+file and prefers Depth Anything.
 
-The depth model is the bulk of it, so a build made with both is about 64 MB
-larger than one made with neither.
+The depth models are the bulk of it: all three add about 169 MB to the build.
+A build that must stay small can ship MiDaS alone for about 64 MB, at the
+measured cost in the README (thin railings unseen, a blind stretch at mid
+distance).
 
 ## Build it
 

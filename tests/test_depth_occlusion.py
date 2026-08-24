@@ -272,18 +272,44 @@ class TestTheModel:
         assert float((mask[inside] > 127).mean()) < 0.02
 
     def test_something_standing_in_front_is_found(self):
+        """The scene must carry real depth cues -- sky, a ground plane, a post
+        whose ground contact sits well below the panel -- and the artwork must
+        be photographic in character. Two earlier versions of this test each
+        pinned an accident: a cue-free painted rectangle that only MiDaS fired
+        on (Depth Anything correctly read it as flat and failed by being
+        right), and giant flat SALE lettering that Depth Anything reads as
+        popped out of the panel at any threshold -- a real caution, recorded
+        in the README, but a property of cartoon text rather than of the
+        detector."""
         segmenter = core.DepthOcclusionSegmenter()
-        frame, panel = scene_with_a_panel()
-        cv2.rectangle(frame, (430, 0), (470, frame.shape[0]), (70, 70, 75), -1)
-        cv2.rectangle(frame, (430, 0), (470, frame.shape[0]), (25, 25, 28), 3)
+        height, width = 540, 960
+        frame = np.full((height, width, 3), 110, np.uint8)
+        frame[:200] = (215, 205, 195)                       # sky
+        for y in range(340, height):                        # receding ground
+            shade = int(58 + (y - 340) * 0.45)
+            frame[y, :] = (shade, shade, shade + 6)
+        panel = np.float32([[250, 210], [700, 205], [700, 360], [250, 365]])
+        # Photographic artwork -- a soft sky with a pale sun. Chosen by
+        # measurement, since each model pops a different kind of depicted
+        # content: banded gradients read as off-plane to MiDaS (46% falsely
+        # marked) and flat lettering to Depth Anything (45%), while both read
+        # this at 2-3%.
+        art = np.zeros((160, 450, 3), np.uint8)
+        for y in range(160):
+            t = y / 160
+            art[y, :] = (int(180 - 40 * t), int(160 - 30 * t),
+                         int(140 + 40 * t))
+        cv2.circle(art, (337, 56), 32, (200, 205, 225), -1)
+        frame[205:365, 250:700] = cv2.GaussianBlur(art, (31, 31), 9)
+        cv2.rectangle(frame, (430, 0), (466, height), (52, 52, 56), -1)
 
-        inside = core.quad_to_mask(panel, frame.shape[1], frame.shape[0]) > 127
+        inside = core.quad_to_mask(panel, width, height) > 127
         post = np.zeros(frame.shape[:2], bool)
-        post[:, 430:470] = True
+        post[:, 430:466] = True
 
         mask = segmenter.mask(frame, panel)
-        assert float((mask[post & inside] > 127).mean()) > 0.8
-        assert float((mask[inside & ~post] > 127).mean()) < 0.25
+        assert float((mask[post & inside] > 127).mean()) > 0.8, segmenter.model_name
+        assert float((mask[inside & ~post] > 127).mean()) < 0.25, segmenter.model_name
 
     def test_the_crop_keeps_the_mask_near_the_area(self):
         """Running on a crop is what keeps a distant railing big enough to
@@ -491,3 +517,61 @@ class TestApproachingTheSurface:
         assert removed == sorted(removed), f"not gradual: {removed}"
         assert removed[0] == 0.0, "stiffened a panel that still had room around it"
         assert removed[-1] > 0.0, "did nothing to a panel filling the crop"
+
+
+class TestWhichDepthModelServes:
+    """Two files can serve, and the better one is preferred. Selection has to
+    be provable without the network, so these drive it through find_model."""
+
+    def test_the_preferred_model_wins_when_both_are_present(self, monkeypatch):
+        if not (core.find_model(core.DepthOcclusionSegmenter.PREFERRED_FILENAME)
+                and core.find_model(core.DepthOcclusionSegmenter.MODEL_FILENAME)):
+            pytest.skip("both depth models needed; run fetch_model.py")
+        assert core.DepthOcclusionSegmenter().model_name == "depth-anything-v2-small"
+
+    def test_midas_serves_when_the_preferred_file_is_absent(self, monkeypatch):
+        midas = core.find_model(core.DepthOcclusionSegmenter.MODEL_FILENAME)
+        if not midas:
+            pytest.skip("MiDaS model needed; run fetch_model.py")
+        monkeypatch.setattr(core, "find_model",
+                            lambda name: midas
+                            if name == core.DepthOcclusionSegmenter.MODEL_FILENAME
+                            else None)
+        assert core.DepthOcclusionSegmenter().model_name == "midas-v21-small"
+
+    def test_a_preferred_file_that_will_not_load_falls_back(self, monkeypatch,
+                                                            tmp_path):
+        """The expected shape of an OpenCV 4.x machine: the transformer file
+        is present but its engine cannot load it. Yesterday's model has to
+        keep working rather than the feature dying on an upgrade."""
+        midas = core.find_model(core.DepthOcclusionSegmenter.MODEL_FILENAME)
+        if not midas:
+            pytest.skip("MiDaS model needed; run fetch_model.py")
+        bogus = tmp_path / core.DepthOcclusionSegmenter.PREFERRED_FILENAME
+        bogus.write_bytes(b"not a network")
+        monkeypatch.setattr(core, "find_model",
+                            lambda name: str(bogus)
+                            if name == core.DepthOcclusionSegmenter.PREFERRED_FILENAME
+                            else midas)
+        segmenter = core.DepthOcclusionSegmenter()
+        assert segmenter.model_name == "midas-v21-small"
+
+    def test_availability_means_either_file(self, monkeypatch):
+        monkeypatch.setattr(core, "find_model",
+                            lambda name: "/tmp/x.onnx"
+                            if name == core.DepthOcclusionSegmenter.PREFERRED_FILENAME
+                            else None)
+        assert core.DepthOcclusionSegmenter.is_available() is True
+        monkeypatch.setattr(core, "find_model", lambda name: None)
+        assert core.DepthOcclusionSegmenter.is_available() is False
+
+    def test_the_fetch_list_carries_all_three(self):
+        import fetch_model
+        names = [m["filename"] for m in fetch_model.MODELS]
+        assert core.DepthOcclusionSegmenter.PREFERRED_FILENAME in names
+        assert core.DepthOcclusionSegmenter.MODEL_FILENAME in names
+        assert core.PersonSegmenter.MODEL_FILENAME in names
+        preferred = next(m for m in fetch_model.MODELS
+                         if m["filename"] ==
+                         core.DepthOcclusionSegmenter.PREFERRED_FILENAME)
+        assert preferred["expected_bytes"] == 99060839
