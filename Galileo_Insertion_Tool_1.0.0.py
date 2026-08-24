@@ -18,7 +18,7 @@ from PyQt5.QtCore import (
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QFrame, QVBoxLayout, QHBoxLayout, QInputDialog,
     QGraphicsDropShadowEffect, QPushButton, QLabel, QMainWindow,
-    QSpacerItem, QSizePolicy, QSlider, QFileDialog, QMenu, QAction,
+    QSpacerItem, QSizePolicy, QSlider, QFileDialog, QMenu, QAction, QActionGroup,
     QStyle, QMessageBox, QGridLayout, QCheckBox, QDialog, QDialogButtonBox,
     QProgressDialog, QScrollArea, QSpinBox, QComboBox, QLineEdit,
     QListWidget, QListWidgetItem, QWIDGETSIZE_MAX)
@@ -2626,6 +2626,33 @@ class TitleBar(QWidget):
         self.obstruction_action.toggled.connect(self.parent.toggle_obstructions)
         options_menu.addAction(self.obstruction_action)
 
+        # How readily it calls something an obstruction. Turn it down when the
+        # artwork already on the billboard has depth in it -- a road running
+        # away, a face leaning out -- and holes start opening in the creative;
+        # turn it up when something really in front is being painted over.
+        sensitivity_menu = QMenu("Obstruction sensitivity", self.menu)
+        self.sensitivity_group = QActionGroup(self)
+        self.sensitivity_group.setExclusive(True)
+        self.sensitivity_actions = {}
+        for level, label, hint in (
+                ("low", "Low",
+                 "For artwork with strong depth in it: fewest false holes, and "
+                 "the faintest obstructions are missed"),
+                ("normal", "Normal", "The measured balance between the two"),
+                ("high", "High",
+                 "Finds the faintest obstructions, and is likeliest to mistake "
+                 "the billboard's own picture for one")):
+            action = QAction(label, self, checkable=True)
+            action.setToolTip(hint)
+            action.setChecked(level == "normal")
+            action.triggered.connect(
+                lambda _checked, name=level:
+                self.parent.set_obstruction_sensitivity(name))
+            self.sensitivity_group.addAction(action)
+            sensitivity_menu.addAction(action)
+            self.sensitivity_actions[level] = action
+        options_menu.addMenu(sensitivity_menu)
+
         self.steady_tracking_action = QAction(
             "Steady the tracked path", self, checkable=True)
         self.steady_tracking_action.setToolTip(
@@ -2935,6 +2962,11 @@ class CentralPanel(QWidget):
         self.occlusion_enabled = False
         self.depth_segmenter = None
         self.obstruction_enabled = False
+        # How readily something counts as standing in front of the surface.
+        # A setting rather than a constant because what defeats the depth
+        # network is the picture already on the billboard, and how much depth
+        # that picture depicts is not something the tool can know.
+        self.obstruction_sensitivity = "normal"
         self._occlusion_cache = None
 
         # Fitting a smooth path through the recorded corners, for both the
@@ -3906,7 +3938,8 @@ class CentralPanel(QWidget):
             return None
         if self.depth_segmenter is None:
             try:
-                self.depth_segmenter = core.DepthOcclusionSegmenter()
+                self.depth_segmenter = core.DepthOcclusionSegmenter(
+                    floor_rel=core.DEPTH_SENSITIVITY[self.obstruction_sensitivity])
             except (FileNotFoundError, IOError) as exc:
                 logging.warning("Obstruction occlusion unavailable: %s", exc)
                 self.obstruction_enabled = False
@@ -4661,7 +4694,8 @@ class RenderSettings:
                  colourise=False, include_audio=True, occlusion=False,
                  blend_settings=None, placements=None, morph=None,
                  deflicker_gains=None, obstructions=False,
-                 steady_tracking=False, steady_window=core.STEADY_WINDOW):
+                 steady_tracking=False, steady_window=core.STEADY_WINDOW,
+                 obstruction_sensitivity="normal"):
         self.base_video_path = base_video_path
         self.out_path = out_path
         self.start_frame = int(start_frame)
@@ -4682,6 +4716,9 @@ class RenderSettings:
         # threads, so the worker builds its own of each.
         self.occlusion = occlusion
         self.obstructions = bool(obstructions)
+        self.obstruction_sensitivity = (
+            obstruction_sensitivity if obstruction_sensitivity
+            in core.DEPTH_SENSITIVITY else "normal")
         # Steadying is applied to the recorded corners here rather than left to
         # the preview, or the file would be written from the raw path the
         # preview had already stopped showing.
@@ -4890,7 +4927,9 @@ class RenderWorker(QObject):
             depth_segmenter = None
             if settings.obstructions:
                 try:
-                    depth_segmenter = core.DepthOcclusionSegmenter()
+                    depth_segmenter = core.DepthOcclusionSegmenter(
+                        floor_rel=core.DEPTH_SENSITIVITY[
+                            settings.obstruction_sensitivity])
                 except (FileNotFoundError, IOError) as exc:
                     logging.warning("Rendering without obstruction occlusion: %s",
                                     exc)
@@ -5561,6 +5600,7 @@ class MainWindow(QMainWindow):
             colourise=overlay.colourise_enabled,
             occlusion=panel.occlusion_enabled,
             obstructions=panel.obstruction_enabled,
+            obstruction_sensitivity=panel.obstruction_sensitivity,
             steady_tracking=panel.steady_tracking,
             steady_window=panel.steady_window,
             blend_settings=blend.BlendSettings.from_dict(overlay.blend.to_dict()),
@@ -5977,6 +6017,34 @@ class MainWindow(QMainWindow):
         if not enabled:
             panel.segmenter = None
         panel.refresh_display()
+
+    def set_obstruction_sensitivity(self, level: str):
+        """How readily something counts as standing in front of the surface.
+
+        The segmenter is dropped rather than adjusted: it holds the setting it
+        was built with, and rebuilding it on the next masked frame is what puts
+        the new one into both the preview and the render.
+        """
+        panel = self.central_panel
+        if level not in core.DEPTH_SENSITIVITY:
+            # Not reachable from the menu, but a caller that gets it wrong must
+            # not leave the tick sitting against a setting nothing is using.
+            self.refresh_sensitivity_action()
+            return
+        panel.obstruction_sensitivity = level
+        self.refresh_sensitivity_action()
+        panel.depth_segmenter = None
+        panel._occlusion_cache = None
+        panel.refresh_display()
+
+    def refresh_sensitivity_action(self):
+        """Tick the sensitivity actually in use, whatever asked for it."""
+        actions = getattr(self.title_bar, "sensitivity_actions", None)
+        if not actions:
+            return
+        current = self.central_panel.obstruction_sensitivity
+        for level, action in actions.items():
+            action.setChecked(level == current)
 
     def toggle_steady_tracking(self, enabled: bool):
         """Fit a smooth path through the recorded corners, for preview and file.

@@ -77,6 +77,7 @@ macOS, `~/.local/share/Galileo` on Linux). Set the environment variable
 | Options → Steady the tracked path | Take the wobble out of the tracked shape |
 | Options → Draw behind people | Let passers-by cross in front of the creative |
 | Options → Draw behind obstructions | Let railings, posts and signs stay in front of it |
+| Options → Obstruction sensitivity | How readily something counts as being in front |
 
 Brightness, contrast and colourise adjustments for the inserted creative are
 available from the left toolbar, and all three apply to the render as well as
@@ -186,6 +187,45 @@ The model is MiDaS v2.1 small (MIT licensed, about 64 MB), fetched by
 `fetch_model.py` alongside the person model and run through the same OpenCV DNN
 module, so it adds no dependency either.
 
+### Sensitivity
+
+A hoarding is rarely blank, and a depth network reads the photograph on it as
+the scene it depicts rather than as ink on a flat panel. Where that reading
+crosses the threshold, the creative is held back and the artwork already on the
+billboard shows through. Because the reading shifts frame to frame, it does not
+look like a steady error: holes flash open and shut for a frame at a time.
+
+The threshold that separates the two is expressed as a fraction of the scene's
+own depth range, since the model's output has no units and its scale changes
+every frame. Measured on a hoarding showing a road running away, under a pan:
+
+| | how far it stands off the surface |
+| --- | --- |
+| the picture on the billboard, at its worst | 0.13 |
+| a lamppost across it | 0.41 |
+| railings across it | 0.86 |
+
+The default sits at **0.15** — clear of the artwork by half as much again, and
+far below either real obstruction. At the 0.10 it started out at, the advert
+crossed the line on 7 frames in 24; at 0.15, on none. It costs a little of the
+softest depth edges (railings went from 90% covered to 88%), which is the right
+way round: a hole in the creative is far more obvious than a slightly thin edge
+on the thing in front of it.
+
+How much depth a given piece of artwork depicts is not something the tool can
+know, so **Options → Obstruction sensitivity** offers the trade rather than
+deciding it:
+
+- **Low** — for artwork with strong depth in it, or anamorphic "3D" content
+  designed to defeat exactly this cue. Fewest false holes; the faintest
+  obstructions are missed.
+- **Normal** — the measured balance above.
+- **High** — the old behaviour. Finds the faintest obstructions, and is
+  likeliest to mistake the billboard's own picture for one.
+
+If you see the original creative flashing through, turn it down; if something
+genuinely in front is being painted over, turn it up.
+
 ### Where it stops
 
 Worth knowing before pointing it at footage, since all of these are quiet
@@ -199,10 +239,8 @@ failures rather than errors:
   obstruction is the majority of what was marked and is taken for the surface.
   The mask then empties out and the creative is painted over — the same result
   as leaving the option off, rather than something worse.
-- **Anamorphic "3D" screen content**, the kind designed to look like it is
-  leaning out of the screen, can raise a blob inside the panel. It defeats
-  exactly the cue being measured. The option is per-project, so switch it off
-  for those shots.
+- **Artwork with strong depth in it.** See *Sensitivity* below: this is the
+  one that shows up as a fault rather than a miss, and it has a control.
 - **An obstruction close to a very distant surface.** Depth separation shrinks
   with distance; something a metre in front of a billboard forty metres away is
   below any honest threshold. A limit of monocular depth, not a setting.
