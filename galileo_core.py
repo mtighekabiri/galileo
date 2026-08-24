@@ -2262,8 +2262,31 @@ def _fit_plane_robust(depth: np.ndarray, interior: np.ndarray,
             float(coefficients[2])), float(scale)
 
 
+#: How far off the surface a pixel must stand, as a fraction of the scene's own
+#: depth range, before it counts as being in front of it. What this number has
+#: to separate is a real obstruction from the *picture already on the
+#: billboard*, because a depth network reads a photograph of a road receding or
+#: a face leaning out as the geometry it depicts rather than as ink on a flat
+#: panel. Measured on a hoarding showing a perspective scene, under a pan:
+#: content on the surface reached 0.13 at its worst, a lamppost across it 0.41,
+#: railings 0.86. At 0.10 the advert crossed the line on 3 frames in 12 -- not
+#: as a steady error but as a flash, there and gone as the network's reading
+#: shifted, which is exactly how it shows up: holes opening in the creative for
+#: a frame at a time with the old artwork behind them. 0.15 clears the worst of
+#: that content by half as much again and still sits far below either real
+#: obstruction; it costs a little of the softest depth edges (railings 90% to
+#: 88% covered), which is the right way round, since a hole in the creative is
+#: far more obvious than a slightly thin edge on the thing in front of it.
+DEPTH_FLOOR = 0.15
+
+#: What *Obstruction sensitivity* offers, since how far a network is fooled
+#: depends on what the billboard happens to be showing. Higher finds more and
+#: invents more; lower is for artwork with strong depth in it.
+DEPTH_SENSITIVITY = {"low": 0.28, "normal": DEPTH_FLOOR, "high": 0.10}
+
+
 def plane_deviation_mask(depth: np.ndarray, quad, k: float = 5.0,
-                         floor_rel: float = 0.10,
+                         floor_rel: float = DEPTH_FLOOR,
                          iterations: int = 3) -> np.ndarray:
     """255 where ``depth`` reads as meaningfully nearer than the marked surface.
 
@@ -2355,7 +2378,7 @@ class DepthOcclusionSegmenter:
     INPUT_SIZE = (256, 256)
 
     def __init__(self, model_path: str = None, k: float = 5.0,
-                 floor_rel: float = 0.10, dilate: int = 4,
+                 floor_rel: float = DEPTH_FLOOR, dilate: int = 4,
                  feather: float = 2.5, pad: float = 0.5):
         """
         Args:

@@ -322,3 +322,59 @@ class TestModelDiscovery:
         bogus.write_bytes(b"not an onnx file")
         with pytest.raises(IOError):
             core.DepthOcclusionSegmenter(model_path=str(bogus))
+
+
+class TestThePictureAlreadyOnTheBillboard:
+    """The hard case, and the one that shows up as a fault rather than a
+    missed obstruction: a hoarding is rarely blank, and a depth network reads
+    the photograph on it as the scene it depicts. Where that reading crosses
+    the threshold the creative is held back and the old artwork shows through
+    -- and because the reading shifts frame to frame it does not show up as a
+    steady error but as holes flashing open and shut."""
+
+    def depicted(self, strength):
+        """Artwork with depth in it: a shape the network reads as leaning out.
+
+        Expressed as a fraction of the scene's depth range, which is what the
+        floor is measured in, so the numbers here mean the same thing as the
+        ones measured off real footage.
+        """
+        depth = surface()
+        spread = float(np.percentile(depth, 95) - np.percentile(depth, 5))
+        depth[region(slice(70, 140), slice(90, 200))] += strength * spread
+        return depth
+
+    def test_artwork_with_depth_in_it_does_not_open_holes(self, interior):
+        """Measured off a hoarding showing a road running away under a pan,
+        content on the surface reached 0.13 of the scene's depth range at its
+        worst. The default floor has to sit clear of that."""
+        mask = core.plane_deviation_mask(self.depicted(0.13), QUAD)
+        assert marked(mask, np.ones((HEIGHT, WIDTH), bool), interior) < 0.01
+
+    def test_a_real_obstruction_is_still_found(self, interior):
+        """The other side of it: a lamppost across the same shot measured
+        0.41, railings 0.86. Both have to stay well inside the net."""
+        for strength in (0.41, 0.86):
+            mask = core.plane_deviation_mask(self.depicted(strength), QUAD)
+            found = marked(mask, region(slice(70, 140), slice(90, 200)), interior)
+            assert found > 0.9, f"only {found:.0%} of a {strength} obstruction"
+
+    def test_the_default_sits_between_the_two(self):
+        assert 0.13 < core.DEPTH_FLOOR < 0.41
+
+    def test_sensitivity_trades_one_against_the_other(self, interior):
+        """Which way to lean is not something the tool can know -- it depends
+        on artwork it has never seen -- so it is offered rather than decided."""
+        borderline = self.depicted(0.20)
+        held = {level: marked(core.plane_deviation_mask(
+                    borderline, QUAD, floor_rel=floor),
+                    np.ones((HEIGHT, WIDTH), bool), interior)
+                for level, floor in core.DEPTH_SENSITIVITY.items()}
+        assert held["low"] < held["normal"] <= held["high"]
+
+    def test_every_level_names_a_real_threshold(self):
+        assert set(core.DEPTH_SENSITIVITY) == {"low", "normal", "high"}
+        assert core.DEPTH_SENSITIVITY["normal"] == core.DEPTH_FLOOR
+        assert (core.DEPTH_SENSITIVITY["high"]
+                < core.DEPTH_SENSITIVITY["normal"]
+                < core.DEPTH_SENSITIVITY["low"])
