@@ -28,6 +28,7 @@ Models:
 
 import hashlib
 import os
+import ssl
 import sys
 import urllib.error
 import urllib.request
@@ -64,6 +65,31 @@ MODELS = [
 MODELS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
 
 
+def _certificate_problem(exc: Exception) -> bool:
+    """Whether this failure was the server's certificate, not the connection."""
+    reason = getattr(exc, "reason", None)
+    return isinstance(exc, ssl.SSLCertVerificationError) or \
+        isinstance(reason, ssl.SSLCertVerificationError)
+
+
+def _certifi_context():
+    """A context trusting certifi's roots, or None if it is not installed.
+
+    Not a way around checking the certificate -- it is the same check against a
+    different, and considerably more complete, list of who may vouch for one.
+    Windows is where this comes up: it ships a small set of roots and fetches
+    the rest on demand, but only for programs that go through its own crypto
+    library. Python reads what has been cached and cannot trigger that fetch,
+    so a server whose root nobody on this machine has needed yet is rejected
+    here while a browser downloads it without complaint.
+    """
+    try:
+        import certifi
+    except ImportError:
+        return None
+    return ssl.create_default_context(cafile=certifi.where())
+
+
 def download(url: str, destination: str, filename: str) -> None:
     print(f"Downloading {filename} ...")
 
@@ -72,7 +98,21 @@ def download(url: str, destination: str, filename: str) -> None:
             done = min(100, count * block_size * 100 // total)
             print(f"\r  {done:3d}%", end="", flush=True)
 
-    urllib.request.urlretrieve(url, destination, reporthook=report)
+    try:
+        urllib.request.urlretrieve(url, destination, reporthook=report)
+    except (urllib.error.URLError, ssl.SSLError) as exc:
+        context = _certifi_context() if _certificate_problem(exc) else None
+        if context is None:
+            raise
+        print("\n  this machine's certificate store could not vouch for that "
+              "server; trying again with certifi's roots")
+        opener = urllib.request.build_opener(
+            urllib.request.HTTPSHandler(context=context))
+        urllib.request.install_opener(opener)
+        try:
+            urllib.request.urlretrieve(url, destination, reporthook=report)
+        finally:
+            urllib.request.install_opener(urllib.request.build_opener())
     print()
 
 
@@ -89,9 +129,26 @@ def fetch(model: dict) -> bool:
             download(model["url"], destination, filename)
         except (urllib.error.URLError, OSError) as exc:
             print(f"\nDownload failed: {exc}", file=sys.stderr)
-            print("\nIf this machine is behind a proxy or offline, fetch the "
-                  "file manually from:\n  " + model["url"]
+            if _certificate_problem(exc):
+                if _certifi_context() is None:
+                    print("\nThat is this machine not recognising who signed "
+                          "the server's certificate, which certifi fixes:\n"
+                          "  pip install certifi\n"
+                          "then run this again.", file=sys.stderr)
+                else:
+                    print("\nThat is a certificate this machine will not "
+                          "accept even against certifi's roots, which usually "
+                          "means something on the network is inspecting "
+                          "traffic and re-signing it. Downloading in a browser "
+                          "goes through the same trust your other software "
+                          "uses, so fetch it by hand as below.", file=sys.stderr)
+            served_as = model["url"].rsplit("/", 1)[-1]
+            print("\nFetch the file manually from:\n  " + model["url"]
                   + f"\nand save it as:\n  {destination}", file=sys.stderr)
+            if served_as != filename:
+                print(f"\nNote the rename: it downloads as {served_as} and "
+                      f"must be saved as {filename}.", file=sys.stderr)
+            print("Then run this again to check it over.", file=sys.stderr)
             return False
 
     size = os.path.getsize(destination)
