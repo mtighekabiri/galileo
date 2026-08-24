@@ -2279,6 +2279,23 @@ def _fit_plane_robust(depth: np.ndarray, interior: np.ndarray,
 #: far more obvious than a slightly thin edge on the thing in front of it.
 DEPTH_FLOOR = 0.15
 
+#: Below this share of the crop being something other than the panel, the
+#: threshold's scene-depth term is measuring the panel against itself and
+#: cannot be taken at face value.
+DEPTH_MIN_CONTEXT = 0.25
+
+#: How much stricter to be when there is no context at all: 1 + this, so 3x.
+#: Driving up to a hoarding, the padded crop is 75% other things while the
+#: panel is small and 2% by the time it fills the frame -- at which point the
+#: yardstick has quietly become the artwork's own depicted depth. Measured on
+#: that approach, at the widest: 46% of the creative was masked without this
+#: and 26% with it, for 73% of a post across the panel still found rather than
+#: 100%. Firmer settings keep cutting the false masking and cost more of the
+#: real obstruction than they are worth: at 4x, 16% masked but only 61% of the
+#: post found.
+DEPTH_CONTEXT_FIRMNESS = 2.0
+
+
 class DepthSettings:
     """The dials behind *Draw behind obstructions*.
 
@@ -2350,7 +2367,9 @@ class DepthSettings:
 
 def plane_deviation_mask(depth: np.ndarray, quad, k: float = 5.0,
                          floor_rel: float = DEPTH_FLOOR,
-                         iterations: int = 3) -> np.ndarray:
+                         iterations: int = 3,
+                         min_context: float = DEPTH_MIN_CONTEXT,
+                         firmness: float = DEPTH_CONTEXT_FIRMNESS) -> np.ndarray:
     """255 where ``depth`` reads as meaningfully nearer than the marked surface.
 
     ``depth`` is relative inverse depth -- larger means nearer -- and ``quad``
@@ -2402,6 +2421,16 @@ def plane_deviation_mask(depth: np.ndarray, quad, k: float = 5.0,
     # The epsilon is what keeps a mathematically perfect plane -- zero noise,
     # zero spread -- from having every pixel clear a threshold of zero.
     threshold = max(k * scale, floor_rel * spread, 1e-6)
+
+    # That spread is supposed to describe the scene the panel stands in. Walk
+    # or drive towards a hoarding and it stops doing so: the crop fills with
+    # panel, and what is being measured is the depth the artwork depicts
+    # rather than the depth of anything real. Ask for a clearer step in
+    # proportion to how little of the crop is anything else -- distrusting the
+    # measurement exactly as far as it has stopped being one.
+    context = float(np.count_nonzero(~interior)) / interior.size
+    if min_context > 0 and context < min_context:
+        threshold *= 1.0 + firmness * (1.0 - context / min_context)
 
     mask[residual > threshold] = 255
     # Open at the map's own resolution, before anything is scaled up: a railing

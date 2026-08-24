@@ -49,10 +49,21 @@ Two mechanisms, both structural rather than artefacts of the synthetic scene:
    almost all panel -- 2% of it is anything else at 105% -- so the yardstick
    becomes the artwork's own depicted depth, and 46% of the creative is masked.
 
-Neither is fixed. If this is picked up: the honest options are a threshold
-derived per frame from the panel's apparent size, a crop that keeps a minimum
-of real context, or an admission in the docs that a drive-up needs the dials
-moved partway through.
+**(2) is now compensated** -- the threshold is stiffened in proportion to how
+little of the crop is anything but panel, taking the worst false masking from
+46% to 26%. See `DEPTH_MIN_CONTEXT` and `DEPTH_CONTEXT_FIRMNESS`.
+
+**(1) is not, and looks unfixable by tuning.** Scaling the threshold by the
+panel's apparent size was tried and does not work: the depth step a real post
+produces is erratic rather than a smooth function of distance (15, 31, 400, 95,
+332 across the approach), and measured against four candidate yardsticks --
+whole crop, context only, the panel's own tilt, the fit residual -- the
+steadiest ratio still swung 18-fold. An Otsu-style split of the residuals was
+tried too: better in places, worse in others, and it does not recover the
+mid-distance stretch either. That stretch is the depth model not seeing the
+obstruction at all, so it is a model limit rather than a threshold one. Do not
+re-derive this; if it is revisited, the lever is a better depth model or a
+second cue, not arithmetic on this one.
 
 `STEADY_WINDOW` (11 frames) has the same smell and has *not* been measured
 across an approach: a fixed window in frames, smoothing a path in pixels,

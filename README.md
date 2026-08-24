@@ -232,6 +232,37 @@ obstructions on plain artwork. *Restore Defaults* puts every dial back to the
 measured setting, and *Cancel* puts back whatever you started the session with
 — the dials change the preview as they move, so cancel has real work to do.
 
+### Driving or walking past
+
+The footage this is pointed at is shot from a moving viewpoint, so a panel can
+go from a small distant rectangle to filling the frame inside one shot. That
+moves the ground under the threshold, because its scene-depth term is a
+fraction of the depth range of a padded crop around the panel — and on the way
+in, that crop stops being a scene. Measured on an approach with a post crossing
+the hoarding, the crop is **75% other things** while the panel is small and
+**2%** by the time it fills the frame. At that point the yardstick has quietly
+become the depth the *artwork* depicts, and **46%** of the creative was being
+masked.
+
+So the demand is stiffened in proportion to how little of the crop is anything
+else: below a quarter, up to three times stricter when there is nothing else at
+all. On the same approach that takes the worst false masking to **26%**, for
+73% of the post still found rather than 100%. Firmer settings keep cutting the
+false masking and cost more than they are worth — at four times, 16% masked but
+only 61% of the post found. It is gradual rather than a cliff, so a shot walks
+through it without the mask lurching on one frame, and a panel with room around
+it is judged exactly as before.
+
+**What this does not fix.** Behaviour still varies with distance more than one
+setting can absorb. On that same approach the post was found on 53% of its
+pixels at 10% of frame width, essentially missed between 18% and 45%, and found
+in full at 65%. That middle stretch is the depth model failing to see the post
+as meaningfully nearer at all, not a threshold being wrong, and no amount of
+tuning recovers it — measured against four different ways of normalising the
+step, the steadiest still swung 18-fold across the approach. For a long
+drive-up, expect to use the dials on the stretch you care about, or to insert
+across a shorter range.
+
 ### Where it stops
 
 Worth knowing before pointing it at footage, since all of these are quiet
@@ -249,7 +280,8 @@ failures rather than errors:
   one that shows up as a fault rather than a miss, and it has a control.
 - **An obstruction close to a very distant surface.** Depth separation shrinks
   with distance; something a metre in front of a billboard forty metres away is
-  below any honest threshold. A limit of monocular depth, not a setting.
+  below any honest threshold. A limit of monocular depth, not a setting — and
+  see *Driving or walking past* above for what that costs across an approach.
 - **Ground and objects just outside the marked area** that genuinely are nearer
   bleed a few pixels into the creative's edge, the same way the person mask
   does.

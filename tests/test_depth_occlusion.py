@@ -411,3 +411,83 @@ class TestTheDials:
         for name, value in settings.to_dict().items():
             setattr(monkey, name, value)
         assert monkey.floor_rel == 0.4 and monkey.k == 9
+
+
+class TestApproachingTheSurface:
+    """The footage this is pointed at is shot walking or driving past, so a
+    panel goes from a small distant rectangle to filling the frame inside one
+    shot. The threshold's scene-depth term is a fraction of the depth range of
+    a padded crop, and that crop's composition changes completely on the way
+    in: mostly street at the far end, almost entirely panel at the near one.
+
+    Past that point the term is measuring the panel against itself -- against
+    the depth its *artwork* depicts -- and holes open in the creative. So the
+    demand is stiffened in proportion to how little of the crop is anything
+    else, which is to say the measurement is distrusted exactly as far as it
+    has stopped being one.
+    """
+
+    def surface_with_depicted_depth(self, strength=0.30):
+        """A panel whose own artwork reads as standing off it."""
+        depth = surface()
+        spread = float(np.percentile(depth, 95) - np.percentile(depth, 5))
+        depth[region(slice(70, 140), slice(90, 200))] += strength * spread
+        return depth
+
+    def test_a_panel_with_room_around_it_is_judged_as_before(self, interior):
+        """Nothing changes while the crop still holds a scene: the quad here
+        covers about a fifth of the map."""
+        small = np.float32([[120, 90], [200, 92], [198, 150], [118, 148]])
+        depth = surface()
+        depth[region(slice(100, 130), slice(140, 175))] += 4.0
+
+        loose = core.plane_deviation_mask(depth, small, min_context=0.0)
+        stiffened = core.plane_deviation_mask(depth, small)
+        assert np.array_equal(loose, stiffened)
+
+    def test_a_panel_filling_the_crop_is_judged_harder(self):
+        """The quad covers nearly everything, so there is no scene left to
+        measure against and the artwork's own depth is all that is left."""
+        filling = np.float32([[1, 1], [WIDTH - 2, 1],
+                              [WIDTH - 2, HEIGHT - 2], [1, HEIGHT - 2]])
+        depth = self.surface_with_depicted_depth()
+
+        loose = core.plane_deviation_mask(depth, filling, min_context=0.0)
+        stiffened = core.plane_deviation_mask(depth, filling)
+        assert stiffened.sum() < loose.sum(), \
+            "a panel with no context around it was taken at face value"
+
+    def test_something_really_in_front_still_survives_it(self):
+        """Stiffening must not amount to switching the feature off up close:
+        a real obstruction stands off the panel far further than its artwork
+        does, and has to keep clearing the raised bar."""
+        filling = np.float32([[1, 1], [WIDTH - 2, 1],
+                              [WIDTH - 2, HEIGHT - 2], [1, HEIGHT - 2]])
+        depth = self.surface_with_depicted_depth()
+        obstruction = region(slice(30, 60), slice(30, 220))
+        spread = float(np.percentile(depth, 95) - np.percentile(depth, 5))
+        depth[obstruction] += 3.0 * spread
+
+        mask = core.plane_deviation_mask(depth, filling)
+        found = float((mask[obstruction] > 127).mean())
+        assert found > 0.9, f"only {found:.0%} of a real obstruction survived"
+
+    def test_the_stiffening_grows_as_the_context_goes(self):
+        """Not a cliff edge: a shot walks through these as the panel grows, so
+        a step would show as the mask lurching on one frame."""
+        depth = self.surface_with_depicted_depth()
+        removed = []
+        for inset in (60, 40, 20, 1):          # ever bigger quad, ever less room
+            quad = np.float32([[inset, inset], [WIDTH - inset, inset],
+                               [WIDTH - inset, HEIGHT - inset],
+                               [inset, HEIGHT - inset]])
+            inside = core.quad_to_mask(quad, WIDTH, HEIGHT) > 127
+            loose = core.plane_deviation_mask(depth, quad, min_context=0.0)
+            stiffened = core.plane_deviation_mask(depth, quad)
+            # How much of the false masking the stiffening took away.
+            removed.append(float((loose[inside] > 127).mean())
+                           - float((stiffened[inside] > 127).mean()))
+
+        assert removed == sorted(removed), f"not gradual: {removed}"
+        assert removed[0] == 0.0, "stiffened a panel that still had room around it"
+        assert removed[-1] > 0.0, "did nothing to a panel filling the crop"
