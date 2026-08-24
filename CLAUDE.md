@@ -76,6 +76,18 @@ mutual: each model misreads a different class of depicted artwork as popped
 46%; photographic content 2-3% for both). Choose test artwork for depth tests
 by measurement, not intuition.
 
+The combined system (Depth Anything + artwork plate, unioned), measured across
+the drive-up through written video: the post found 100% at every fill with
+false masking 0-25%; 2-14 px bars found 94-100% everywhere with false masking
+under 2% at three fills but 18-51% at 10/47/65% -- and that residue is not
+edge fattening (it survives a 15 px margin). It is the depth cue marking broad
+bands around DENSE bars, covering the gaps between them, so old artwork shows
+in the gaps. If that shows on real footage the lever is per-source
+post-processing (the depth mask's dilate/feather are shared by both models and
+tuned for MiDaS's soft edges; Depth Anything's are sharp), not the thresholds.
+Tune it on real clips -- synthetic mp4v footage has been flattering or damning
+in ways real camera H.264 was not, twice.
+
 `STEADY_WINDOW` (11 frames) has the same smell and has *not* been measured
 across an approach: a fixed window in frames, smoothing a path in pixels,
 while the on-screen motion accelerates.
