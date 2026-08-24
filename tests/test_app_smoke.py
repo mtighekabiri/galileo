@@ -336,12 +336,94 @@ class TestScreenAndOcclusionToggles:
         overlay.overlay_bgra = logo_bgra
         overlay.tracking_history = {0: [tuple(map(float, p)) for p in truth[0]]}
         window.central_panel.occlusion_enabled = True
+        window.central_panel.obstruction_enabled = True
 
         settings = window.build_render_settings(0, 2, 1.0, str(tmp_path / "o.mp4"))
         assert settings.occlusion is True
+        assert settings.obstructions is True
         assert not hasattr(settings, "segmenter")
         for value in vars(settings).values():
             assert not isinstance(value, cv2.dnn.Net)
+
+    def test_obstructions_off_produces_no_mask(self, loaded):
+        window, path, truth = loaded
+        panel = window.central_panel
+        assert panel.obstruction_enabled is False
+        assert panel.obstruction_mask(panel.prev_frame, truth[0]) is None
+
+    def test_obstructions_without_the_model_warn_and_stay_off(self, loaded,
+                                                              monkeypatch):
+        window, path, truth = loaded
+        monkeypatch.setattr(core.DepthOcclusionSegmenter, "is_available",
+                            classmethod(lambda cls: False))
+        warned = []
+        monkeypatch.setattr(galileo_app.QMessageBox, "warning",
+                            staticmethod(lambda *a, **k: warned.append(a)))
+
+        window.toggle_obstructions(True)
+        assert warned, "no warning shown for the missing model"
+        assert window.central_panel.obstruction_enabled is False
+
+    def test_the_two_sources_are_combined(self, loaded, monkeypatch):
+        """Both kinds of occlusion have to reach the compositor, and a
+        pedestrian behind a railing is found by both at once."""
+        window, path, truth = loaded
+        panel = window.central_panel
+        height, width = panel.prev_frame.shape[:2]
+
+        person = np.zeros((height, width), np.uint8)
+        person[10:40, 10:40] = 255
+        depth = np.zeros((height, width), np.uint8)
+        depth[30:60, 30:60] = 255
+        monkeypatch.setattr(panel, "occlusion_mask", lambda f, q: person)
+        monkeypatch.setattr(panel, "obstruction_mask", lambda f, q: depth)
+
+        combined = panel.combined_occlusion(panel.prev_frame, truth[0])
+        assert np.array_equal(combined, cv2.max(person, depth))
+        assert combined[20, 20] == 255 and combined[50, 50] == 255
+
+    def test_either_source_alone_still_reaches_the_compositor(self, loaded,
+                                                             monkeypatch):
+        window, path, truth = loaded
+        panel = window.central_panel
+        only = np.zeros(panel.prev_frame.shape[:2], np.uint8)
+        only[5:15, 5:15] = 255
+
+        monkeypatch.setattr(panel, "occlusion_mask", lambda f, q: None)
+        monkeypatch.setattr(panel, "obstruction_mask", lambda f, q: only)
+        assert panel.combined_occlusion(panel.prev_frame, truth[0]) is only
+
+        monkeypatch.setattr(panel, "occlusion_mask", lambda f, q: only)
+        monkeypatch.setattr(panel, "obstruction_mask", lambda f, q: None)
+        assert panel.combined_occlusion(panel.prev_frame, truth[0]) is only
+
+        monkeypatch.setattr(panel, "occlusion_mask", lambda f, q: None)
+        monkeypatch.setattr(panel, "obstruction_mask", lambda f, q: None)
+        assert panel.combined_occlusion(panel.prev_frame, truth[0]) is None
+
+    def test_the_cache_notices_a_toggle_on_the_same_frame(self, loaded,
+                                                          monkeypatch):
+        """Switching a source on while paused has to redraw the frame with it.
+        The frame has not changed, so the toggles are part of the cache key."""
+        window, path, truth = loaded
+        panel = window.central_panel
+        placement = panel.tracking_overlay.placements[0]
+        placement.points = [tuple(map(float, p)) for p in truth[0]]
+
+        calls = []
+        monkeypatch.setattr(panel, "occlusion_mask",
+                            lambda f, q: calls.append("person"))
+        monkeypatch.setattr(panel, "obstruction_mask",
+                            lambda f, q: calls.append("depth"))
+
+        panel.occlusion_enabled = True
+        panel.occlusion_for_frame(panel.prev_frame, [placement])
+        panel.occlusion_for_frame(panel.prev_frame, [placement])
+        assert len(calls) == 2, "the same frame was segmented twice"
+
+        panel.obstruction_enabled = True
+        panel.occlusion_for_frame(panel.prev_frame, [placement])
+        assert "depth" in calls, "turning a source on did not recompute"
 
 
 class TestThePreviousFrameToggle:

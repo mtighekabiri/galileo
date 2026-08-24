@@ -2599,6 +2599,14 @@ class TitleBar(QWidget):
         self.occlusion_action.toggled.connect(self.parent.toggle_occlusion)
         options_menu.addAction(self.occlusion_action)
 
+        self.obstruction_action = QAction(
+            "Draw behind obstructions", self, checkable=True)
+        self.obstruction_action.setToolTip(
+            "Let railings, lampposts, signs and anything else in front of the "
+            "surface pass in front of the inserted creative")
+        self.obstruction_action.toggled.connect(self.parent.toggle_obstructions)
+        options_menu.addAction(self.obstruction_action)
+
         self.deflicker_action = QAction(
             "Steady the lighting", self, checkable=True)
         self.deflicker_action.setToolTip(
@@ -2891,10 +2899,14 @@ class CentralPanel(QWidget):
         self.current_frame_index = 0
         self.total_frames = 0
 
-        # Person segmentation for occlusion, built on first use. The cache
-        # holds (frame, quantised-quad cell, mask) for the frame on screen.
+        # Segmentation for occlusion, each built on first use: people by the
+        # person model, everything else by depth. The cache holds (frame,
+        # quantised-quad cell and which sources are on, mask) for the frame on
+        # screen, and the two masks are combined before it is stored.
         self.segmenter = None
         self.occlusion_enabled = False
+        self.depth_segmenter = None
+        self.obstruction_enabled = False
         self._occlusion_cache = None
 
         # 1) The container for video + overlay.
@@ -3652,7 +3664,7 @@ class CentralPanel(QWidget):
             return frame
 
         occlusion = None
-        if self.occlusion_enabled:
+        if self.occlusion_enabled or self.obstruction_enabled:
             occlusion = self.occlusion_for_frame(frame, ready)
 
         out = frame
@@ -3749,27 +3761,48 @@ class CentralPanel(QWidget):
                 placement.points = recorded[:]
 
     def occlusion_for_frame(self, frame, placements):
-        """The person mask for this frame, cropped near the inserts.
+        """Everything in front of the inserts on this frame, cropped near them.
 
         Two savings over segmenting the naked frame every composite. The
-        crop: the segmenter's own docstring says a padded crop around the
-        quad is both cheaper and better, because the fixed 192x192 network
-        input keeps a distant pedestrian visible at all -- and every
-        full-frame resize/dilate/blur it does afterwards shrinks with it.
+        crop: the segmenters' own docstrings say a padded crop around the
+        quad is both cheaper and better, because the fixed network input
+        keeps a distant pedestrian visible at all -- and every full-frame
+        resize/dilate/blur they do afterwards shrinks with it.
         The cache: a corner drag recomposites the same paused frame many
-        times, and the people in it have not moved between mouse events.
+        times, and nothing in it has moved between mouse events.
+
+        Which sources are switched on is part of the cache key rather than
+        something the toggles have to remember to clear: turning one on while
+        paused has to redraw the frame with it, and the frame itself has not
+        changed.
         """
         union = core.union_quad([p.points for p in placements
                                  if len(p.points) == 4])
         if union is None:
-            return self.occlusion_mask(frame, None)
-        cell = tuple(int(v) // 32 for v in union.reshape(-1))
+            return self.combined_occlusion(frame, None)
+        cell = (tuple(int(v) // 32 for v in union.reshape(-1)),
+                self.occlusion_enabled, self.obstruction_enabled)
         cached = self._occlusion_cache
         if (cached is not None and cached[0] is frame and cached[1] == cell):
             return cached[2]
-        mask = self.occlusion_mask(frame, union)
+        mask = self.combined_occlusion(frame, union)
         self._occlusion_cache = (frame, cell, mask)
         return mask
+
+    def combined_occlusion(self, frame, quad):
+        """Both kinds of occlusion in one mask, or None when neither applies.
+
+        They overlap happily -- a pedestrian behind a railing is found twice --
+        so the two are merged by taking whichever holds the creative back more
+        at each pixel, and a placement is drawn behind the union of them.
+        """
+        person = self.occlusion_mask(frame, quad)
+        depth = self.obstruction_mask(frame, quad)
+        if person is None:
+            return depth
+        if depth is None:
+            return person
+        return cv2.max(person, depth)
 
     def occlusion_mask(self, frame, quad):
         """A mask of people in front of the surface, or None if switched off."""
@@ -3786,6 +3819,23 @@ class CentralPanel(QWidget):
             return self.segmenter.mask(frame, quad)
         except cv2.error as exc:
             logging.warning("Segmentation failed on this frame: %s", exc)
+            return None
+
+    def obstruction_mask(self, frame, quad):
+        """A mask of whatever else is in front, or None if switched off."""
+        if not self.obstruction_enabled or frame is None:
+            return None
+        if self.depth_segmenter is None:
+            try:
+                self.depth_segmenter = core.DepthOcclusionSegmenter()
+            except (FileNotFoundError, IOError) as exc:
+                logging.warning("Obstruction occlusion unavailable: %s", exc)
+                self.obstruction_enabled = False
+                return None
+        try:
+            return self.depth_segmenter.mask(frame, quad)
+        except cv2.error as exc:
+            logging.warning("Depth estimation failed on this frame: %s", exc)
             return None
 
     def reset_tracker(self):
@@ -4531,7 +4581,7 @@ class RenderSettings:
                  overlay_start_frame=0, brightness=0, contrast=1.0,
                  colourise=False, include_audio=True, occlusion=False,
                  blend_settings=None, placements=None, morph=None,
-                 deflicker_gains=None):
+                 deflicker_gains=None, obstructions=False):
         self.base_video_path = base_video_path
         self.out_path = out_path
         self.start_frame = int(start_frame)
@@ -4548,9 +4598,10 @@ class RenderSettings:
         self.contrast = contrast
         self.colourise = colourise
         self.include_audio = include_audio
-        # A flag, not a segmenter: a cv2.dnn.Net cannot be shared across
-        # threads, so the worker builds its own.
+        # Flags, not segmenters: a cv2.dnn.Net cannot be shared across
+        # threads, so the worker builds its own of each.
         self.occlusion = occlusion
+        self.obstructions = bool(obstructions)
         self.blend = blend_settings or blend.BlendSettings.off()
         self.morph = morph or morphlib.Morph()
         # Every insertion to draw. The single-placement fields above are kept
@@ -4743,6 +4794,16 @@ class RenderWorker(QObject):
                     caveats.append("the person model is missing, so people "
                                    "walking in front were painted over")
 
+            depth_segmenter = None
+            if settings.obstructions:
+                try:
+                    depth_segmenter = core.DepthOcclusionSegmenter()
+                except (FileNotFoundError, IOError) as exc:
+                    logging.warning("Rendering without obstruction occlusion: %s",
+                                    exc)
+                    caveats.append("the depth model is missing, so obstructions "
+                                   "in front of the surface were painted over")
+
             frame_counter = 0
 
             for frame_idx in range(settings.start_frame, settings.end_frame + 1):
@@ -4761,21 +4822,32 @@ class RenderWorker(QObject):
                     base_frame = cv2.resize(base_frame, (width, height),
                                             interpolation=cv2.INTER_AREA)
 
-                # Segment once per frame and share the mask: the model is the
-                # slow part and it does not depend on which insert is drawn.
+                # Segment once per frame and share the mask: the models are the
+                # slow part and neither depends on which insert is drawn.
                 # Cropped to a quad around the frame's inserts, same as the
                 # preview -- better for distant people, cheaper everywhere.
                 occlusion = None
-                if segmenter is not None:
+                if segmenter is not None or depth_segmenter is not None:
                     union = core.union_quad(
                         [np.float32(p.dense[frame_idx]) * p.scale
                          for p in placements
                          if p.dense.get(frame_idx) is not None])
-                    try:
-                        occlusion = segmenter.mask(base_frame, union)
-                    except cv2.error as exc:
-                        logging.warning("Segmentation failed on frame %d: %s",
-                                        frame_idx, exc)
+                    if segmenter is not None:
+                        try:
+                            occlusion = segmenter.mask(base_frame, union)
+                        except cv2.error as exc:
+                            logging.warning("Segmentation failed on frame %d: %s",
+                                            frame_idx, exc)
+                    if depth_segmenter is not None:
+                        try:
+                            # Merged the same way the preview merges them, so a
+                            # person behind a railing is held back once.
+                            from_depth = depth_segmenter.mask(base_frame, union)
+                            occlusion = (from_depth if occlusion is None
+                                         else cv2.max(occlusion, from_depth))
+                        except cv2.error as exc:
+                            logging.warning("Depth estimation failed on frame "
+                                            "%d: %s", frame_idx, exc)
 
                 for placement in placements:
                     base_frame = self._draw_placement(
@@ -5395,6 +5467,7 @@ class MainWindow(QMainWindow):
             contrast=overlay.contrast,
             colourise=overlay.colourise_enabled,
             occlusion=panel.occlusion_enabled,
+            obstructions=panel.obstruction_enabled,
             blend_settings=blend.BlendSettings.from_dict(overlay.blend.to_dict()),
             placements=[PlacementSnapshot(p, scale_factor)
                         for p in overlay.placements
@@ -5808,6 +5881,25 @@ class MainWindow(QMainWindow):
         panel.occlusion_enabled = enabled
         if not enabled:
             panel.segmenter = None
+        panel.refresh_display()
+
+    def toggle_obstructions(self, enabled: bool):
+        """Let anything else in front of the surface stay in front of it."""
+        panel = self.central_panel
+
+        if enabled and not core.DepthOcclusionSegmenter.is_available():
+            QMessageBox.warning(
+                self, "Model Not Found",
+                "The depth model is missing.\n\n"
+                "Run fetch_model.py to download it (about 64 MB), or place "
+                f"{core.DepthOcclusionSegmenter.MODEL_FILENAME} in a 'models' "
+                "folder beside the application.")
+            self.title_bar.obstruction_action.setChecked(False)
+            return
+
+        panel.obstruction_enabled = enabled
+        if not enabled:
+            panel.depth_segmenter = None
         panel.refresh_display()
 
     def toggle_previous_positions(self, enabled: bool):

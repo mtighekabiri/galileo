@@ -12,10 +12,15 @@ inside the folder.
 python fetch_model.py
 ```
 
-Downloads the person-segmentation model (about 6 MB) into `models/`, which the
-spec then bundles so occlusion works for whoever receives the build. Skip it and
-everything else still works, but **Draw behind people** will be unavailable to
-them with no way to switch it on.
+Downloads the two occlusion models into `models/` — person segmentation (about
+6 MB) and depth (about 64 MB) — which the spec then bundles so occlusion works
+for whoever receives the build. Skip it and everything else still works, but
+**Draw behind people** and **Draw behind obstructions** will be unavailable to
+them with no way to switch them on. Fetching only one is fine: each menu item
+depends on its own model, and the build bundles whatever is there.
+
+The depth model is the bulk of it, so a build made with both is about 64 MB
+larger than one made with neither.
 
 ## Build it
 

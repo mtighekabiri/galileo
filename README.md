@@ -74,6 +74,8 @@ macOS, `~/.local/share/Galileo` on Linux). Set the environment variable
 | Scroll on the magnifier | Set its magnification by hand |
 | Panes button on the magnifier | One view of the whole area, or a tile per handle |
 | Options → Steady the lighting | Even out pulsing from flickering fittings |
+| Options → Draw behind people | Let passers-by cross in front of the creative |
+| Options → Draw behind obstructions | Let railings, posts and signs stay in front of it |
 
 Brightness, contrast and colourise adjustments for the inserted creative are
 available from the left toolbar, and all three apply to the render as well as
@@ -132,15 +134,84 @@ creative back where they are, so they pass in front of it.
 This needs a model file, which is not committed to the repository:
 
 ```bash
-python fetch_model.py      # about 6 MB, once
+python fetch_model.py      # both models, once
 ```
 
 It runs through OpenCV's own DNN module, so there is no extra dependency to
 install, and a packaged build bundles it automatically if it was fetched before
 building. Without it the menu item warns and stays off.
 
-Note that this segments *people*. Something else crossing the shot — a bus, a
-trolley, a pillar in the foreground — is not handled.
+Note that this segments *people* specifically. For everything else, see below.
+
+## Occlusion — anything else in front
+
+A street is full of things that are not people: railings along a walkway, a
+lamppost, a sign, a passing bus. **Options → Draw behind obstructions** handles
+all of them, and it does so without being told what any of them are.
+
+There is no list of objects to recognise, because there could not be one. What
+every obstruction has in common is not what it looks like but where it is: in
+front of the surface. So that is what gets measured. A depth model estimates
+how far away everything in the frame is, a plane is fitted to the area you
+marked — the inverse depth of a flat surface is affine in image coordinates, so
+a billboard is a tilted plane in that map whatever angle it is seen from — and
+whatever stands off that plane *towards the camera* is held back from the
+creative.
+
+Two properties fall out of measuring geometry rather than appearance, and both
+matter:
+
+- **It works on a digital screen playing its own content.** The test is
+  one-sided: only things nearer than the surface are marked, and a picture of a
+  landscape on a screen reads as receding. The advert being replaced cannot eat
+  into the creative replacing it. This is the same trap the digital-screen
+  tracking mode exists for, avoided the same way — nothing here is keyed on
+  what moves.
+- **Nothing needs to hold still.** The mask is computed from each frame on its
+  own, so a moving camera and a moving obstruction are the ordinary case, not a
+  hard one. It also means the preview and the render agree by construction:
+  scrubbing to a frame gives the same mask as arriving at it in sequence.
+
+The two occlusion options are independent and combine — with both on, a
+pedestrian behind a railing is drawn in front of the creative once, from
+whichever source found more of them.
+
+Measured on an ordinary four-core desktop: **66 ms per frame at 1080p**, plus
+about 170 ms once when the model is first used. That is well below real-time
+playback, so the preview slows down noticeably while it is on; renders are
+unaffected beyond taking longer.
+
+The model is MiDaS v2.1 small (MIT licensed, about 64 MB), fetched by
+`fetch_model.py` alongside the person model and run through the same OpenCV DNN
+module, so it adds no dependency either.
+
+### Where it stops
+
+Worth knowing before pointing it at footage, since all of these are quiet
+failures rather than errors:
+
+- **Very thin railings.** The model sees a crop around the marked area scaled
+  to 256×256, and a bar much thinner than a sixtieth of that crop's width is
+  gone before the detector runs. Ordinary railings and posts are found; fine
+  mesh and chain-link are not.
+- **Obstructions covering more than about half the marked area.** Past that the
+  obstruction is the majority of what was marked and is taken for the surface.
+  The mask then empties out and the creative is painted over — the same result
+  as leaving the option off, rather than something worse.
+- **Anamorphic "3D" screen content**, the kind designed to look like it is
+  leaning out of the screen, can raise a blob inside the panel. It defeats
+  exactly the cue being measured. The option is per-project, so switch it off
+  for those shots.
+- **An obstruction close to a very distant surface.** Depth separation shrinks
+  with distance; something a metre in front of a billboard forty metres away is
+  below any honest threshold. A limit of monocular depth, not a setting.
+- **Ground and objects just outside the marked area** that genuinely are nearer
+  bleed a few pixels into the creative's edge, the same way the person mask
+  does.
+
+The mask is recomputed per frame with nothing carried between them, which keeps
+preview and render identical but leaves a little shimmer along an obstruction's
+edge on marginal cases.
 
 ## How the tracking works
 
@@ -631,6 +702,7 @@ file, and the algorithms can be tested without a display.
 | `galileo_core.PlanarTracker` | Feature-based planar tracking with RANSAC and sanity checks |
 | `galileo_core.ReferenceMatcher` | Locates a target in the footage from a reference image |
 | `galileo_core.PersonSegmenter` | Segments people so the insert can go behind them |
+| `galileo_core.DepthOcclusionSegmenter` | Finds anything else in front of the surface, by depth |
 | `galileo_core.Region` | Four corners plus per-edge curvature |
 | `galileo_core.composite_region` | Alpha-correct perspective/curved warp and blend |
 | `galileo_core.interpolate_tracking` | Fills the gaps between tracked frames |
@@ -668,5 +740,9 @@ whole-frame one demonstrably does *not* fix banding, which is why the choice
 is made rather than offered — and that a preview that has been steadied is
 rendered to a file that is steady too.
 
-Occlusion tests that need the model file skip cleanly when it has not been
-fetched; the compositing side is tested with hand-made masks either way.
+Occlusion tests that need a model file skip cleanly when it has not been
+fetched; the compositing side is tested with hand-made masks either way, and
+`tests/test_depth_occlusion.py` states what turns a depth map into a mask using
+maps built by hand — an obstruction across the middle, a surface seen at a
+steep angle, sky showing past a loosely marked edge — so the rules hold whether
+or not the 64 MB model has been downloaded.
