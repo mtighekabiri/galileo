@@ -2614,6 +2614,170 @@ def open_reference(path: str, **kwargs):
 # Tracking history
 # --------------------------------------------------------------------------
 
+#: How many frames the fit sees at once when steadying a tracked path.
+#: Measured against a hand-corrected path over a handheld shot: 11 frames take
+#: the frame-to-frame acceleration from 4.96 px to 0.64 px while also bringing
+#: the shape *closer* to where it belongs, 1.92 px to 1.08 px, because most of
+#: what is being removed was never real movement. Wider windows keep steadying
+#: it -- 21 frames reach 0.31 px -- but start pulling the shape off a surface
+#: that is genuinely moving quickly, which is the failure worth avoiding.
+STEADY_WINDOW = 11
+
+#: A step this many times the run's typical one is a move, not a wobble.
+#: Splitting there keeps the smoother from smearing a deliberate
+#: repositioning -- or a cut -- backwards and forwards over its neighbours.
+JUMP_FACTOR = 8.0
+
+#: ...but only once it is also worth noticing in pixels. Without this, a shape
+#: sitting still on a locked-off shot has a typical step of nearly nothing, and
+#: every twitch in it counts as eight times that.
+JUMP_FLOOR = 6.0
+
+
+def _runs(keys, corners, jump_factor=JUMP_FACTOR, jump_floor=JUMP_FLOOR):
+    """Split frames into stretches that describe one continuous movement.
+
+    ``keys`` is sorted; ``corners`` holds their quads as one (n, 8) array. The
+    threshold is measured over the whole recording rather than each stretch, so
+    that asking for one frame's smoothed position and asking for every frame's
+    divide the recording exactly the same way.
+    """
+    steps = np.linalg.norm(
+        np.diff(corners, axis=0).reshape(-1, 4, 2), axis=2).mean(axis=1)
+    limit = max(jump_factor * float(np.median(steps)) if steps.size else 0.0,
+                jump_floor)
+
+    breaks = np.flatnonzero((np.diff(np.asarray(keys)) != 1) | (steps > limit))
+    return np.split(np.arange(len(keys)), breaks + 1)
+
+
+def _fit_at(corners, offset, half, degree):
+    """The polynomial fit through one frame's neighbours, read at that frame.
+
+    ``corners`` is a run as an (n, 8) array; ``offset`` indexes into it, and
+    the answer comes back in the same eight-wide, full-precision form. The
+    window is clipped to the run's ends, which is the whole of the special
+    handling the first and last few frames need -- a shorter window and, if it
+    is shorter than the polynomial, a lower order.
+    """
+    low = max(0, offset - half)
+    high = min(len(corners), offset + half + 1)
+    span = np.arange(low - offset, high - offset, dtype=np.float64)
+    order = min(degree, high - low - 1)
+    try:
+        solution, *_ = np.linalg.lstsq(np.vander(span, order + 1),
+                                       corners[low:high], rcond=None)
+    except np.linalg.LinAlgError:
+        return corners[offset]
+    # The value at this frame is the constant term: the window's frame numbers
+    # are measured from it, so every other power is zero here.
+    return solution[-1]
+
+
+def smooth_tracking(history: dict, window: int = STEADY_WINDOW, degree: int = 2,
+                    strength: float = 1.0, only: int = None) -> dict:
+    """Fit a smooth path through recorded corners, taking the wobble out.
+
+    Nothing else in the pipeline does this. The Kalman filter in
+    :func:`smooth_quad` runs live, during a tracking pass, and it only ever
+    sees the past -- so it lags, it cannot touch a frame the user corrected by
+    hand afterwards, and it is thrown away and restarted from a standstill
+    every time they do. What reaches the file is then whatever is in the
+    history, interpolated straight between the recorded frames.
+
+    That matters most for the frames a person placed. Corners set by hand carry
+    the unsteadiness of the hand that set them: clicking to a typical pixel and
+    a half puts about **4.3 px** of frame-to-frame acceleration into the path,
+    against **0.25 px** for even a struggling tracker and **0.007 px** for the
+    camera move being followed. The correction fixes where the shape sits and
+    ruins how it moves, which is exactly the complaint that the insert looks
+    fidgety after a lot of careful work.
+
+    So the whole recorded path is fitted here rather than filtered: around each
+    frame, a low-order polynomial is put through the corners of the frames
+    nearby and evaluated at that frame. Reading forwards as well as backwards
+    is what makes this different from the live filter -- there is no lag to
+    trade against, because the future is already known by the time anyone
+    renders.
+
+    ``degree`` 2 is what keeps it honest. A polynomial of that order can
+    already be a pan, a zoom or a steady acceleration, so real camera movement
+    passes through untouched and only what does not fit that description --
+    which is to say the noise -- is removed. A larger ``window`` smooths
+    harder; ``strength`` below 1.0 keeps part of the original, for a shape that
+    should follow something the fit refuses to believe.
+
+    Stretches are smoothed separately either side of a gap in the recording or
+    a jump too big to be a wobble, so a deliberate repositioning stays a
+    repositioning instead of being spread over the frames around it.
+
+    Pass ``only`` for a single frame's smoothed corners rather than the whole
+    clip's. That is what the preview asks for as it goes, and it is the same
+    arithmetic over the same neighbours, so the shape on screen is the shape
+    the renderer will write for that frame.
+    """
+    tracked = {int(k): as_quad(v) for k, v in history.items()
+               if v is not None and len(v) == 4}
+    if len(tracked) < 3 or strength <= 0 or window < 3:
+        return {k: v.copy() for k, v in tracked.items()}
+
+    keys = sorted(tracked)
+    all_corners = np.array([tracked[k] for k in keys], np.float64).reshape(-1, 8)
+    half = max(1, int(window) // 2)
+    smoothed = {}
+
+    for run in _runs(keys, all_corners):
+        if only is not None and not (keys[run[0]] <= only <= keys[run[-1]]):
+            continue
+        # Too short to say anything about the shape of the movement; a fit
+        # through this few points would follow the noise it is meant to remove.
+        if len(run) <= degree + 1:
+            for i in run:
+                smoothed[keys[i]] = tracked[keys[i]].copy()
+            continue
+
+        length = len(run)
+        corners = all_corners[run[0]:run[-1] + 1]
+
+        if only is not None:
+            # One frame's smoothed position depends on nothing outside its own
+            # window, so the preview can ask for the frame on screen without
+            # fitting the whole clip -- and gets the number the render will use,
+            # because it is the same fit over the same neighbours.
+            offset = only - keys[run[0]]
+            fitted = _fit_at(corners, offset, half, degree)
+            blended = corners[offset] + strength * (fitted - corners[offset])
+            smoothed[only] = blended.reshape(4, 2).astype(np.float32)
+            continue
+
+        fitted = corners.copy()
+
+        # Every frame with a full window either side is fitted over the same
+        # relative frame numbers, so the fit is one fixed set of weights over
+        # its neighbours rather than a fresh solve apiece -- the difference
+        # between a clip's worth of tiny least-squares problems and a single
+        # pass. Only the frames near each end, whose windows are cut short by
+        # the end, need their own.
+        if length >= 2 * half + 1:
+            span = np.arange(-half, half + 1, dtype=np.float64)
+            weights = np.linalg.pinv(np.vander(span, degree + 1))[-1]
+            windows = np.lib.stride_tricks.sliding_window_view(
+                corners, 2 * half + 1, axis=0)
+            fitted[half:length - half] = windows @ weights
+
+        for offset in list(range(min(half, length))) + \
+                list(range(max(half, length - half), length)):
+            fitted[offset] = _fit_at(corners, offset, half, degree)
+
+        blended = corners + strength * (fitted - corners)
+        for offset, i in enumerate(run):
+            smoothed[keys[i]] = blended[offset].reshape(4, 2).astype(np.float32)
+
+    if only is not None:
+        return {only: smoothed[only]} if only in smoothed else {}
+    return smoothed
+
+
 def interpolate_tracking(history: dict, start: int = None, end: int = None) -> dict:
     """Fill gaps between tracked frames by interpolating the corners.
 

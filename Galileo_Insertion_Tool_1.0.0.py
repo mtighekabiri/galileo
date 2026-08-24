@@ -1639,6 +1639,11 @@ class Placement:
         self.curvature = np.zeros((4, 2, 2), np.float32)
         self.curved_enabled = False
         self.tracking_history = {}
+        # The frames of that history a person placed rather than the tracker,
+        # which is the difference between a correction and an estimate. A
+        # tracking pass keeps these and re-anchors itself to them instead of
+        # writing over them; see CentralPanel.track_placement.
+        self.manual_frames = set()
 
         # Creative
         self.overlay_bgra = None
@@ -1797,6 +1802,7 @@ class Placement:
             "blend": self.blend.to_dict(),
             "morph": self.morph.to_dict(),
             "feature_source": self.feature_source,
+            "manual_frames": sorted(self.manual_frames),
         }
 
     @classmethod
@@ -1810,6 +1816,10 @@ class Placement:
         placement.tracking_history = {
             int(k): [tuple(p) for p in v]
             for k, v in (data.get("tracking_history") or {}).items()}
+        # Absent from projects saved before corrections were told apart from
+        # estimates. Those simply have none recorded, which is what they knew.
+        placement.manual_frames = {int(f) for f in (data.get("manual_frames") or [])
+                                   if int(f) in placement.tracking_history}
         placement.overlay_source_path = data.get("overlay_path")
         placement.inserted_overlay_is_video = bool(data.get("overlay_is_video", False))
         placement.inserted_overlay_start_frame = data.get("overlay_start_frame", 0)
@@ -1915,6 +1925,7 @@ class TrackingOverlay(QWidget):
     curvature = _active_property("curvature")
     curved_enabled = _active_property("curved_enabled")
     tracking_history = _active_property("tracking_history")
+    manual_frames = _active_property("manual_frames")
     overlay_bgra = _active_property("overlay_bgra")
     overlay_source_path = _active_property("overlay_source_path")
     inserted_overlay_is_video = _active_property("inserted_overlay_is_video")
@@ -2059,8 +2070,15 @@ class TrackingOverlay(QWidget):
         frame_index = panel.get_current_frame_index()
         if len(self.points) == 4:
             self.tracking_history[frame_index] = self.points[:]
+            # Remember that a person put this one here. A tracking pass coming
+            # back through the frame will keep it and carry on from it, rather
+            # than overwriting the correction with the estimate it was made to
+            # fix -- which is how an afternoon of frame-by-frame work used to
+            # disappear on the next pass, with nothing on screen to say so.
+            self.manual_frames.add(frame_index)
         elif frame_index in self.tracking_history:
             del self.tracking_history[frame_index]
+            self.manual_frames.discard(frame_index)
         mw.mark_dirty()
 
     def mouseReleaseEvent(self, event):
@@ -2215,6 +2233,7 @@ class TrackingOverlay(QWidget):
         self.curvature = np.zeros((4, 2, 2), np.float32)
         self.remove_inserted_overlay()
         self.tracking_history.clear()
+        self.manual_frames.clear()
         self.update()
 
     def has_overlay(self) -> bool:
@@ -2607,6 +2626,15 @@ class TitleBar(QWidget):
         self.obstruction_action.toggled.connect(self.parent.toggle_obstructions)
         options_menu.addAction(self.obstruction_action)
 
+        self.steady_tracking_action = QAction(
+            "Steady the tracked path", self, checkable=True)
+        self.steady_tracking_action.setToolTip(
+            "Take the frame-to-frame wobble out of the tracked shape, "
+            "including the wobble left by corrections made by hand")
+        self.steady_tracking_action.toggled.connect(
+            self.parent.toggle_steady_tracking)
+        options_menu.addAction(self.steady_tracking_action)
+
         self.deflicker_action = QAction(
             "Steady the lighting", self, checkable=True)
         self.deflicker_action.setToolTip(
@@ -2909,6 +2937,13 @@ class CentralPanel(QWidget):
         self.obstruction_enabled = False
         self._occlusion_cache = None
 
+        # Fitting a smooth path through the recorded corners, for both the
+        # preview and the render. Off by default: it is worth a great deal on a
+        # path that has been corrected by hand, and costs a little accuracy on
+        # one that was already steady. See core.smooth_tracking.
+        self.steady_tracking = False
+        self.steady_window = core.STEADY_WINDOW
+
         # 1) The container for video + overlay.
         #
         # No layout manager here on purpose: layout_video_stage positions the
@@ -3179,6 +3214,9 @@ class CentralPanel(QWidget):
             del self.tracking_overlay.tracking_history[current_frame_index]
         if current_frame_index in self.tracking_history:
             del self.tracking_history[current_frame_index]
+        # Deleting the shape deletes the correction with it; there is no longer
+        # anything here for a tracking pass to preserve.
+        self.tracking_overlay.active.manual_frames.discard(current_frame_index)
         # Clear points if on that frame
         if self.get_current_frame_index() == current_frame_index:
             self.tracking_overlay.points.clear()
@@ -3251,8 +3289,9 @@ class CentralPanel(QWidget):
 
         # Show this frame's shape if it has one, otherwise keep what is on
         # screen so the user can carry it to a frame that needs marking.
-        if frame_index in self.tracking_history:
-            self.tracking_overlay.points = self.tracking_history[frame_index][:]
+        shape = self.recorded_shape(self.tracking_overlay.active, frame_index)
+        if shape:
+            self.tracking_overlay.points = shape
 
         self.tracking_overlay.update()
 
@@ -3693,9 +3732,23 @@ class CentralPanel(QWidget):
 
         Returns whether anything was recorded, so the caller knows which
         placement it has just written and can leave that one alone.
+
+        A frame the user corrected by hand is not re-tracked. The shape they
+        set is kept and the tracker is re-anchored to it, so the pass carries
+        on from the correction instead of writing over it -- which turns a
+        correction into something that fixes the frames after it, rather than
+        something to be repeated on every one of them.
         """
         if not placement.enabled or len(placement.points) != 4:
             return False
+
+        if frame_index in placement.manual_frames:
+            corrected = placement.tracking_history.get(frame_index)
+            if corrected and len(corrected) == 4:
+                placement.points = corrected[:]
+                placement.tracker = None
+                placement.kalman_filters = []
+                return True
 
         if not placement.kalman_filters:
             placement.kalman_filters = core.make_filters(placement.points)
@@ -3745,6 +3798,12 @@ class CentralPanel(QWidget):
         altering another's history. A placement with nothing recorded here
         keeps the shape it has -- it has not been tracked at this frame, and
         moving it anyway would be a guess written down as measurement.
+
+        With the path steadied, what is shown is the fitted shape rather than
+        the recorded one -- the same value, from the same fit, that the render
+        will use for this frame. The history itself is left exactly as it was:
+        steadying is a way of reading it, not an edit to it, so it can be
+        turned off again and nothing has been lost.
         """
         for placement in self.tracking_overlay.placements:
             if placement is being_tracked:
@@ -3756,9 +3815,29 @@ class CentralPanel(QWidget):
             # still needs to know how far the shape moved between frames.
             placement.tracker = None
             placement.kalman_filters = []
-            recorded = placement.tracking_history.get(frame_index)
+            recorded = self.recorded_shape(placement, frame_index)
             if recorded:
-                placement.points = recorded[:]
+                placement.points = recorded
+
+    def recorded_shape(self, placement, frame_index):
+        """What this placement's shape is on this frame, steadied if asked for.
+
+        Returns a fresh list of corners, or None when nothing was recorded --
+        never the stored list itself, which the caller would then be able to
+        edit in place and silently rewrite the history through.
+        """
+        recorded = placement.tracking_history.get(frame_index)
+        if not recorded:
+            return None
+        if not self.steady_tracking:
+            return recorded[:]
+        fitted = core.smooth_tracking(placement.tracking_history,
+                                      window=self.steady_window,
+                                      only=int(frame_index))
+        quad = fitted.get(int(frame_index))
+        if quad is None:
+            return recorded[:]
+        return [(float(x), float(y)) for x, y in quad]
 
     def occlusion_for_frame(self, frame, placements):
         """Everything in front of the inserts on this frame, cropped near them.
@@ -4581,7 +4660,8 @@ class RenderSettings:
                  overlay_start_frame=0, brightness=0, contrast=1.0,
                  colourise=False, include_audio=True, occlusion=False,
                  blend_settings=None, placements=None, morph=None,
-                 deflicker_gains=None, obstructions=False):
+                 deflicker_gains=None, obstructions=False,
+                 steady_tracking=False, steady_window=core.STEADY_WINDOW):
         self.base_video_path = base_video_path
         self.out_path = out_path
         self.start_frame = int(start_frame)
@@ -4602,6 +4682,11 @@ class RenderSettings:
         # threads, so the worker builds its own of each.
         self.occlusion = occlusion
         self.obstructions = bool(obstructions)
+        # Steadying is applied to the recorded corners here rather than left to
+        # the preview, or the file would be written from the raw path the
+        # preview had already stopped showing.
+        self.steady_tracking = bool(steady_tracking)
+        self.steady_window = int(steady_window)
         self.blend = blend_settings or blend.BlendSettings.off()
         self.morph = morph or morphlib.Morph()
         # Every insertion to draw. The single-placement fields above are kept
@@ -4645,8 +4730,16 @@ class RenderWorker(QObject):
 
         usable = []
         for placement in snapshots:
+            history = placement.history
+            if settings.steady_tracking:
+                # Before the gaps are filled, so the fit sees the frames that
+                # were actually solved rather than points invented between
+                # them, and the straight lines drawn across a gap are drawn
+                # between steadied ends.
+                history = core.smooth_tracking(history,
+                                               window=settings.steady_window)
             placement.dense = core.interpolate_tracking(
-                placement.history, settings.start_frame, settings.end_frame)
+                history, settings.start_frame, settings.end_frame)
             if not placement.dense:
                 continue
 
@@ -5468,6 +5561,8 @@ class MainWindow(QMainWindow):
             colourise=overlay.colourise_enabled,
             occlusion=panel.occlusion_enabled,
             obstructions=panel.obstruction_enabled,
+            steady_tracking=panel.steady_tracking,
+            steady_window=panel.steady_window,
             blend_settings=blend.BlendSettings.from_dict(overlay.blend.to_dict()),
             placements=[PlacementSnapshot(p, scale_factor)
                         for p in overlay.placements
@@ -5881,6 +5976,17 @@ class MainWindow(QMainWindow):
         panel.occlusion_enabled = enabled
         if not enabled:
             panel.segmenter = None
+        panel.refresh_display()
+
+    def toggle_steady_tracking(self, enabled: bool):
+        """Fit a smooth path through the recorded corners, for preview and file.
+
+        Nothing is rewritten: the recording is left as it was and read through
+        the fit instead, so this can be turned on to see what it does and off
+        again without having cost anything.
+        """
+        panel = self.central_panel
+        panel.steady_tracking = enabled
         panel.refresh_display()
 
     def toggle_obstructions(self, enabled: bool):
