@@ -2279,15 +2279,97 @@ def _fit_plane_robust(depth: np.ndarray, interior: np.ndarray,
 #: far more obvious than a slightly thin edge on the thing in front of it.
 DEPTH_FLOOR = 0.15
 
-#: What *Obstruction sensitivity* offers, since how far a network is fooled
-#: depends on what the billboard happens to be showing. Higher finds more and
-#: invents more; lower is for artwork with strong depth in it.
-DEPTH_SENSITIVITY = {"low": 0.28, "normal": DEPTH_FLOOR, "high": 0.10}
+#: Below this share of the crop being something other than the panel, the
+#: threshold's scene-depth term is measuring the panel against itself and
+#: cannot be taken at face value.
+DEPTH_MIN_CONTEXT = 0.25
+
+#: How much stricter to be when there is no context at all: 1 + this, so 3x.
+#: Driving up to a hoarding, the padded crop is 75% other things while the
+#: panel is small and 2% by the time it fills the frame -- at which point the
+#: yardstick has quietly become the artwork's own depicted depth. Measured on
+#: that approach, at the widest: 46% of the creative was masked without this
+#: and 26% with it, for 73% of a post across the panel still found rather than
+#: 100%. Firmer settings keep cutting the false masking and cost more of the
+#: real obstruction than they are worth: at 4x, 16% masked but only 61% of the
+#: post found.
+DEPTH_CONTEXT_FIRMNESS = 2.0
+
+
+class DepthSettings:
+    """The dials behind *Draw behind obstructions*.
+
+    Kept as an object rather than loose numbers so that the preview and the
+    renderer are demonstrably working from the same ones -- the same reason
+    :class:`galileo_blend.BlendSettings` exists. Which way to lean depends on
+    artwork the tool has never seen, so these are offered rather than decided.
+    """
+
+    __slots__ = ("floor_rel", "k", "dilate", "feather")
+
+    #: What each dial does, and the range worth exploring, for whatever is
+    #: putting them on screen. Ordered by how much difference they make.
+    DIALS = (
+        ("floor_rel", "In front by at least", 0.02, 0.60, 0.01,
+         "How far off the surface something must stand before it counts as\n"
+         "being in front of it, as a fraction of the scene's depth range.\n"
+         "Raise it when the billboard's own picture shows through the\n"
+         "creative; lower it when something really in front is painted over."),
+        ("k", "Clear of the noise by", 1.0, 12.0, 0.5,
+         "The same demand, in multiples of how ragged the surface's own depth\n"
+         "reads. This is what holds the line on a surface the model is unsure\n"
+         "about, where the fraction above would let the raggedness through."),
+        ("dilate", "Grow the edges", 0.0, 12.0, 1.0,
+         "Widen what is found, in pixels. Depth edges land slightly inside\n"
+         "the real object, so a little of this covers the seam."),
+        ("feather", "Soften the edges", 0.0, 8.0, 0.5,
+         "Blur the mask's edge, which also hides the frame-to-frame wobble in\n"
+         "the model's own boundaries."),
+    )
+
+    def __init__(self, floor_rel: float = DEPTH_FLOOR, k: float = 5.0,
+                 dilate: float = 4.0, feather: float = 2.5):
+        self.floor_rel = float(floor_rel)
+        self.k = float(k)
+        self.dilate = float(dilate)
+        self.feather = float(feather)
+
+    def to_dict(self) -> dict:
+        return {name: float(getattr(self, name)) for name in self.__slots__}
+
+    @classmethod
+    def from_dict(cls, data) -> "DepthSettings":
+        """Rebuild from a saved project, ignoring anything that is not a dial.
+
+        Out-of-range numbers are pulled back to the range rather than refused:
+        a project saved by a later version with a wider dial should still open,
+        with the nearest setting this one can actually apply.
+        """
+        settings = cls()
+        for name, _, low, high, _, _ in cls.DIALS:
+            value = (data or {}).get(name)
+            if value is None:
+                continue
+            try:
+                setattr(settings, name, float(np.clip(float(value), low, high)))
+            except (TypeError, ValueError):
+                continue
+        return settings
+
+    def __eq__(self, other):
+        return (isinstance(other, DepthSettings)
+                and self.to_dict() == other.to_dict())
+
+    def __repr__(self):
+        return ("DepthSettings(" + ", ".join(
+            f"{name}={getattr(self, name):g}" for name in self.__slots__) + ")")
 
 
 def plane_deviation_mask(depth: np.ndarray, quad, k: float = 5.0,
                          floor_rel: float = DEPTH_FLOOR,
-                         iterations: int = 3) -> np.ndarray:
+                         iterations: int = 3,
+                         min_context: float = DEPTH_MIN_CONTEXT,
+                         firmness: float = DEPTH_CONTEXT_FIRMNESS) -> np.ndarray:
     """255 where ``depth`` reads as meaningfully nearer than the marked surface.
 
     ``depth`` is relative inverse depth -- larger means nearer -- and ``quad``
@@ -2340,6 +2422,16 @@ def plane_deviation_mask(depth: np.ndarray, quad, k: float = 5.0,
     # zero spread -- from having every pixel clear a threshold of zero.
     threshold = max(k * scale, floor_rel * spread, 1e-6)
 
+    # That spread is supposed to describe the scene the panel stands in. Walk
+    # or drive towards a hoarding and it stops doing so: the crop fills with
+    # panel, and what is being measured is the depth the artwork depicts
+    # rather than the depth of anything real. Ask for a clearer step in
+    # proportion to how little of the crop is anything else -- distrusting the
+    # measurement exactly as far as it has stopped being one.
+    context = float(np.count_nonzero(~interior)) / interior.size
+    if min_context > 0 and context < min_context:
+        threshold *= 1.0 + firmness * (1.0 - context / min_context)
+
     mask[residual > threshold] = 255
     # Open at the map's own resolution, before anything is scaled up: a railing
     # three pixels wide here survives a 3x3 open, and would not survive a
@@ -2369,12 +2461,32 @@ class DepthOcclusionSegmenter:
     move with the surface" flags the advert being replaced. Depth does not care
     what is playing -- the panel is flat either way.
 
-    Runs MiDaS v2.1 small through OpenCV's own DNN module, one 64 MB file and
-    no extra runtime, exactly like the person model. See fetch_model.py.
+    Two models can serve, and the better one is preferred. Depth Anything V2
+    small (99 MB, Apache-2.0, the exact file OpenCV pins in its own dnn test
+    suite) sees what MiDaS v2.1 small structurally cannot: measured across a
+    drive-up, MiDaS found 2-14 px railing bars on 0% of their pixels at every
+    distance and dropped to 19% on a post at one, where Depth Anything found
+    the bars on 91-100% and the post on 100% throughout, at the same dial
+    settings. It is a transformer, so it loads on OpenCV 5's dnn engine and
+    not the classic 4.x one -- when it cannot load, or its file has not been
+    fetched, MiDaS serves as before. ``model_name`` says which one answered.
+
+    Costs, measured on this 4-core class of machine: MiDaS ~66 ms a frame,
+    Depth Anything ~440 ms at its 518 input (392 halves that but was measured
+    losing a third of the thin bars at one distance, so quality keeps the
+    default). Both run through OpenCV's own DNN module -- no extra runtime.
+    See fetch_model.py.
     """
 
+    #: Preferred: Depth Anything V2 small, when its file is present and the
+    #: dnn engine can load it.
+    PREFERRED_FILENAME = "depth_anything_v2_small.onnx"
+    #: Multiple of 14 (the ViT patch size). 518 is the size the model was
+    #: trained at and the size OpenCV's own perf suite runs it at.
+    PREFERRED_INPUT = 518
+    #: Fallback: MiDaS v2.1 small, which loads on any supported OpenCV.
     MODEL_FILENAME = "midas_v21_small_256.onnx"
-    #: Fixed by the exported graph. Feeding it another size is not an option.
+    #: Fixed by the MiDaS export. Feeding it another size is not an option.
     INPUT_SIZE = (256, 256)
 
     def __init__(self, model_path: str = None, k: float = 5.0,
@@ -2398,26 +2510,48 @@ class DepthOcclusionSegmenter:
                 context that tells the network the screen is flat, whatever is
                 playing on it.
         """
-        path = model_path or find_model(self.MODEL_FILENAME)
-        if not path:
-            raise FileNotFoundError(
-                f"Could not find {self.MODEL_FILENAME}. Run fetch_model.py to "
-                "download it, or place it in a 'models' folder beside the "
-                "application.")
-        try:
-            self.net = cv2.dnn.readNetFromONNX(path)
-        except cv2.error as exc:
-            # OpenCV 5 picks an engine for itself and falls back to the 4.x one
-            # on its own, but say so explicitly rather than rely on it: this
-            # model is known to load on the classic engine.
-            if not hasattr(cv2.dnn, "ENGINE_CLASSIC"):
-                raise IOError(f"Could not load the depth model: {exc}") from exc
-            try:
-                self.net = cv2.dnn.readNetFromONNX(path, cv2.dnn.ENGINE_CLASSIC)
-            except cv2.error as retry:
-                raise IOError(f"Could not load the depth model: {retry}") from retry
+        self.net = None
+        self.model_name = None
+        self.model_path = None
 
-        self.model_path = path
+        if model_path is None:
+            preferred = find_model(self.PREFERRED_FILENAME)
+            if preferred:
+                try:
+                    self.net = cv2.dnn.readNetFromONNX(preferred)
+                    self.model_name = "depth-anything-v2-small"
+                    self.model_path = preferred
+                except cv2.error as exc:
+                    # Expected on OpenCV 4.x, whose engine has no transformer
+                    # support: fall back to MiDaS rather than fail a machine
+                    # that worked yesterday.
+                    logger.warning("Preferred depth model would not load "
+                                   "(%s); falling back to MiDaS", exc)
+
+        if self.net is None:
+            path = model_path or find_model(self.MODEL_FILENAME)
+            if not path:
+                raise FileNotFoundError(
+                    f"Could not find {self.MODEL_FILENAME} (or "
+                    f"{self.PREFERRED_FILENAME}). Run fetch_model.py to "
+                    "download them, or place one in a 'models' folder beside "
+                    "the application.")
+            try:
+                self.net = cv2.dnn.readNetFromONNX(path)
+            except cv2.error as exc:
+                # OpenCV 5 picks an engine for itself and falls back to the
+                # 4.x one on its own, but say so explicitly rather than rely
+                # on it: MiDaS is known to load on the classic engine.
+                if not hasattr(cv2.dnn, "ENGINE_CLASSIC"):
+                    raise IOError(f"Could not load the depth model: {exc}") from exc
+                try:
+                    self.net = cv2.dnn.readNetFromONNX(path,
+                                                       cv2.dnn.ENGINE_CLASSIC)
+                except cv2.error as retry:
+                    raise IOError(
+                        f"Could not load the depth model: {retry}") from retry
+            self.model_name = "midas-v21-small"
+            self.model_path = path
         self.k = k
         self.floor_rel = floor_rel
         self.dilate = dilate
@@ -2426,21 +2560,36 @@ class DepthOcclusionSegmenter:
 
     @classmethod
     def is_available(cls) -> bool:
-        """True if the model file can be found."""
-        return find_model(cls.MODEL_FILENAME) is not None
+        """True if either depth model's file can be found."""
+        return (find_model(cls.PREFERRED_FILENAME) is not None
+                or find_model(cls.MODEL_FILENAME) is not None)
+
+    #: What Depth Anything expects OUTSIDE the graph. The two models disagree
+    #: here in exactly the way that bites silently: MiDaS bakes its ImageNet
+    #: normalisation into the export and wants plain [0, 1] RGB, Depth
+    #: Anything leaves it to the caller. Feeding either the other's recipe
+    #: produces a plausible-looking, quietly wrong depth map.
+    _DA_MEAN = np.float32([0.485, 0.456, 0.406])
+    _DA_STD = np.float32([0.229, 0.224, 0.225])
 
     def _infer(self, patch_bgr: np.ndarray) -> np.ndarray:
         """Relative inverse depth for one patch, at the network's own size.
 
-        The mean and standard deviation this model was trained with are baked
-        into the exported graph, so the input wanted here is plain [0, 1] RGB.
-        Subtracting them again -- which most examples of driving this model
-        through OpenCV do -- normalises it twice and quietly degrades the
-        result rather than failing outright.
+        Larger means nearer for both models, so everything downstream is
+        indifferent to which one answered.
         """
-        blob = cv2.dnn.blobFromImage(
-            patch_bgr, scalefactor=1 / 255.0, size=self.INPUT_SIZE,
-            mean=(0, 0, 0), swapRB=True, crop=False)
+        if self.model_name == "depth-anything-v2-small":
+            side = self.PREFERRED_INPUT
+            resized = cv2.resize(patch_bgr, (side, side),
+                                 interpolation=cv2.INTER_CUBIC)
+            pixels = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
+            pixels = (pixels.astype(np.float32) / 255.0 - self._DA_MEAN) \
+                / self._DA_STD
+            blob = pixels.transpose(2, 0, 1)[None]
+        else:
+            blob = cv2.dnn.blobFromImage(
+                patch_bgr, scalefactor=1 / 255.0, size=self.INPUT_SIZE,
+                mean=(0, 0, 0), swapRB=True, crop=False)
         self.net.setInput(blob)
         output = np.asarray(self.net.forward(), np.float32)
         return output.reshape(output.shape[-2], output.shape[-1])
@@ -2488,14 +2637,280 @@ class DepthOcclusionSegmenter:
         patch_mask = np.where(patch_mask > 127, 255, 0).astype(np.uint8)
 
         if self.dilate > 0:
-            kernel = np.ones((self.dilate * 2 + 1,) * 2, np.uint8)
-            patch_mask = cv2.dilate(patch_mask, kernel)
+            span = int(round(self.dilate)) * 2 + 1
+            patch_mask = cv2.dilate(patch_mask, np.ones((span, span), np.uint8))
         if self.feather > 0:
             ksize = max(3, int(self.feather * 4) | 1)
             patch_mask = cv2.GaussianBlur(patch_mask, (ksize, ksize), self.feather)
 
         mask[y0:y1, x0:x1] = patch_mask
         return mask
+
+    @classmethod
+    def from_settings(cls, settings: "DepthSettings" = None, **kwargs):
+        """Build one from a :class:`DepthSettings`, which is what the dials
+        and the render both hand over."""
+        settings = settings or DepthSettings()
+        return cls(k=settings.k, floor_rel=settings.floor_rel,
+                   dilate=settings.dilate, feather=settings.feather, **kwargs)
+
+
+# --------------------------------------------------------------------------
+# Occlusion from the surface's own artwork
+# --------------------------------------------------------------------------
+
+#: How many tracked frames the plate is built from. Spread evenly over the
+#: recording so the same history always gives the same plate -- the render
+#: rebuilds it independently and has to land on identical numbers.
+PLATE_SAMPLES = 24
+
+#: The plate's width in pixels. Height follows the marked area's own aspect.
+PLATE_WIDTH = 480
+
+#: Median grey-level disagreement between the sampled frames and the finished
+#: plate, above which the artwork is not usable as a reference. A printed
+#: hoarding disagrees only where something crossed it -- measured 1.5 on the
+#: synthetic approach with a post sweeping the panel -- while a screen playing
+#: its own advert disagrees everywhere, measured 23 with modest scene changes.
+#: The cut sits between the two, nearer the printed side: refusing a usable
+#: plate merely falls back to depth, while accepting a screen's would eat the
+#: creative on every frame.
+PLATE_UNSTEADY = 8.0
+
+
+def _fit_gain(source_gray: np.ndarray, target_gray: np.ndarray):
+    """Gain and offset taking ``source`` onto ``target``, by their moments.
+
+    Whole-frame exposure and lighting drift is the ordinary condition of this
+    footage (see :func:`level_gray`); fitting it out before any comparison is
+    what keeps a camera hunting its exposure from reading as change.
+    """
+    spread = float(source_gray.std())
+    if spread < 1e-3:
+        return 1.0, float(target_gray.mean() - source_gray.mean())
+    gain = float(target_gray.std()) / spread
+    gain = float(np.clip(gain, 0.5, 2.0))
+    return gain, float(target_gray.mean() - gain * source_gray.mean())
+
+
+def _plate_gray(image: np.ndarray) -> np.ndarray:
+    return image.mean(axis=2) if image.ndim == 3 else image
+
+
+class SurfacePlate:
+    """The marked surface's own artwork, learned from the shot, as a reference.
+
+    A printed hoarding's artwork is fixed to the panel, so rectifying the
+    tracked quad to one canonical rectangle makes the artwork identical frame
+    after frame -- while anything standing in front of it, being nearer, slides
+    across it as the viewpoint moves. A per-pixel median over the shot is
+    therefore a clean plate of the artwork, and whatever disagrees with it on
+    a given frame is something in front.
+
+    This is the second cue the depth model needs. Measured on a drive-up with
+    a post crossing the hoarding: the depth model finds the post on 0-7% of
+    its pixels between 18% and 45% of frame width -- it simply does not read
+    it as nearer -- and never sees railing bars thinner than about a sixtieth
+    of its crop. Through the same footage compressed to file, this cue finds
+    that post on 75-100% of its pixels at every distance (100% everywhere on
+    clean frames), and finds 2 px bars, because it compares pictures at the
+    panel's own resolution instead of asking a 256-wide network about
+    geometry. What it under-reads is an obstruction with nearly the artwork's
+    own colour -- measured no lower than 53% of a dark post over dark artwork
+    -- which is exactly where a depth step is large, so the two cues cover
+    each other's blind sides.
+
+    Its limits are the mirror image, which is why the two run together rather
+    than either replacing the other: it knows nothing outside the quad, it
+    cannot work where the artwork itself changes (a digital screen playing
+    content -- :func:`build_surface_plate` refuses those), and a hard shadow
+    crossing the panel is a photometric change it will mark as if it were an
+    object, where depth correctly would not.
+    """
+
+    def __init__(self, plate: np.ndarray, abs_floor: float = 8.0,
+                 k: float = 6.0, dilate: int = 4, feather: float = 2.5):
+        """
+        Args:
+            plate: the canonical artwork, float32 HxWx3.
+            abs_floor: smallest grey-level difference that can count, however
+                clean the frame reads.
+            k: the difference demanded, in multiples of the frame's own median
+                difference from the plate -- its compression and focus noise.
+            dilate: grow the mask by this many pixels, matching the other
+                segmenters.
+            feather: blur the mask edge by this sigma, likewise.
+        """
+        self.plate = np.asarray(plate, np.float32)
+        self.abs_floor = float(abs_floor)
+        self.k = float(k)
+        self.dilate = int(dilate)
+        self.feather = float(feather)
+        self._shrunk = {}
+
+    def _plate_at(self, width: int, height: int) -> np.ndarray:
+        cached = self._shrunk.get((width, height))
+        if cached is None:
+            cached = cv2.resize(self.plate, (width, height),
+                                interpolation=cv2.INTER_AREA)
+            self._shrunk[(width, height)] = cached
+        return cached
+
+    def mask(self, frame_bgr: np.ndarray, quad) -> np.ndarray:
+        """A frame-sized mask, 255 where this frame disagrees with the plate.
+
+        The comparison runs at the panel's on-screen resolution, not the
+        plate's. A distant panel's fine artwork detail exists in the plate but
+        literally not in the frame, and comparing sharp against soft marks
+        every line of the artwork: measured on the far end of an approach,
+        differencing at the plate's resolution falsely masked 47% of the
+        panel, at the panel's own 9%.
+
+        The difference taken is the smallest over one-pixel shifts of the
+        plate. Tracked corners are good to about a pixel, not exactly, and
+        that misregistration lights every artwork edge: at 0.7 px of quad
+        error, plain differencing falsely masked up to 30%, the shift-tolerant
+        version 10% -- with the obstruction itself still found in full, since
+        no one-pixel slide makes a post look like the artwork behind it.
+
+        The noise the threshold scales from is the median difference,
+        deliberately: any upper quantile includes the obstruction itself once
+        it covers a real share of the panel, and raises the bar exactly for
+        the thing being looked for -- swapping in the 75th to 90th percentile
+        was measured to drop a plainly visible post from 53% found to 0%.
+        """
+        height, width = frame_bgr.shape[:2]
+        out = np.zeros((height, width), np.uint8)
+        corners = as_quad(quad)
+
+        plate_h, plate_w = self.plate.shape[:2]
+        on_screen = (np.linalg.norm(corners[1] - corners[0])
+                     + np.linalg.norm(corners[2] - corners[3])) / 2.0
+        native_w = int(np.clip(on_screen, 24, plate_w))
+        native_h = max(14, int(round(native_w * plate_h / plate_w)))
+
+        target = np.float32([[0, 0], [native_w, 0],
+                             [native_w, native_h], [0, native_h]])
+        try:
+            transform = cv2.getPerspectiveTransform(corners, target)
+        except cv2.error:
+            return out
+        source = frame_bgr
+        if on_screen > 1.2 * native_w:
+            # The warp is about to shrink the panel, and warpPerspective can
+            # only sample, not average -- filter to the destination's scale
+            # first or the aliasing reads as disagreement with the plate.
+            sigma = 0.5 * on_screen / native_w
+            ksize = int(sigma * 4) | 1
+            source = cv2.GaussianBlur(frame_bgr, (ksize, ksize), sigma)
+        rectified = cv2.warpPerspective(
+            source, transform, (native_w, native_h)).astype(np.float32)
+        plate = self._plate_at(native_w, native_h)
+
+        gain, offset = _fit_gain(_plate_gray(rectified), _plate_gray(plate))
+        rectified = rectified * gain + offset
+
+        difference = None
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                shifted = np.abs(rectified - np.roll(plate, (dy, dx),
+                                                     axis=(0, 1))).mean(axis=2)
+                difference = shifted if difference is None \
+                    else np.minimum(difference, shifted)
+
+        noise = float(np.median(difference))
+        binary = ((difference > max(self.abs_floor, self.k * noise))
+                  .astype(np.uint8)) * 255
+        binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN,
+                                  np.ones((3, 3), np.uint8))
+
+        back = cv2.warpPerspective(binary, transform, (width, height),
+                                   flags=cv2.WARP_INVERSE_MAP)
+        back = np.where(back > 127, 255, 0).astype(np.uint8)
+        if self.dilate > 0:
+            span = self.dilate * 2 + 1
+            back = cv2.dilate(back, np.ones((span, span), np.uint8))
+        if self.feather > 0:
+            ksize = max(3, int(self.feather * 4) | 1)
+            back = cv2.GaussianBlur(back, (ksize, ksize), self.feather)
+        out[:] = back
+        return out
+
+
+def build_surface_plate(video_path: str, history: dict,
+                        samples: int = PLATE_SAMPLES,
+                        width: int = PLATE_WIDTH):
+    """Learn a :class:`SurfacePlate` from the tracked shot, or refuse.
+
+    Deterministic on its inputs -- the same history over the same video gives
+    the same plate to the last bit, which is what lets the preview and the
+    renderer each build their own and be showing the same thing.
+
+    Returns None when there is not enough tracking to learn from, the video
+    cannot be read, or the artwork fails the steadiness check -- a digital
+    screen playing its own content disagrees with any plate everywhere, and
+    refusing it here is what keeps this cue from eating the creative on
+    footage it cannot serve. The caller falls back to depth alone.
+    """
+    tracked = {int(k): as_quad(v) for k, v in (history or {}).items()
+               if v is not None and len(v) == 4}
+    if len(tracked) < 3:
+        return None
+    keys = sorted(tracked)
+    picks = sorted(set(np.linspace(0, len(keys) - 1,
+                                   min(samples, len(keys))).round().astype(int)))
+
+    capture = cv2.VideoCapture(video_path)
+    if not capture.isOpened():
+        return None
+    try:
+        aspects, gathered = [], []
+        for index in picks:
+            frame_index = keys[index]
+            quad = tracked[frame_index]
+            capture.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
+            ok, frame = capture.read()
+            if not ok:
+                continue
+            top = np.linalg.norm(quad[1] - quad[0])
+            side = np.linalg.norm(quad[3] - quad[0])
+            if top < 8 or side < 8:
+                continue
+            aspects.append(side / top)
+            gathered.append((frame, quad))
+    finally:
+        capture.release()
+
+    if len(gathered) < 3:
+        return None
+
+    height = int(np.clip(round(width * float(np.median(aspects))), 32, width))
+    target = np.float32([[0, 0], [width, 0], [width, height], [0, height]])
+
+    rectified = []
+    for frame, quad in gathered:
+        transform = cv2.getPerspectiveTransform(quad, target)
+        rectified.append(cv2.warpPerspective(frame, transform, (width, height))
+                         .astype(np.float32))
+
+    # Exposure drifts over a shot; fold each sample onto the first before the
+    # median, or a slow brightening reads as half the panel changing.
+    reference = _plate_gray(rectified[0])
+    for i in range(1, len(rectified)):
+        gain, offset = _fit_gain(_plate_gray(rectified[i]), reference)
+        rectified[i] = rectified[i] * gain + offset
+
+    plate = np.median(np.stack(rectified), axis=0)
+
+    disagreement = np.median([
+        float(np.median(np.abs(_plate_gray(r) - _plate_gray(plate))))
+        for r in rectified])
+    if disagreement > PLATE_UNSTEADY:
+        logger.info("surface plate refused: median disagreement %.1f "
+                    "(artwork is not steady enough to be a reference)",
+                    disagreement)
+        return None
+    return SurfacePlate(plate)
 
 
 VIDEO_SUFFIXES = (".mp4", ".avi", ".mkv", ".mov", ".m4v", ".webm")

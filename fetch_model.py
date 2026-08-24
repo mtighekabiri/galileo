@@ -3,25 +3,33 @@
 
     python fetch_model.py
 
-Fetches both into ./models/, skipping whichever is already there:
+Fetches all of them into ./models/, skipping whatever is already there:
 
 * **PP-HumanSeg** (about 6 MB) segments people, so the creative can be drawn
   *behind* somebody walking in front of the screen -- Options → Draw behind
   people.
-* **MiDaS v2.1 small** (about 64 MB) estimates how far away everything in the
-  frame is, so anything standing in front of the surface -- railings,
+* **Depth Anything V2 small** (about 99 MB) estimates how far away everything
+  in the frame is, so anything standing in front of the surface -- railings,
   lampposts, signs, a passing bus -- can be drawn in front of the creative
-  too, whatever it is -- Options → Draw behind obstructions.
+  too, whatever it is -- Options → Draw behind obstructions. Needs OpenCV 5's
+  dnn engine; on older OpenCV the tool falls back to:
+* **MiDaS v2.1 small** (about 64 MB), the previous depth model, which loads
+  everywhere. Measurably weaker -- across a drive-up it found 2-14 px railing
+  bars on 0% of their pixels where Depth Anything found 91-100% -- so it is
+  the fallback rather than the choice.
 
-Both run through OpenCV's own DNN module, so nothing else needs installing.
-Neither is committed to the repository, so run this once after cloning, and
+All run through OpenCV's own DNN module, so nothing else needs installing.
+None is committed to the repository, so run this once after cloning, and
 before packaging a build if you want occlusion available to the people you
-hand it to. Either model works without the other; each enables its own menu
-item.
+hand it to. Each downloads on its own account; each menu item lights up with
+whatever is present.
 
 Models:
   PP-HumanSeg, OpenCV Model Zoo (Apache-2.0).
   https://github.com/opencv/opencv_zoo/tree/main/models/human_segmentation_pphumanseg
+  Depth Anything V2 small (Apache-2.0 -- the Small variant specifically).
+  Yang et al., "Depth Anything V2", NeurIPS 2024.
+  https://github.com/DepthAnything/Depth-Anything-V2
   MiDaS v2.1 small, Intel ISL (MIT). Ranftl et al., "Towards Robust Monocular
   Depth Estimation", TPAMI 2020.  https://github.com/isl-org/MiDaS
 """
@@ -50,6 +58,19 @@ MODELS = [
         "feature": "Draw behind people",
     },
     {
+        "filename": "depth_anything_v2_small.onnx",
+        # The exact export OpenCV pins in its own dnn test suite
+        # (opencv_extra download_models.py, sha1 034e45219f00397b...).
+        # Apache-2.0 -- the Small variant specifically; Base and Large are
+        # CC-BY-NC and must not be substituted here.
+        "url": ("https://huggingface.co/onnx-community/depth-anything-v2-small/"
+                "resolve/main/onnx/model.onnx"),
+        "expected_bytes": 99060839,
+        "min_bytes": 50_000_000,
+        "size_hint": "about 99 MB",
+        "feature": "Draw behind obstructions (preferred model; needs OpenCV 5)",
+    },
+    {
         "filename": "midas_v21_small_256.onnx",
         # Released as model-small.onnx; saved under a name that says which
         # model and which input size it is once it is sitting in models/.
@@ -58,7 +79,7 @@ MODELS = [
         "expected_bytes": 66764249,
         "min_bytes": 30_000_000,
         "size_hint": "about 64 MB",
-        "feature": "Draw behind obstructions",
+        "feature": "Draw behind obstructions (fallback for older OpenCV)",
     },
 ]
 

@@ -315,11 +315,179 @@ class BlendDialog(QDialog):
         for name, _, _ in self.EFFECTS:
             self.sliders[name].setValue(int(getattr(fresh, name) * 100))
         self.enabled_box.setChecked(True)
-        self.fill_box.setChecked(morphlib.Morph().fill)
 
     def _revert_and_reject(self):
         for key, value in self.original.items():
             setattr(self.settings, key, value)
+        self.on_change()
+        self.reject()
+
+
+class ObstructionDialog(QDialog):
+    """Live dials for what counts as standing in front of the surface.
+
+    Every dial recomposites the frame behind it, because none of these can be
+    judged from a number: the question is always whether the creative is being
+    eaten by the billboard's own picture, or something really in front is being
+    painted over, and only the shot itself answers that.
+    """
+
+    def __init__(self, settings, enabled, on_change, plate_enabled=True,
+                 parent=None):
+        super().__init__(parent)
+        self.settings = settings
+        self.on_change = on_change
+        self.original = settings.to_dict()
+        self.original_enabled = enabled
+        self.original_plate = plate_enabled
+
+        # A drag delivers far more values than anyone can see, and each one
+        # costs a pass of the depth model over the frame -- much the most
+        # expensive thing in the preview. Coalesce them, and more patiently
+        # than the blend dialog does, which only re-does arithmetic.
+        self._preview_timer = QTimer(self)
+        self._preview_timer.setSingleShot(True)
+        self._preview_timer.setInterval(150)
+        self._preview_timer.timeout.connect(lambda: self.on_change())
+
+        self.setWindowTitle("Draw Behind Obstructions")
+        self.setMinimumWidth(540)
+        self.setStyleSheet("""
+            QDialog { background-color: #2A2A2A; }
+            QLabel { color: #E8E8E8; font-size: 13px; }
+            QCheckBox { color: #E8E8E8; font-size: 13px; }
+            QSlider::groove:horizontal { background: #444; height: 5px;
+                                         border-radius: 2px; }
+            QSlider::handle:horizontal { background: #DDD; width: 14px;
+                                         margin: -5px 0; border-radius: 7px; }
+            QSlider::sub-page:horizontal { background: #00A000;
+                                           border-radius: 2px; }
+            QPushButton { background-color: #3C3C3C; color: white; border: none;
+                          border-radius: 6px; padding: 7px 16px; }
+            QPushButton:hover { background-color: #505050; }
+        """)
+
+        layout = QVBoxLayout(self)
+        layout.setSpacing(10)
+
+        self.enabled_box = QCheckBox(
+            "Let railings, posts, signs and anything else in front stay in front")
+        self.enabled_box.setChecked(enabled)
+        self.enabled_box.toggled.connect(self._on_enabled)
+        layout.addWidget(self.enabled_box)
+
+        note = QLabel("Measured from how far away the frame looks, so what the "
+                      "obstruction happens to be does not matter.")
+        note.setStyleSheet("color: #9A9A9A; font-size: 11px;")
+        note.setWordWrap(True)
+        layout.addWidget(note)
+
+        self.plate_box = QCheckBox(
+            "Also compare against the panel's own artwork (printed surfaces)")
+        self.plate_box.setChecked(plate_enabled)
+        self.plate_box.setToolTip(
+            "Learn what the panel itself looks like from the tracked shot and "
+            "hold the creative back wherever a frame disagrees with it.\n"
+            "Catches what the depth model cannot -- thin railings, and "
+            "obstructions at mid distance -- but only where the artwork is "
+            "fixed;\na screen playing its own content is detected and skipped.")
+        self.plate_box.toggled.connect(lambda _checked: self.on_change())
+        layout.addWidget(self.plate_box)
+
+        self.sliders = {}
+        self.value_labels = {}
+        for name, title, low, high, step, hint in core.DepthSettings.DIALS:
+            row = QHBoxLayout()
+            label = QLabel(title)
+            label.setFixedWidth(150)
+            label.setToolTip(hint)
+            slider = QSlider(Qt.Horizontal)
+            # Sliders count in whole numbers, so each dial counts in its own
+            # steps and is converted back on the way out.
+            slider.setRange(0, int(round((high - low) / step)))
+            slider.setValue(self._to_slider(name, getattr(settings, name)))
+            slider.setToolTip(hint)
+            slider.valueChanged.connect(
+                lambda value, key=name: self._on_slider(key, value))
+            value_label = QLabel()
+            value_label.setFixedWidth(46)
+            value_label.setStyleSheet("color: #9A9A9A; font-size: 12px;")
+
+            row.addWidget(label)
+            row.addWidget(slider, 1)
+            row.addWidget(value_label)
+            layout.addLayout(row)
+            self.sliders[name] = slider
+            self.value_labels[name] = value_label
+            self._show_value(name)
+
+        measured = QLabel(
+            "The measured starting point for the first dial is 0.15. On a "
+            "hoarding showing a road running away, the billboard's own picture "
+            "reached 0.13 and a lamppost across it 0.41 — so that is the "
+            "one to raise first if the artwork is showing through the creative.")
+        measured.setStyleSheet("color: #9A9A9A; font-size: 11px;")
+        measured.setWordWrap(True)
+        layout.addWidget(measured)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel |
+                                   QDialogButtonBox.RestoreDefaults)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self._revert_and_reject)
+        buttons.button(QDialogButtonBox.RestoreDefaults).clicked.connect(self._defaults)
+        layout.addWidget(buttons, alignment=Qt.AlignRight)
+        self._sync_enabled()
+
+    @staticmethod
+    def _spec(key):
+        for dial in core.DepthSettings.DIALS:
+            if dial[0] == key:
+                return dial
+        raise KeyError(key)
+
+    def _to_slider(self, key, value):
+        _, _, low, high, step, _ = self._spec(key)
+        return int(round((min(max(value, low), high) - low) / step))
+
+    def _from_slider(self, key, position):
+        _, _, low, _, step, _ = self._spec(key)
+        return low + position * step
+
+    def _show_value(self, key):
+        value = getattr(self.settings, key)
+        # Whole pixels read as whole pixels; a fraction needs its decimals.
+        text = f"{value:.0f}" if key == "dilate" else f"{value:.2f}"
+        self.value_labels[key].setText(text)
+
+    def _on_enabled(self, checked):
+        self._sync_enabled()
+        self.on_change()
+
+    def _sync_enabled(self):
+        for slider in self.sliders.values():
+            slider.setEnabled(self.enabled_box.isChecked())
+
+    def _on_slider(self, key, position):
+        setattr(self.settings, key, self._from_slider(key, position))
+        self._show_value(key)
+        self._preview_timer.start()
+
+    def _defaults(self):
+        fresh = core.DepthSettings()
+        for name, _, _, _, _, _ in core.DepthSettings.DIALS:
+            self.sliders[name].setValue(self._to_slider(name, getattr(fresh, name)))
+
+    def is_enabled(self) -> bool:
+        return self.enabled_box.isChecked()
+
+    def is_plate_enabled(self) -> bool:
+        return self.plate_box.isChecked()
+
+    def _revert_and_reject(self):
+        for key, value in self.original.items():
+            setattr(self.settings, key, value)
+        self.enabled_box.setChecked(self.original_enabled)
+        self.plate_box.setChecked(self.original_plate)
         self.on_change()
         self.reject()
 
@@ -1644,6 +1812,13 @@ class Placement:
         # tracking pass keeps these and re-anchors itself to them instead of
         # writing over them; see CentralPanel.track_placement.
         self.manual_frames = set()
+        # The panel's own artwork as an occlusion reference, learned from the
+        # tracked shot (core.build_surface_plate). Derived data: never saved,
+        # rebuilt whenever the fingerprint of what it was learned from stops
+        # matching. A fingerprint with no plate records a refusal, so a
+        # screen's moving picture is not re-tested on every frame.
+        self.surface_plate = None
+        self.plate_fingerprint = None
 
         # Creative
         self.overlay_bgra = None
@@ -2626,32 +2801,6 @@ class TitleBar(QWidget):
         self.obstruction_action.toggled.connect(self.parent.toggle_obstructions)
         options_menu.addAction(self.obstruction_action)
 
-        # How readily it calls something an obstruction. Turn it down when the
-        # artwork already on the billboard has depth in it -- a road running
-        # away, a face leaning out -- and holes start opening in the creative;
-        # turn it up when something really in front is being painted over.
-        sensitivity_menu = QMenu("Obstruction sensitivity", self.menu)
-        self.sensitivity_group = QActionGroup(self)
-        self.sensitivity_group.setExclusive(True)
-        self.sensitivity_actions = {}
-        for level, label, hint in (
-                ("low", "Low",
-                 "For artwork with strong depth in it: fewest false holes, and "
-                 "the faintest obstructions are missed"),
-                ("normal", "Normal", "The measured balance between the two"),
-                ("high", "High",
-                 "Finds the faintest obstructions, and is likeliest to mistake "
-                 "the billboard's own picture for one")):
-            action = QAction(label, self, checkable=True)
-            action.setToolTip(hint)
-            action.setChecked(level == "normal")
-            action.triggered.connect(
-                lambda _checked, name=level:
-                self.parent.set_obstruction_sensitivity(name))
-            self.sensitivity_group.addAction(action)
-            sensitivity_menu.addAction(action)
-            self.sensitivity_actions[level] = action
-        options_menu.addMenu(sensitivity_menu)
 
         self.steady_tracking_action = QAction(
             "Steady the tracked path", self, checkable=True)
@@ -2781,6 +2930,7 @@ class LeftColumn(QWidget):
     contrastClicked = pyqtSignal()
     colouriseClicked = pyqtSignal(bool)
     blendClicked = pyqtSignal()
+    obstructionsClicked = pyqtSignal()
     curveClicked = pyqtSignal(bool)
     clearClicked = pyqtSignal()
     
@@ -2790,12 +2940,13 @@ class LeftColumn(QWidget):
         self.setStyleSheet("background-color: #1A1A1A;")
 
         layout = QVBoxLayout()
-        # Nine tools at 52 high with 15 between them wanted 588px of column,
-        # against the 580 a 1024x640 window leaves -- so Render still fell off
-        # the bottom. Tighter margins and spacing give the whole set room with
-        # a little to spare.
-        layout.setContentsMargins(0, 8, 0, 8)
-        layout.setSpacing(6)
+        # The whole set has to fit the 577px a 1024x640 window leaves for this
+        # column, and each tool is 52 high. Ten of them at 6 apart wanted 590
+        # and pushed Render off the bottom; 4 apart with slimmer margins wants
+        # 568, which leaves room to spare but not much -- an eleventh tool will
+        # need the icons themselves to shrink.
+        layout.setContentsMargins(0, 6, 0, 6)
+        layout.setSpacing(4)
 
         # Emoji render inconsistently across Windows builds and several of
         # these are hard to tell apart at 20px, so every tool carries a tooltip
@@ -2816,6 +2967,10 @@ class LeftColumn(QWidget):
             ("🌫", "Blend", "Match the creative's lighting, softness, grain and\n"
                             "motion blur to the footage, so it does not look\n"
                             "pasted on."),
+            ("🚧", "Behind", "Let railings, posts, signs and anything else in\n"
+                             "front of the surface stay in front of the\n"
+                             "creative, with dials for how readily something\n"
+                             "counts as being in front."),
             ("❌", "Clear", "Remove the tracking from every frame."),
             ("📼", "Render", "Export the video with the creative composited in."),
         ]
@@ -2852,7 +3007,7 @@ class LeftColumn(QWidget):
     # Toggles that stand for a mode rather than a one-off action. Clearing
     # their highlight when a different icon is clicked would leave the lamp
     # off while the mode was still on, so they keep their state.
-    STATEFUL_ICONS = ("Draw", "Colourise", "Curve")
+    STATEFUL_ICONS = ("Draw", "Colourise", "Curve", "Behind")
 
     def make_icon_click_handler(self, icon_widget, original_mouse_press):
         def handler(event):
@@ -2894,6 +3049,11 @@ class LeftColumn(QWidget):
                 if is_selected:
                     self.blendClicked.emit()
                 icon_widget.set_selected(False)   # opens a dialog, not a mode
+            elif text == "Behind":
+                # Opens the dialog either way; whether it stays lit is decided
+                # by what the dialog is left saying, not by the click, so the
+                # lamp cannot end up disagreeing with the setting.
+                self.obstructionsClicked.emit()
             elif text == "Curve":
                 self.curveClicked.emit(is_selected)  # Also a state, keep it lit
             elif text == "Clear":
@@ -2903,8 +3063,8 @@ class LeftColumn(QWidget):
 
             # After any icon interaction, ensure focus is correct.
             main_window = self.get_main_window()
-            if main_window and main_window.central_panel.tracking_mode:
-                main_window.central_panel.tracking_overlay.setFocus()
+            if main_window:
+                main_window.central_panel.restore_drawing_focus()
 
         return handler
 
@@ -2963,10 +3123,14 @@ class CentralPanel(QWidget):
         self.depth_segmenter = None
         self.obstruction_enabled = False
         # How readily something counts as standing in front of the surface.
-        # A setting rather than a constant because what defeats the depth
-        # network is the picture already on the billboard, and how much depth
-        # that picture depicts is not something the tool can know.
-        self.obstruction_sensitivity = "normal"
+        # Dials rather than constants because what defeats the depth network is
+        # the picture already on the billboard, and how much depth that picture
+        # depicts is not something the tool can know.
+        self.depth_settings = core.DepthSettings()
+        # The artwork cue runs alongside depth wherever it can serve --
+        # printed surfaces with enough tracking to learn from. One switch for
+        # the user; the per-placement gates live in plate_for.
+        self.plate_enabled = True
         self._occlusion_cache = None
 
         # Fitting a smooth path through the recorded corners, for both the
@@ -3914,30 +4078,84 @@ class CentralPanel(QWidget):
         union = core.union_quad([p.points for p in placements
                                  if len(p.points) == 4])
         if union is None:
-            return self.combined_occlusion(frame, None)
+            return self.combined_occlusion(frame, None, placements)
         cell = (tuple(int(v) // 32 for v in union.reshape(-1)),
-                self.occlusion_enabled, self.obstruction_enabled)
+                self.occlusion_enabled, self.obstruction_enabled,
+                self.plate_enabled,
+                tuple(self._history_fingerprint(p) for p in placements))
         cached = self._occlusion_cache
         if (cached is not None and cached[0] is frame and cached[1] == cell):
             return cached[2]
-        mask = self.combined_occlusion(frame, union)
+        mask = self.combined_occlusion(frame, union, placements)
         self._occlusion_cache = (frame, cell, mask)
         return mask
 
-    def combined_occlusion(self, frame, quad):
-        """Both kinds of occlusion in one mask, or None when neither applies.
+    def combined_occlusion(self, frame, quad, placements=()):
+        """Every occlusion source in one mask, or None when none applies.
 
-        They overlap happily -- a pedestrian behind a railing is found twice --
-        so the two are merged by taking whichever holds the creative back more
-        at each pixel, and a placement is drawn behind the union of them.
+        They overlap happily -- a pedestrian behind a railing is found by two
+        of them -- so the sources are merged by taking whichever holds the
+        creative back more at each pixel, and a placement is drawn behind the
+        union of them.
         """
-        person = self.occlusion_mask(frame, quad)
-        depth = self.obstruction_mask(frame, quad)
-        if person is None:
-            return depth
-        if depth is None:
-            return person
-        return cv2.max(person, depth)
+        combined = None
+        for source in (self.occlusion_mask(frame, quad),
+                       self.obstruction_mask(frame, quad),
+                       *(self.plate_mask(frame, p) for p in placements)):
+            if source is None:
+                continue
+            combined = source if combined is None else cv2.max(combined, source)
+        return combined
+
+    def _history_fingerprint(self, placement):
+        """A cheap stand-in for "has what the plate was learned from changed".
+
+        Checked on every composite, so it has to cost nearly nothing; missing
+        an exotic edit merely leaves a slightly stale plate until the next
+        real change. The video path is part of it -- a plate learned from one
+        clip must not survive into another.
+        """
+        history = placement.tracking_history
+        if not history:
+            return (getattr(self, "current_video_path", None), 0)
+        keys = sorted(history)
+        middle = history[keys[len(keys) // 2]]
+        return (getattr(self, "current_video_path", None), len(keys),
+                keys[0], keys[-1],
+                int(sum(x + y for x, y in middle)) if middle else 0)
+
+    def plate_mask(self, frame, placement):
+        """The artwork cue's mask for one placement, or None where it cannot serve.
+
+        It cannot serve a digital screen (the artwork moves -- that is what
+        SURROUND tracking mode means, and build_surface_plate refuses such
+        footage on its own evidence too), a placement with too little
+        tracking, or a frame while a tracking pass is actively rewriting the
+        history -- the plate already learned keeps serving through the pass
+        and is refreshed at the first composite after it.
+        """
+        if (not self.obstruction_enabled or not self.plate_enabled
+                or frame is None
+                or placement.feature_source == core.PlanarTracker.SURROUND
+                or not getattr(self, "current_video_path", "")):
+            return None
+
+        fingerprint = self._history_fingerprint(placement)
+        stale = placement.plate_fingerprint != fingerprint
+        if stale and not (self.tracking_mode
+                          and placement.surface_plate is not None):
+            placement.surface_plate = core.build_surface_plate(
+                self.current_video_path, placement.tracking_history)
+            placement.plate_fingerprint = fingerprint
+
+        plate = placement.surface_plate
+        if plate is None or len(placement.points) != 4:
+            return None
+        try:
+            return plate.mask(frame, placement.points)
+        except cv2.error as exc:
+            logging.warning("Artwork comparison failed on this frame: %s", exc)
+            return None
 
     def occlusion_mask(self, frame, quad):
         """A mask of people in front of the surface, or None if switched off."""
@@ -3962,8 +4180,8 @@ class CentralPanel(QWidget):
             return None
         if self.depth_segmenter is None:
             try:
-                self.depth_segmenter = core.DepthOcclusionSegmenter(
-                    floor_rel=core.DEPTH_SENSITIVITY[self.obstruction_sensitivity])
+                self.depth_segmenter = core.DepthOcclusionSegmenter.from_settings(
+                    self.depth_settings)
             except (FileNotFoundError, IOError) as exc:
                 logging.warning("Obstruction occlusion unavailable: %s", exc)
                 self.obstruction_enabled = False
@@ -4693,6 +4911,10 @@ class PlacementSnapshot:
         self.morph = morphlib.Morph.from_dict(placement.morph.to_dict())
         self.shape_cache = morphlib.ShapeCache()
         self.scale = scale
+        self.feature_source = getattr(placement, "feature_source",
+                                      core.PlanarTracker.INTERIOR)
+        # The artwork reference, built by the worker once the range is known.
+        self.plate = None
         # Per-placement decode state, filled in by the worker.
         self.capture = None
         self.cursor = -1
@@ -4719,7 +4941,7 @@ class RenderSettings:
                  blend_settings=None, placements=None, morph=None,
                  deflicker_gains=None, obstructions=False,
                  steady_tracking=False, steady_window=core.STEADY_WINDOW,
-                 obstruction_sensitivity="normal"):
+                 depth_settings=None, plate_enabled=True):
         self.base_video_path = base_video_path
         self.out_path = out_path
         self.start_frame = int(start_frame)
@@ -4740,9 +4962,13 @@ class RenderSettings:
         # threads, so the worker builds its own of each.
         self.occlusion = occlusion
         self.obstructions = bool(obstructions)
-        self.obstruction_sensitivity = (
-            obstruction_sensitivity if obstruction_sensitivity
-            in core.DEPTH_SENSITIVITY else "normal")
+        # A copy, so moving a dial mid-render cannot change what is being
+        # written; the same reason everything else here is detached.
+        self.depth = core.DepthSettings.from_dict(
+            (depth_settings or core.DepthSettings()).to_dict())
+        # Whether the artwork cue may run; the plates themselves are built by
+        # the worker from each placement's history, not carried across.
+        self.plate_enabled = bool(plate_enabled)
         # Steadying is applied to the recorded corners here rather than left to
         # the preview, or the file would be written from the raw path the
         # preview had already stopped showing.
@@ -4951,14 +5177,25 @@ class RenderWorker(QObject):
             depth_segmenter = None
             if settings.obstructions:
                 try:
-                    depth_segmenter = core.DepthOcclusionSegmenter(
-                        floor_rel=core.DEPTH_SENSITIVITY[
-                            settings.obstruction_sensitivity])
+                    depth_segmenter = core.DepthOcclusionSegmenter.from_settings(
+                        settings.depth)
                 except (FileNotFoundError, IOError) as exc:
                     logging.warning("Rendering without obstruction occlusion: %s",
                                     exc)
                     caveats.append("the depth model is missing, so obstructions "
                                    "in front of the surface were painted over")
+
+            if settings.obstructions and settings.plate_enabled:
+                for placement in placements:
+                    if placement.feature_source == core.PlanarTracker.SURROUND:
+                        continue
+                    placement.plate = core.build_surface_plate(
+                        settings.base_video_path, placement.history)
+                    if placement.plate is None:
+                        caveats.append(
+                            f"the artwork of {placement.name} could not serve "
+                            "as an occlusion reference, so obstructions there "
+                            "rely on the depth model alone")
 
             frame_counter = 0
 
@@ -5004,6 +5241,20 @@ class RenderWorker(QObject):
                         except cv2.error as exc:
                             logging.warning("Depth estimation failed on frame "
                                             "%d: %s", frame_idx, exc)
+
+                for placement in placements:
+                    quad = placement.dense.get(frame_idx)
+                    if placement.plate is None or quad is None:
+                        continue
+                    try:
+                        from_plate = placement.plate.mask(
+                            base_frame, np.float32(quad) * placement.scale)
+                    except cv2.error as exc:
+                        logging.warning("Artwork comparison failed on frame "
+                                        "%d: %s", frame_idx, exc)
+                        continue
+                    occlusion = (from_plate if occlusion is None
+                                 else cv2.max(occlusion, from_plate))
 
                 for placement in placements:
                     base_frame = self._draw_placement(
@@ -5451,6 +5702,7 @@ class MainWindow(QMainWindow):
         self.left_col.contrastClicked.connect(self.on_contrast_clicked)
         self.left_col.colouriseClicked.connect(self.on_colourise_clicked)
         self.left_col.blendClicked.connect(self.open_blend_dialog)
+        self.left_col.obstructionsClicked.connect(self.on_obstructions_clicked)
         self.left_col.curveClicked.connect(self.toggle_curved_edges)
         self.left_col.clearClicked.connect(self.on_clear_clicked)
 
@@ -5624,7 +5876,8 @@ class MainWindow(QMainWindow):
             colourise=overlay.colourise_enabled,
             occlusion=panel.occlusion_enabled,
             obstructions=panel.obstruction_enabled,
-            obstruction_sensitivity=panel.obstruction_sensitivity,
+            depth_settings=panel.depth_settings,
+            plate_enabled=panel.plate_enabled,
             steady_tracking=panel.steady_tracking,
             steady_window=panel.steady_window,
             blend_settings=blend.BlendSettings.from_dict(overlay.blend.to_dict()),
@@ -6042,33 +6295,66 @@ class MainWindow(QMainWindow):
             panel.segmenter = None
         panel.refresh_display()
 
-    def set_obstruction_sensitivity(self, level: str):
-        """How readily something counts as standing in front of the surface.
+    def apply_depth_settings(self):
+        """Put the dials into effect, in the preview and so in the render.
 
-        The segmenter is dropped rather than adjusted: it holds the setting it
-        was built with, and rebuilding it on the next masked frame is what puts
-        the new one into both the preview and the render.
+        The segmenter is dropped rather than adjusted: it holds the numbers it
+        was built with, and rebuilding it on the next masked frame is what
+        carries a moved dial through. The cache goes too, or the frame on
+        screen would keep the mask it was given before the change.
         """
         panel = self.central_panel
-        if level not in core.DEPTH_SENSITIVITY:
-            # Not reachable from the menu, but a caller that gets it wrong must
-            # not leave the tick sitting against a setting nothing is using.
-            self.refresh_sensitivity_action()
-            return
-        panel.obstruction_sensitivity = level
-        self.refresh_sensitivity_action()
         panel.depth_segmenter = None
         panel._occlusion_cache = None
         panel.refresh_display()
 
-    def refresh_sensitivity_action(self):
-        """Tick the sensitivity actually in use, whatever asked for it."""
-        actions = getattr(self.title_bar, "sensitivity_actions", None)
-        if not actions:
+    def on_obstructions_clicked(self):
+        """The sidebar tool: the switch and its dials in one place."""
+        panel = self.central_panel
+        if not panel.obstruction_enabled and not core.DepthOcclusionSegmenter.is_available():
+            self.warn_depth_model_missing()
+            self.refresh_obstruction_lamp()
             return
-        current = self.central_panel.obstruction_sensitivity
-        for level, action in actions.items():
-            action.setChecked(level == current)
+
+        dialog = ObstructionDialog(panel.depth_settings, panel.obstruction_enabled,
+                                   self._preview_obstructions,
+                                   plate_enabled=panel.plate_enabled, parent=self)
+        before = panel.obstruction_enabled
+        before_plate = panel.plate_enabled
+        accepted = dialog.exec_() == QDialog.Accepted
+        panel.obstruction_enabled = dialog.is_enabled() if accepted else before
+        panel.plate_enabled = (dialog.is_plate_enabled() if accepted
+                               else before_plate)
+        if not panel.obstruction_enabled:
+            panel.depth_segmenter = None
+        self.refresh_obstruction_lamp()
+        self.apply_depth_settings()
+
+    def _preview_obstructions(self):
+        """What the dialog calls as a dial moves: show it on this frame."""
+        panel = self.central_panel
+        dialog = self.findChild(ObstructionDialog)
+        panel.obstruction_enabled = (dialog.is_enabled() if dialog
+                                     else panel.obstruction_enabled)
+        panel.plate_enabled = (dialog.is_plate_enabled() if dialog
+                               else panel.plate_enabled)
+        self.apply_depth_settings()
+
+    def obstruction_dialog_enabled(self) -> bool:
+        dialog = self.findChild(ObstructionDialog)
+        return dialog.is_enabled() if dialog else self.central_panel.obstruction_enabled
+
+    def refresh_obstruction_lamp(self):
+        """Keep the sidebar lamp and the menu tick on the actual setting."""
+        enabled = self.central_panel.obstruction_enabled
+        action = getattr(self.title_bar, "obstruction_action", None)
+        if action is not None and action.isChecked() != enabled:
+            action.blockSignals(True)
+            action.setChecked(enabled)
+            action.blockSignals(False)
+        for icon in self.left_col.icons:
+            if icon.meaning_label.text() == "Behind":
+                icon.set_selected(enabled)
 
     def toggle_steady_tracking(self, enabled: bool):
         """Fit a smooth path through the recorded corners, for preview and file.
@@ -6086,19 +6372,25 @@ class MainWindow(QMainWindow):
         panel = self.central_panel
 
         if enabled and not core.DepthOcclusionSegmenter.is_available():
-            QMessageBox.warning(
-                self, "Model Not Found",
-                "The depth model is missing.\n\n"
-                "Run fetch_model.py to download it (about 64 MB), or place "
-                f"{core.DepthOcclusionSegmenter.MODEL_FILENAME} in a 'models' "
-                "folder beside the application.")
+            self.warn_depth_model_missing()
             self.title_bar.obstruction_action.setChecked(False)
             return
 
         panel.obstruction_enabled = enabled
         if not enabled:
             panel.depth_segmenter = None
+        self.refresh_obstruction_lamp()
         panel.refresh_display()
+
+    def warn_depth_model_missing(self):
+        """Said the same way wherever the option is reached from."""
+        QMessageBox.warning(
+            self, "Model Not Found",
+            "No depth model is present.\n\n"
+            "Run fetch_model.py to download them, or place "
+            f"{core.DepthOcclusionSegmenter.PREFERRED_FILENAME} or "
+            f"{core.DepthOcclusionSegmenter.MODEL_FILENAME} in a 'models' "
+            "folder beside the application.")
 
     def toggle_previous_positions(self, enabled: bool):
         """Mark each corner's previous-frame position in the magnifier tiles."""

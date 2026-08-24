@@ -853,64 +853,111 @@ class TestCorrectionsAreKept:
         assert galileo_app.Placement.from_dict(older).manual_frames == set()
 
 
-class TestObstructionSensitivity:
-    """How readily something counts as being in front of the surface is a
-    setting, because what defeats the depth network is the picture already on
-    the billboard and the tool cannot know how much depth that picture has in
-    it."""
+class TestTheObstructionTool:
+    """The sidebar tool, its lamp, and the dials behind it."""
 
-    def test_it_starts_at_the_measured_middle(self, loaded):
+    def test_it_is_in_the_sidebar_and_holds_its_state(self, loaded):
         window, path, truth = loaded
-        assert window.central_panel.obstruction_sensitivity == "normal"
+        labels = [icon.meaning_label.text() for icon in window.left_col.icons]
+        assert "Behind" in labels
+        # A mode, not a one-shot action: the lamp has to survive other clicks.
+        assert "Behind" in galileo_app.LeftColumn.STATEFUL_ICONS
 
-    def test_each_level_reaches_the_render(self, loaded, logo_bgra, tmp_path):
+    def test_it_starts_from_the_measured_settings(self, loaded):
         window, path, truth = loaded
-        overlay = window.central_panel.tracking_overlay
+        assert window.central_panel.depth_settings == core.DepthSettings()
+
+    def test_the_dials_cover_their_stated_range(self, loaded):
+        window, path, truth = loaded
+        settings = window.central_panel.depth_settings
+        dialog = galileo_app.ObstructionDialog(settings, False, lambda: None)
+
+        for name, _, low, high, _, _ in core.DepthSettings.DIALS:
+            slider = dialog.sliders[name]
+            slider.setValue(slider.maximum())
+            assert getattr(settings, name) == pytest.approx(high), name
+            slider.setValue(slider.minimum())
+            assert getattr(settings, name) == pytest.approx(low), name
+
+    def test_restoring_defaults_puts_every_dial_back(self, loaded):
+        window, path, truth = loaded
+        settings = window.central_panel.depth_settings
+        dialog = galileo_app.ObstructionDialog(settings, True, lambda: None)
+        for name, _, _, _, _, _ in core.DepthSettings.DIALS:
+            dialog.sliders[name].setValue(dialog.sliders[name].maximum())
+
+        dialog._defaults()
+        assert settings == core.DepthSettings()
+
+    def test_cancelling_puts_back_what_was_there(self, loaded):
+        """The dials change the preview as they move, so cancel has real work
+        to do -- the frame on screen is already showing the new numbers."""
+        window, path, truth = loaded
+        settings = window.central_panel.depth_settings
+        settings.floor_rel = 0.22
+        before = settings.to_dict()
+
+        dialog = galileo_app.ObstructionDialog(settings, True, lambda: None)
+        dialog.sliders["floor_rel"].setValue(dialog.sliders["floor_rel"].maximum())
+        assert settings.to_dict() != before
+        dialog._revert_and_reject()
+        assert settings.to_dict() == before
+
+    def test_moving_a_dial_shows_it_on_the_frame(self, loaded):
+        """Every dial has to reach the preview, or it cannot be judged."""
+        window, path, truth = loaded
+        seen = []
+        dialog = galileo_app.ObstructionDialog(
+            window.central_panel.depth_settings, True, lambda: seen.append(1))
+        dialog._preview_timer.setInterval(0)
+        dialog.sliders["k"].setValue(dialog.sliders["k"].maximum())
+        QTest.qWait(30)
+        assert seen, "moving a dial never refreshed the preview"
+
+    def test_the_dials_reach_the_render_detached(self, loaded, logo_bgra, tmp_path):
+        window, path, truth = loaded
+        panel = window.central_panel
+        overlay = panel.tracking_overlay
         overlay.overlay_bgra = logo_bgra
         overlay.tracking_history = {0: [tuple(map(float, p)) for p in truth[0]]}
 
-        for level in ("low", "high", "normal"):
-            window.set_obstruction_sensitivity(level)
-            settings = window.build_render_settings(
-                0, 2, 1.0, str(tmp_path / "o.mp4"))
-            assert settings.obstruction_sensitivity == level
-            assert (core.DEPTH_SENSITIVITY[settings.obstruction_sensitivity]
-                    == core.DEPTH_SENSITIVITY[level])
+        panel.depth_settings.floor_rel = 0.33
+        panel.depth_settings.k = 9.0
+        settings = window.build_render_settings(0, 2, 1.0, str(tmp_path / "o.mp4"))
+        assert settings.depth.floor_rel == pytest.approx(0.33)
+        assert settings.depth.k == pytest.approx(9.0)
 
-    def test_changing_it_rebuilds_the_segmenter(self, loaded):
-        """It holds the setting it was built with, so the old one has to go or
-        the preview would go on masking to the setting just replaced."""
+        # A copy: moving a dial mid-render must not change what is written.
+        panel.depth_settings.floor_rel = 0.05
+        assert settings.depth.floor_rel == pytest.approx(0.33)
+
+    def test_the_lamp_and_the_menu_agree_with_the_setting(self, loaded, monkeypatch):
         window, path, truth = loaded
         panel = window.central_panel
-        panel.depth_segmenter = object()
-        window.set_obstruction_sensitivity("low")
-        assert panel.depth_segmenter is None
+        monkeypatch.setattr(core.DepthOcclusionSegmenter, "is_available",
+                            classmethod(lambda cls: True))
 
-    def test_the_menu_shows_what_is_in_use(self, loaded):
+        window.toggle_obstructions(True)
+        lamp = next(icon for icon in window.left_col.icons
+                    if icon.meaning_label.text() == "Behind")
+        assert panel.obstruction_enabled and lamp.selected
+        assert window.title_bar.obstruction_action.isChecked()
+
+        window.toggle_obstructions(False)
+        assert not panel.obstruction_enabled and not lamp.selected
+
+    def test_without_the_model_the_tool_says_so_and_stays_off(self, loaded,
+                                                              monkeypatch):
         window, path, truth = loaded
-        window.set_obstruction_sensitivity("low")
-        ticked = [level for level, action
-                  in window.title_bar.sensitivity_actions.items()
-                  if action.isChecked()]
-        assert ticked == ["low"]
+        monkeypatch.setattr(core.DepthOcclusionSegmenter, "is_available",
+                            classmethod(lambda cls: False))
+        warned = []
+        monkeypatch.setattr(galileo_app.QMessageBox, "warning",
+                            staticmethod(lambda *a, **k: warned.append(a)))
 
-    def test_a_level_it_does_not_know_is_refused(self, loaded):
-        window, path, truth = loaded
-        panel = window.central_panel
-        window.set_obstruction_sensitivity("normal")
-        window.set_obstruction_sensitivity("very high indeed")
-        assert panel.obstruction_sensitivity == "normal"
-        ticked = [level for level, action
-                  in window.title_bar.sensitivity_actions.items()
-                  if action.isChecked()]
-        assert ticked == ["normal"], "the tick drifted off what is in use"
-
-    def test_settings_built_the_old_way_still_work(self, loaded):
-        """RenderSettings is constructed positionally in places."""
-        settings = galileo_app.RenderSettings(
-            "video.mp4", "out.mp4", 0, 1, 1.0, 25.0, {},
-            np.zeros((4, 2, 2), np.float32), False)
-        assert settings.obstruction_sensitivity == "normal"
+        window.on_obstructions_clicked()
+        assert warned, "no warning shown for the missing model"
+        assert window.central_panel.obstruction_enabled is False
 
 
 class TestTheKeyboardStaysWithTheDrawingTools:
@@ -976,3 +1023,99 @@ class TestTheKeyboardStaysWithTheDrawingTools:
         panel.slider.setFocus()
         panel.on_forward()
         assert window.focusWidget() is not overlay
+
+
+class TestTheArtworkCue:
+    """The plate's plumbing: who may use it, when it renews, and that the
+    preview and the render are provably looking at the same one."""
+
+    def tracked(self, window, truth, path):
+        panel = window.central_panel
+        placement = panel.tracking_overlay.placements[0]
+        placement.points = [tuple(map(float, p)) for p in truth[0]]
+        placement.tracking_history = {
+            i: [tuple(map(float, p)) for p in quad]
+            for i, quad in enumerate(truth)}
+        panel.obstruction_enabled = True
+        return panel, placement
+
+    def test_preview_and_render_build_the_same_plate(self, loaded):
+        """Each side builds its own from the history and the video; they must
+        agree to the last bit or the file differs from what was approved."""
+        window, path, truth = loaded
+        panel, placement = self.tracked(window, truth, path)
+
+        preview_mask = panel.plate_mask(panel.prev_frame, placement)
+        assert preview_mask is not None, "the preview never built a plate"
+
+        render_plate = core.build_surface_plate(path, placement.tracking_history)
+        render_mask = render_plate.mask(panel.prev_frame,
+                                        np.float32(placement.points))
+        assert np.array_equal(preview_mask, render_mask)
+
+    def test_a_digital_screen_placement_is_left_to_depth(self, loaded):
+        window, path, truth = loaded
+        panel, placement = self.tracked(window, truth, path)
+        placement.feature_source = core.PlanarTracker.SURROUND
+        assert panel.plate_mask(panel.prev_frame, placement) is None
+
+    def test_switching_the_cue_off_switches_it_off(self, loaded):
+        window, path, truth = loaded
+        panel, placement = self.tracked(window, truth, path)
+        panel.plate_enabled = False
+        assert panel.plate_mask(panel.prev_frame, placement) is None
+
+    def test_the_plate_is_not_rebuilt_mid_pass(self, loaded):
+        """A tracking pass rewrites the history on every frame; rebuilding a
+        half-second plate per frame would end playback. The one already
+        learned keeps serving until the pass is over."""
+        window, path, truth = loaded
+        panel, placement = self.tracked(window, truth, path)
+
+        panel.plate_mask(panel.prev_frame, placement)
+        first = placement.surface_plate
+        assert first is not None
+
+        panel.tracking_mode = True
+        placement.tracking_history[999] = placement.tracking_history[0]
+        panel.plate_mask(panel.prev_frame, placement)
+        assert placement.surface_plate is first, "rebuilt during the pass"
+
+        panel.tracking_mode = False
+        panel.plate_mask(panel.prev_frame, placement)
+        assert placement.surface_plate is not first, "never refreshed after it"
+
+    def test_a_refusal_is_remembered_rather_than_retried(self, loaded, monkeypatch):
+        window, path, truth = loaded
+        panel, placement = self.tracked(window, truth, path)
+        calls = []
+        monkeypatch.setattr(core, "build_surface_plate",
+                            lambda *a, **k: calls.append(1))
+        panel.plate_mask(panel.prev_frame, placement)
+        panel.plate_mask(panel.prev_frame, placement)
+        assert len(calls) == 1, "an unusable plate was re-learned per frame"
+
+    def test_the_flag_reaches_the_render_settings(self, loaded, logo_bgra, tmp_path):
+        window, path, truth = loaded
+        overlay = window.central_panel.tracking_overlay
+        overlay.overlay_bgra = logo_bgra
+        overlay.points = [tuple(map(float, p)) for p in truth[0]]
+        overlay.tracking_history = {0: [tuple(map(float, p)) for p in truth[0]]}
+
+        window.central_panel.plate_enabled = False
+        settings = window.build_render_settings(0, 2, 1.0, str(tmp_path / "o.mp4"))
+        assert settings.plate_enabled is False
+        snapshot = settings.placements[0]
+        assert snapshot.feature_source == core.PlanarTracker.INTERIOR
+        assert snapshot.plate is None
+
+    def test_the_dialog_checkbox_round_trips(self, loaded):
+        window, path, truth = loaded
+        panel = window.central_panel
+        dialog = galileo_app.ObstructionDialog(
+            panel.depth_settings, True, lambda: None, plate_enabled=True)
+        assert dialog.is_plate_enabled() is True
+        dialog.plate_box.setChecked(False)
+        assert dialog.is_plate_enabled() is False
+        dialog._revert_and_reject()
+        assert dialog.is_plate_enabled() is True, "cancel did not restore it"

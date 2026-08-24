@@ -78,7 +78,7 @@ macOS, `~/.local/share/Galileo` on Linux). Set the environment variable
 | Options → Steady the tracked path | Take the wobble out of the tracked shape |
 | Options → Draw behind people | Let passers-by cross in front of the creative |
 | Options → Draw behind obstructions | Let railings, posts and signs stay in front of it |
-| Options → Obstruction sensitivity | How readily something counts as being in front |
+| *Behind* tool (left toolbar) | The same switch, with dials for how readily something counts as being in front |
 
 Brightness, contrast and colourise adjustments for the inserted creative are
 available from the left toolbar, and all three apply to the render as well as
@@ -137,7 +137,7 @@ creative back where they are, so they pass in front of it.
 This needs a model file, which is not committed to the repository:
 
 ```bash
-python fetch_model.py      # both models, once
+python fetch_model.py      # all three models, once
 ```
 
 It runs through OpenCV's own DNN module, so there is no extra dependency to
@@ -149,8 +149,9 @@ Note that this segments *people* specifically. For everything else, see below.
 ## Occlusion — anything else in front
 
 A street is full of things that are not people: railings along a walkway, a
-lamppost, a sign, a passing bus. **Options → Draw behind obstructions** handles
-all of them, and it does so without being told what any of them are.
+lamppost, a sign, a passing bus. The **Behind** tool in the left toolbar — or
+**Options → Draw behind obstructions**, which is the same switch — handles all
+of them, and does so without being told what any of them are.
 
 There is no list of objects to recognise, because there could not be one. What
 every obstruction has in common is not what it looks like but where it is: in
@@ -179,16 +180,34 @@ The two occlusion options are independent and combine — with both on, a
 pedestrian behind a railing is drawn in front of the creative once, from
 whichever source found more of them.
 
-Measured on an ordinary four-core desktop: **66 ms per frame at 1080p**, plus
-about 170 ms once when the model is first used. That is well below real-time
-playback, so the preview slows down noticeably while it is on; renders are
+Two depth models can serve, and the tool prefers the better one when its file
+is present. **Depth Anything V2 small** (Apache-2.0, about 99 MB — the exact
+export OpenCV pins in its own dnn test suite) sees what **MiDaS v2.1 small**
+(MIT, about 64 MB) structurally cannot. Measured across the drive-up, at the
+same dial settings:
+
+| | MiDaS v2.1 small | Depth Anything V2 small |
+| --- | --- | --- |
+| post crossing the hoarding | dips to 19% at one distance | 100% throughout |
+| railing bars of 2–14 px | 0% at every distance | 91–100% |
+| cost per frame, four-core desktop | ~66 ms | ~440 ms |
+
+Depth Anything is a transformer and loads on OpenCV 5's dnn engine only; on an
+older OpenCV, or when its file has not been fetched, MiDaS serves exactly as
+before — the fallback is automatic and logged. Both run through OpenCV's own
+DNN module, so neither adds a dependency. The preview slows down noticeably
+while the depth cue is on (more so under Depth Anything); renders are
 unaffected beyond taking longer.
 
-The model is MiDaS v2.1 small (MIT licensed, about 64 MB), fetched by
-`fetch_model.py` alongside the person model and run through the same OpenCV DNN
-module, so it adds no dependency either.
+One caution, measured and mutual: each model misreads a different kind of
+*depicted* content as standing off the panel. Giant flat lettering read as
+popped to Depth Anything on 45% of a synthetic test panel at any threshold,
+and banded gradient artwork read as off-plane to MiDaS on 46% — while
+photographic artwork sat at 2–3% for both. The artwork cue above and the
+sensitivity dials are the remedies; deleting `depth_anything_v2_small.onnx`
+from `models/` forces the MiDaS behaviour if a particular clip prefers it.
 
-### Sensitivity
+### The dials
 
 A hoarding is rarely blank, and a depth network reads the photograph on it as
 the scene it depicts rather than as ink on a flat panel. Where that reading
@@ -196,9 +215,22 @@ crosses the threshold, the creative is held back and the artwork already on the
 billboard shows through. Because the reading shifts frame to frame, it does not
 look like a steady error: holes flash open and shut for a frame at a time.
 
-The threshold that separates the two is expressed as a fraction of the scene's
-own depth range, since the model's output has no units and its scale changes
-every frame. Measured on a hoarding showing a road running away, under a pan:
+The **Behind** tool in the left toolbar is the switch and its dials in one
+place — the same feature as the menu item, and the lamp on the icon follows
+whichever one you use. Every dial recomposites the frame as it moves, because
+none of them can be judged from a number: the question is always whether the
+creative is being eaten by the billboard's own picture, or something really in
+front is being painted over, and only the shot answers that.
+
+| Dial | What it does |
+| --- | --- |
+| **In front by at least** | How far off the surface something must stand to count, as a fraction of the scene's depth range. The one that matters most. |
+| **Clear of the noise by** | The same demand in multiples of how ragged the surface's own depth reads — what holds the line where the model is unsure. |
+| **Grow the edges** | Widen what is found, in pixels. Depth edges land slightly inside the real object. |
+| **Soften the edges** | Blur the mask's edge, which also hides the frame-to-frame wobble in the model's boundaries. |
+
+The first dial starts at **0.15**, which is measured rather than picked.
+On a hoarding showing a road running away, under a pan:
 
 | | how far it stands off the surface |
 | --- | --- |
@@ -206,26 +238,96 @@ every frame. Measured on a hoarding showing a road running away, under a pan:
 | a lamppost across it | 0.41 |
 | railings across it | 0.86 |
 
-The default sits at **0.15** — clear of the artwork by half as much again, and
-far below either real obstruction. At the 0.10 it started out at, the advert
-crossed the line on 7 frames in 24; at 0.15, on none. It costs a little of the
-softest depth edges (railings went from 90% covered to 88%), which is the right
-way round: a hole in the creative is far more obvious than a slightly thin edge
-on the thing in front of it.
+At the 0.10 it started out at, the advert crossed the line on 7 frames in 24;
+at 0.15, on none. It costs a little of the softest depth edges (railings went
+from 90% covered to 88%), which is the right way round: a hole in the creative
+is far more obvious than a slightly thin edge on the thing in front of it.
 
-How much depth a given piece of artwork depicts is not something the tool can
-know, so **Options → Obstruction sensitivity** offers the trade rather than
-deciding it:
+**If the original creative flashes through, raise the first dial.** If
+something genuinely in front is being painted over, lower it. Around 0.28 is
+clean even on artwork with strong depth in it; below 0.10 is for faint
+obstructions on plain artwork. *Restore Defaults* puts every dial back to the
+measured setting, and *Cancel* puts back whatever you started the session with
+— the dials change the preview as they move, so cancel has real work to do.
 
-- **Low** — for artwork with strong depth in it, or anamorphic "3D" content
-  designed to defeat exactly this cue. Fewest false holes; the faintest
-  obstructions are missed.
-- **Normal** — the measured balance above.
-- **High** — the old behaviour. Finds the faintest obstructions, and is
-  likeliest to mistake the billboard's own picture for one.
+### The panel as its own reference
 
-If you see the original creative flashing through, turn it down; if something
-genuinely in front is being painted over, turn it up.
+The depth model is one witness; the artwork is another. For a printed
+hoarding, whatever is on the panel is fixed to it — so rectifying the tracked
+area to one canonical rectangle makes the artwork identical frame after frame,
+while anything standing in front of it, being nearer, slides across it as the
+viewpoint moves. A per-pixel median over the tracked shot is therefore a clean
+plate of the artwork, and wherever a frame disagrees with the plate, something
+is in front. The comparison happens at the panel's own on-screen resolution,
+with a one-pixel tolerance for tracking error, and it costs no download and no
+model.
+
+This cue exists because the depth model measurably cannot cover two things,
+and it covers both. Measured on the drive-up, through codec compression:
+
+| | depth model | artwork cue |
+| --- | --- | --- |
+| post at 18–45% of frame width | 0–7% of its pixels | 75–100% |
+| railing bars of 2–14 px | not seen | 55–75% |
+
+Its blind side is the mirror image, which is why the two run together rather
+than either replacing the other: an obstruction with nearly the artwork's own
+colour under-reads (measured no lower than 53%, a dark post over equally dark
+artwork — exactly where a depth step is large), it knows nothing outside the
+marked area, and a hard shadow crossing the panel is a photometric change it
+will mark as if it were an object.
+
+It refuses footage it cannot serve. A digital screen playing its own content
+disagrees with any plate everywhere; `build_surface_plate` measures that
+disagreement and returns nothing — measured 1.5 grey levels of median
+disagreement for a printed hoarding against 23 for a screen with modest scene
+changes, cut at 8 — and a placement in *Digital screen (track surroundings)*
+mode is never tried at all. Either way those fall back to depth alone, and a
+render says so in its completion notes. The checkbox in the *Behind* dialog
+turns the cue off entirely for shots where it misjudges.
+
+The plate is learned once from up to 24 tracked frames (about half a second),
+deterministically — the preview and the render each build their own from the
+same tracking and land on identical numbers, which is what keeps the file
+matching the screen. It refreshes when the tracking it was learned from
+changes, but never in the middle of a tracking pass.
+
+### Driving or walking past
+
+The footage this is pointed at is shot from a moving viewpoint, so a panel can
+go from a small distant rectangle to filling the frame inside one shot. That
+moves the ground under the threshold, because its scene-depth term is a
+fraction of the depth range of a padded crop around the panel — and on the way
+in, that crop stops being a scene. Measured on an approach with a post crossing
+the hoarding, the crop is **75% other things** while the panel is small and
+**2%** by the time it fills the frame. At that point the yardstick has quietly
+become the depth the *artwork* depicts, and **46%** of the creative was being
+masked.
+
+So the demand is stiffened in proportion to how little of the crop is anything
+else: below a quarter, up to three times stricter when there is nothing else at
+all. On the same approach that takes the worst false masking to **26%**, for
+73% of the post still found rather than 100%. Firmer settings keep cutting the
+false masking and cost more than they are worth — at four times, 16% masked but
+only 61% of the post found. It is gradual rather than a cliff, so a shot walks
+through it without the mask lurching on one frame, and a panel with room around
+it is judged exactly as before.
+
+**What this does not fix.** The depth model's behaviour still varies with
+distance more than one setting can absorb. On that same approach the post was
+found on 53% of its pixels at 10% of frame width, essentially missed between
+18% and 45%, and found in full at 65%. That middle stretch is the model
+failing to see the post as meaningfully nearer at all, not a threshold being
+wrong, and no amount of tuning recovers it — measured against four different
+ways of normalising the step, the steadiest still swung 18-fold across the
+approach. **On a printed hoarding that stretch is now covered by the artwork
+cue above**, which found the same post on 75–100% of its pixels at every
+distance — and with the Depth Anything model fetched, by the depth cue as
+well, which holds 100% throughout the approach where MiDaS dipped to 19%. On
+a digital screen playing its own content the artwork cue cannot run, so a
+screen on an old-OpenCV machine still carrying only MiDaS keeps the blind
+stretch: there, expect to use the dials on the part of the approach you care
+about, or to insert across a shorter range.
 
 ### Where it stops
 
@@ -244,7 +346,8 @@ failures rather than errors:
   one that shows up as a fault rather than a miss, and it has a control.
 - **An obstruction close to a very distant surface.** Depth separation shrinks
   with distance; something a metre in front of a billboard forty metres away is
-  below any honest threshold. A limit of monocular depth, not a setting.
+  below any honest threshold. A limit of monocular depth, not a setting — and
+  see *Driving or walking past* above for what that costs across an approach.
 - **Ground and objects just outside the marked area** that genuinely are nearer
   bleed a few pixels into the creative's edge, the same way the person mask
   does.
@@ -813,6 +916,8 @@ file, and the algorithms can be tested without a display.
 | `galileo_core.DepthOcclusionSegmenter` | Finds anything else in front of the surface, by depth |
 | `galileo_core.Region` | Four corners plus per-edge curvature |
 | `galileo_core.composite_region` | Alpha-correct perspective/curved warp and blend |
+| `galileo_core.DepthSettings` | The dials behind *Draw behind obstructions* |
+| `galileo_core.SurfacePlate` | The panel's own artwork as an occlusion reference |
 | `galileo_core.smooth_tracking` | Fits a smooth path through the recorded corners |
 | `galileo_core.interpolate_tracking` | Fills the gaps between tracked frames |
 | `galileo_core.remux_audio` | Copies the source audio onto a finished render |

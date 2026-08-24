@@ -272,18 +272,44 @@ class TestTheModel:
         assert float((mask[inside] > 127).mean()) < 0.02
 
     def test_something_standing_in_front_is_found(self):
+        """The scene must carry real depth cues -- sky, a ground plane, a post
+        whose ground contact sits well below the panel -- and the artwork must
+        be photographic in character. Two earlier versions of this test each
+        pinned an accident: a cue-free painted rectangle that only MiDaS fired
+        on (Depth Anything correctly read it as flat and failed by being
+        right), and giant flat SALE lettering that Depth Anything reads as
+        popped out of the panel at any threshold -- a real caution, recorded
+        in the README, but a property of cartoon text rather than of the
+        detector."""
         segmenter = core.DepthOcclusionSegmenter()
-        frame, panel = scene_with_a_panel()
-        cv2.rectangle(frame, (430, 0), (470, frame.shape[0]), (70, 70, 75), -1)
-        cv2.rectangle(frame, (430, 0), (470, frame.shape[0]), (25, 25, 28), 3)
+        height, width = 540, 960
+        frame = np.full((height, width, 3), 110, np.uint8)
+        frame[:200] = (215, 205, 195)                       # sky
+        for y in range(340, height):                        # receding ground
+            shade = int(58 + (y - 340) * 0.45)
+            frame[y, :] = (shade, shade, shade + 6)
+        panel = np.float32([[250, 210], [700, 205], [700, 360], [250, 365]])
+        # Photographic artwork -- a soft sky with a pale sun. Chosen by
+        # measurement, since each model pops a different kind of depicted
+        # content: banded gradients read as off-plane to MiDaS (46% falsely
+        # marked) and flat lettering to Depth Anything (45%), while both read
+        # this at 2-3%.
+        art = np.zeros((160, 450, 3), np.uint8)
+        for y in range(160):
+            t = y / 160
+            art[y, :] = (int(180 - 40 * t), int(160 - 30 * t),
+                         int(140 + 40 * t))
+        cv2.circle(art, (337, 56), 32, (200, 205, 225), -1)
+        frame[205:365, 250:700] = cv2.GaussianBlur(art, (31, 31), 9)
+        cv2.rectangle(frame, (430, 0), (466, height), (52, 52, 56), -1)
 
-        inside = core.quad_to_mask(panel, frame.shape[1], frame.shape[0]) > 127
+        inside = core.quad_to_mask(panel, width, height) > 127
         post = np.zeros(frame.shape[:2], bool)
-        post[:, 430:470] = True
+        post[:, 430:466] = True
 
         mask = segmenter.mask(frame, panel)
-        assert float((mask[post & inside] > 127).mean()) > 0.8
-        assert float((mask[inside & ~post] > 127).mean()) < 0.25
+        assert float((mask[post & inside] > 127).mean()) > 0.8, segmenter.model_name
+        assert float((mask[inside & ~post] > 127).mean()) < 0.25, segmenter.model_name
 
     def test_the_crop_keeps_the_mask_near_the_area(self):
         """Running on a crop is what keeps a distant railing big enough to
@@ -362,19 +388,190 @@ class TestThePictureAlreadyOnTheBillboard:
     def test_the_default_sits_between_the_two(self):
         assert 0.13 < core.DEPTH_FLOOR < 0.41
 
-    def test_sensitivity_trades_one_against_the_other(self, interior):
+    def test_the_dial_trades_one_against_the_other(self, interior):
         """Which way to lean is not something the tool can know -- it depends
-        on artwork it has never seen -- so it is offered rather than decided."""
+        on artwork it has never seen -- so it is a dial rather than a decision.
+        Turning it up holds back less, monotonically, which is what makes it
+        usable by eye."""
         borderline = self.depicted(0.20)
-        held = {level: marked(core.plane_deviation_mask(
-                    borderline, QUAD, floor_rel=floor),
-                    np.ones((HEIGHT, WIDTH), bool), interior)
-                for level, floor in core.DEPTH_SENSITIVITY.items()}
-        assert held["low"] < held["normal"] <= held["high"]
+        held = [marked(core.plane_deviation_mask(borderline, QUAD, floor_rel=f),
+                       np.ones((HEIGHT, WIDTH), bool), interior)
+                for f in (0.05, 0.15, 0.30, 0.50)]
+        assert held == sorted(held, reverse=True), held
+        assert held[0] > 0 and held[-1] == 0
 
-    def test_every_level_names_a_real_threshold(self):
-        assert set(core.DEPTH_SENSITIVITY) == {"low", "normal", "high"}
-        assert core.DEPTH_SENSITIVITY["normal"] == core.DEPTH_FLOOR
-        assert (core.DEPTH_SENSITIVITY["high"]
-                < core.DEPTH_SENSITIVITY["normal"]
-                < core.DEPTH_SENSITIVITY["low"])
+
+class TestTheDials:
+    """What the sliders are allowed to be, since a project saved by another
+    version has to open with settings this one can actually apply."""
+
+    def test_the_defaults_are_the_measured_ones(self):
+        assert core.DepthSettings().floor_rel == core.DEPTH_FLOOR
+
+    def test_every_dial_has_a_range_that_contains_its_default(self):
+        fresh = core.DepthSettings()
+        for name, title, low, high, step, hint in core.DepthSettings.DIALS:
+            value = getattr(fresh, name)
+            assert low <= value <= high, f"{name} starts outside its own range"
+            assert step > 0 and high > low, name
+            assert title and hint, f"{name} has nothing to say for itself"
+
+    def test_it_survives_a_round_trip(self):
+        settings = core.DepthSettings(floor_rel=0.31, k=8.5, dilate=7, feather=1.0)
+        assert core.DepthSettings.from_dict(settings.to_dict()) == settings
+
+    def test_a_setting_from_beyond_the_dial_is_brought_back_to_it(self):
+        restored = core.DepthSettings.from_dict({"floor_rel": 40.0, "k": -3})
+        assert restored.floor_rel == 0.60
+        assert restored.k == 1.0
+
+    def test_rubbish_leaves_the_default_standing(self):
+        restored = core.DepthSettings.from_dict(
+            {"floor_rel": "quite a lot", "nonsense": 1})
+        assert restored.floor_rel == core.DEPTH_FLOOR
+
+    def test_the_segmenter_is_built_from_them(self):
+        settings = core.DepthSettings(floor_rel=0.4, k=9, dilate=6, feather=1.5)
+        monkey = core.DepthOcclusionSegmenter.__new__(core.DepthOcclusionSegmenter)
+        # Only the numbers are being checked, so the model file is not needed.
+        for name, value in settings.to_dict().items():
+            setattr(monkey, name, value)
+        assert monkey.floor_rel == 0.4 and monkey.k == 9
+
+
+class TestApproachingTheSurface:
+    """The footage this is pointed at is shot walking or driving past, so a
+    panel goes from a small distant rectangle to filling the frame inside one
+    shot. The threshold's scene-depth term is a fraction of the depth range of
+    a padded crop, and that crop's composition changes completely on the way
+    in: mostly street at the far end, almost entirely panel at the near one.
+
+    Past that point the term is measuring the panel against itself -- against
+    the depth its *artwork* depicts -- and holes open in the creative. So the
+    demand is stiffened in proportion to how little of the crop is anything
+    else, which is to say the measurement is distrusted exactly as far as it
+    has stopped being one.
+    """
+
+    def surface_with_depicted_depth(self, strength=0.30):
+        """A panel whose own artwork reads as standing off it."""
+        depth = surface()
+        spread = float(np.percentile(depth, 95) - np.percentile(depth, 5))
+        depth[region(slice(70, 140), slice(90, 200))] += strength * spread
+        return depth
+
+    def test_a_panel_with_room_around_it_is_judged_as_before(self, interior):
+        """Nothing changes while the crop still holds a scene: the quad here
+        covers about a fifth of the map."""
+        small = np.float32([[120, 90], [200, 92], [198, 150], [118, 148]])
+        depth = surface()
+        depth[region(slice(100, 130), slice(140, 175))] += 4.0
+
+        loose = core.plane_deviation_mask(depth, small, min_context=0.0)
+        stiffened = core.plane_deviation_mask(depth, small)
+        assert np.array_equal(loose, stiffened)
+
+    def test_a_panel_filling_the_crop_is_judged_harder(self):
+        """The quad covers nearly everything, so there is no scene left to
+        measure against and the artwork's own depth is all that is left."""
+        filling = np.float32([[1, 1], [WIDTH - 2, 1],
+                              [WIDTH - 2, HEIGHT - 2], [1, HEIGHT - 2]])
+        depth = self.surface_with_depicted_depth()
+
+        loose = core.plane_deviation_mask(depth, filling, min_context=0.0)
+        stiffened = core.plane_deviation_mask(depth, filling)
+        assert stiffened.sum() < loose.sum(), \
+            "a panel with no context around it was taken at face value"
+
+    def test_something_really_in_front_still_survives_it(self):
+        """Stiffening must not amount to switching the feature off up close:
+        a real obstruction stands off the panel far further than its artwork
+        does, and has to keep clearing the raised bar."""
+        filling = np.float32([[1, 1], [WIDTH - 2, 1],
+                              [WIDTH - 2, HEIGHT - 2], [1, HEIGHT - 2]])
+        depth = self.surface_with_depicted_depth()
+        obstruction = region(slice(30, 60), slice(30, 220))
+        spread = float(np.percentile(depth, 95) - np.percentile(depth, 5))
+        depth[obstruction] += 3.0 * spread
+
+        mask = core.plane_deviation_mask(depth, filling)
+        found = float((mask[obstruction] > 127).mean())
+        assert found > 0.9, f"only {found:.0%} of a real obstruction survived"
+
+    def test_the_stiffening_grows_as_the_context_goes(self):
+        """Not a cliff edge: a shot walks through these as the panel grows, so
+        a step would show as the mask lurching on one frame."""
+        depth = self.surface_with_depicted_depth()
+        removed = []
+        for inset in (60, 40, 20, 1):          # ever bigger quad, ever less room
+            quad = np.float32([[inset, inset], [WIDTH - inset, inset],
+                               [WIDTH - inset, HEIGHT - inset],
+                               [inset, HEIGHT - inset]])
+            inside = core.quad_to_mask(quad, WIDTH, HEIGHT) > 127
+            loose = core.plane_deviation_mask(depth, quad, min_context=0.0)
+            stiffened = core.plane_deviation_mask(depth, quad)
+            # How much of the false masking the stiffening took away.
+            removed.append(float((loose[inside] > 127).mean())
+                           - float((stiffened[inside] > 127).mean()))
+
+        assert removed == sorted(removed), f"not gradual: {removed}"
+        assert removed[0] == 0.0, "stiffened a panel that still had room around it"
+        assert removed[-1] > 0.0, "did nothing to a panel filling the crop"
+
+
+class TestWhichDepthModelServes:
+    """Two files can serve, and the better one is preferred. Selection has to
+    be provable without the network, so these drive it through find_model."""
+
+    def test_the_preferred_model_wins_when_both_are_present(self, monkeypatch):
+        if not (core.find_model(core.DepthOcclusionSegmenter.PREFERRED_FILENAME)
+                and core.find_model(core.DepthOcclusionSegmenter.MODEL_FILENAME)):
+            pytest.skip("both depth models needed; run fetch_model.py")
+        assert core.DepthOcclusionSegmenter().model_name == "depth-anything-v2-small"
+
+    def test_midas_serves_when_the_preferred_file_is_absent(self, monkeypatch):
+        midas = core.find_model(core.DepthOcclusionSegmenter.MODEL_FILENAME)
+        if not midas:
+            pytest.skip("MiDaS model needed; run fetch_model.py")
+        monkeypatch.setattr(core, "find_model",
+                            lambda name: midas
+                            if name == core.DepthOcclusionSegmenter.MODEL_FILENAME
+                            else None)
+        assert core.DepthOcclusionSegmenter().model_name == "midas-v21-small"
+
+    def test_a_preferred_file_that_will_not_load_falls_back(self, monkeypatch,
+                                                            tmp_path):
+        """The expected shape of an OpenCV 4.x machine: the transformer file
+        is present but its engine cannot load it. Yesterday's model has to
+        keep working rather than the feature dying on an upgrade."""
+        midas = core.find_model(core.DepthOcclusionSegmenter.MODEL_FILENAME)
+        if not midas:
+            pytest.skip("MiDaS model needed; run fetch_model.py")
+        bogus = tmp_path / core.DepthOcclusionSegmenter.PREFERRED_FILENAME
+        bogus.write_bytes(b"not a network")
+        monkeypatch.setattr(core, "find_model",
+                            lambda name: str(bogus)
+                            if name == core.DepthOcclusionSegmenter.PREFERRED_FILENAME
+                            else midas)
+        segmenter = core.DepthOcclusionSegmenter()
+        assert segmenter.model_name == "midas-v21-small"
+
+    def test_availability_means_either_file(self, monkeypatch):
+        monkeypatch.setattr(core, "find_model",
+                            lambda name: "/tmp/x.onnx"
+                            if name == core.DepthOcclusionSegmenter.PREFERRED_FILENAME
+                            else None)
+        assert core.DepthOcclusionSegmenter.is_available() is True
+        monkeypatch.setattr(core, "find_model", lambda name: None)
+        assert core.DepthOcclusionSegmenter.is_available() is False
+
+    def test_the_fetch_list_carries_all_three(self):
+        import fetch_model
+        names = [m["filename"] for m in fetch_model.MODELS]
+        assert core.DepthOcclusionSegmenter.PREFERRED_FILENAME in names
+        assert core.DepthOcclusionSegmenter.MODEL_FILENAME in names
+        assert core.PersonSegmenter.MODEL_FILENAME in names
+        preferred = next(m for m in fetch_model.MODELS
+                         if m["filename"] ==
+                         core.DepthOcclusionSegmenter.PREFERRED_FILENAME)
+        assert preferred["expected_bytes"] == 99060839
