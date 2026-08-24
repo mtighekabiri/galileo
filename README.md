@@ -74,6 +74,9 @@ macOS, `~/.local/share/Galileo` on Linux). Set the environment variable
 | Scroll on the magnifier | Set its magnification by hand |
 | Panes button on the magnifier | One view of the whole area, or a tile per handle |
 | Options → Steady the lighting | Even out pulsing from flickering fittings |
+| Options → Steady the tracked path | Take the wobble out of the tracked shape |
+| Options → Draw behind people | Let passers-by cross in front of the creative |
+| Options → Draw behind obstructions | Let railings, posts and signs stay in front of it |
 
 Brightness, contrast and colourise adjustments for the inserted creative are
 available from the left toolbar, and all three apply to the render as well as
@@ -132,15 +135,84 @@ creative back where they are, so they pass in front of it.
 This needs a model file, which is not committed to the repository:
 
 ```bash
-python fetch_model.py      # about 6 MB, once
+python fetch_model.py      # both models, once
 ```
 
 It runs through OpenCV's own DNN module, so there is no extra dependency to
 install, and a packaged build bundles it automatically if it was fetched before
 building. Without it the menu item warns and stays off.
 
-Note that this segments *people*. Something else crossing the shot — a bus, a
-trolley, a pillar in the foreground — is not handled.
+Note that this segments *people* specifically. For everything else, see below.
+
+## Occlusion — anything else in front
+
+A street is full of things that are not people: railings along a walkway, a
+lamppost, a sign, a passing bus. **Options → Draw behind obstructions** handles
+all of them, and it does so without being told what any of them are.
+
+There is no list of objects to recognise, because there could not be one. What
+every obstruction has in common is not what it looks like but where it is: in
+front of the surface. So that is what gets measured. A depth model estimates
+how far away everything in the frame is, a plane is fitted to the area you
+marked — the inverse depth of a flat surface is affine in image coordinates, so
+a billboard is a tilted plane in that map whatever angle it is seen from — and
+whatever stands off that plane *towards the camera* is held back from the
+creative.
+
+Two properties fall out of measuring geometry rather than appearance, and both
+matter:
+
+- **It works on a digital screen playing its own content.** The test is
+  one-sided: only things nearer than the surface are marked, and a picture of a
+  landscape on a screen reads as receding. The advert being replaced cannot eat
+  into the creative replacing it. This is the same trap the digital-screen
+  tracking mode exists for, avoided the same way — nothing here is keyed on
+  what moves.
+- **Nothing needs to hold still.** The mask is computed from each frame on its
+  own, so a moving camera and a moving obstruction are the ordinary case, not a
+  hard one. It also means the preview and the render agree by construction:
+  scrubbing to a frame gives the same mask as arriving at it in sequence.
+
+The two occlusion options are independent and combine — with both on, a
+pedestrian behind a railing is drawn in front of the creative once, from
+whichever source found more of them.
+
+Measured on an ordinary four-core desktop: **66 ms per frame at 1080p**, plus
+about 170 ms once when the model is first used. That is well below real-time
+playback, so the preview slows down noticeably while it is on; renders are
+unaffected beyond taking longer.
+
+The model is MiDaS v2.1 small (MIT licensed, about 64 MB), fetched by
+`fetch_model.py` alongside the person model and run through the same OpenCV DNN
+module, so it adds no dependency either.
+
+### Where it stops
+
+Worth knowing before pointing it at footage, since all of these are quiet
+failures rather than errors:
+
+- **Very thin railings.** The model sees a crop around the marked area scaled
+  to 256×256, and a bar much thinner than a sixtieth of that crop's width is
+  gone before the detector runs. Ordinary railings and posts are found; fine
+  mesh and chain-link are not.
+- **Obstructions covering more than about half the marked area.** Past that the
+  obstruction is the majority of what was marked and is taken for the surface.
+  The mask then empties out and the creative is painted over — the same result
+  as leaving the option off, rather than something worse.
+- **Anamorphic "3D" screen content**, the kind designed to look like it is
+  leaning out of the screen, can raise a blob inside the panel. It defeats
+  exactly the cue being measured. The option is per-project, so switch it off
+  for those shots.
+- **An obstruction close to a very distant surface.** Depth separation shrinks
+  with distance; something a metre in front of a billboard forty metres away is
+  below any honest threshold. A limit of monocular depth, not a setting.
+- **Ground and objects just outside the marked area** that genuinely are nearer
+  bleed a few pixels into the creative's edge, the same way the person mask
+  does.
+
+The mask is recomputed per frame with nothing carried between them, which keeps
+preview and render identical but leaves a little shimmer along an obstruction's
+edge on marginal cases.
 
 ## How the tracking works
 
@@ -181,6 +253,74 @@ bit** — corners, curvature and every per-placement setting come back exactly a
 they went in, and repeated save-edit-save cycles do not drift. Tracking a clip
 is the expensive part of using this tool, and a save that quietly rounds is the
 worst kind of fault: the file looks fine and nothing ever reports a problem.
+
+### Corrections made by hand
+
+Corners a person places are marked as corrections and kept apart from the ones
+the tracker produced. Two things follow from knowing the difference.
+
+**A later pass will not overwrite them.** It used to: re-tracking a stretch
+wrote over every frame in it, so an afternoon spent fixing a difficult clip
+frame by frame disappeared on the next pass with nothing on screen to say it
+had happened.
+
+**A correction now fixes the frames after it, not just its own.** Reaching a
+corrected frame, a pass keeps the shape and re-anchors the tracker to it, so
+tracking carries on from where the surface actually is. Fixing drift once and
+playing on is the intended way to work; correcting every frame in turn is not.
+
+Projects saved before this record no corrections, which is exactly what they
+knew, and load unchanged.
+
+### Steadying the tracked path
+
+**Options → Steady the tracked path** fits a smooth path through the recorded
+corners — for the preview and the render alike.
+
+This is aimed squarely at the corrections above. Corners set by hand are right
+on average and unsteady in between, because a hand is not accurate to the
+pixel, and that unsteadiness is what makes an insert look fidgety after a lot
+of careful work. Measured against a known camera move: the move itself
+accelerates by **0.007 px** per frame, a tracker having a hard time by about
+**0.25 px**, and a path corrected by hand to a typical pixel and a half by
+**4.9 px**. The correction fixes where the shape sits and ruins how it moves.
+
+Around each frame a low-order polynomial is fitted through the corners of the
+frames nearby and read off at that frame. Reading forwards as well as backwards
+is what separates this from the Kalman filter above: that one runs live and can
+only see the past, so it lags, it never sees a frame corrected afterwards, and
+it is thrown away and restarted from a standstill every time one is. Here the
+whole clip is already known, so there is no lag to trade against.
+
+On a hand-corrected path over a handheld shot, that takes the frame-to-frame
+acceleration from **4.96 px to 0.64 px** and at the same time brings the shape
+**closer** to where it belongs, 1.92 px to 1.08 px — most of what is removed
+was never movement, so removing it is not a trade against accuracy.
+
+A quadratic can already describe a pan, a zoom or a steady acceleration, so
+real camera movement passes through untouched; only what cannot be described
+that way is taken out. Stretches either side of a gap in the recording, or of a
+jump too large to be a wobble, are fitted separately, so a deliberate
+repositioning stays where it was put instead of being smeared over its
+neighbours.
+
+It is off by default, and it is a way of *reading* the recording rather than an
+edit to it — the history is untouched, so it can be switched on to see what it
+does and off again having cost nothing. Off by default because it is worth a
+great deal on a path that was corrected by hand and costs a little on one that
+was already steady: on a handheld shot tracked perfectly, fitting over 11
+frames pulls the shape about 0.6 px off the surface it is stuck to. Wider
+windows keep steadying the path — 21 frames reach 0.31 px of acceleration — at
+a growing cost of that kind, which is why the default sits where it does.
+
+Worth knowing about the tracker itself, since it is the other suspect: its own
+contribution to fidget is small even on footage it finds difficult, and
+steadying an untouched tracked path barely changes it (1.09 px to 1.08 px).
+Where the tracker fails on hard footage it fails by being *wrong* rather than
+unsteady — on deliberately punishing material, repetitive texture under heavy
+blur and noise, it has been measured 33 px from the truth while reporting
+success. No amount of smoothing recovers from that; re-marking the area, or
+*Digital screen (track surroundings)*, is what helps there.
 
 ### Footage whose brightness will not sit still
 
@@ -631,8 +771,10 @@ file, and the algorithms can be tested without a display.
 | `galileo_core.PlanarTracker` | Feature-based planar tracking with RANSAC and sanity checks |
 | `galileo_core.ReferenceMatcher` | Locates a target in the footage from a reference image |
 | `galileo_core.PersonSegmenter` | Segments people so the insert can go behind them |
+| `galileo_core.DepthOcclusionSegmenter` | Finds anything else in front of the surface, by depth |
 | `galileo_core.Region` | Four corners plus per-edge curvature |
 | `galileo_core.composite_region` | Alpha-correct perspective/curved warp and blend |
+| `galileo_core.smooth_tracking` | Fits a smooth path through the recorded corners |
 | `galileo_core.interpolate_tracking` | Fills the gaps between tracked frames |
 | `galileo_core.remux_audio` | Copies the source audio onto a finished render |
 | `MainWindow` | Frameless main window, menus, load/save/render actions |
@@ -668,5 +810,17 @@ whole-frame one demonstrably does *not* fix banding, which is why the choice
 is made rather than offered — and that a preview that has been steadied is
 rendered to a file that is steady too.
 
-Occlusion tests that need the model file skip cleanly when it has not been
-fetched; the compositing side is tested with hand-made masks either way.
+`tests/test_steadiness.py` measures the wobble itself rather than accuracy —
+the mean size of the shape's frame-to-frame acceleration — and pins down both
+that a corrected path is hundreds of times less steady than the camera move it
+describes and that fitting a path through it removes that without pulling the
+shape away from where it belongs. It also asserts that asking for one frame's
+steadied corners, which is what the preview does as it goes, gives exactly what
+fitting the whole clip gives, which is what the renderer does.
+
+Occlusion tests that need a model file skip cleanly when it has not been
+fetched; the compositing side is tested with hand-made masks either way, and
+`tests/test_depth_occlusion.py` states what turns a depth map into a mask using
+maps built by hand — an obstruction across the middle, a surface seen at a
+steep angle, sky showing past a loosely marked edge — so the rules hold whether
+or not the 64 MB model has been downloaded.

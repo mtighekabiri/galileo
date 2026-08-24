@@ -15,9 +15,10 @@
 import os
 import sys
 
-# Bundle the person-segmentation model if it has been fetched, so occlusion
-# works for whoever receives the build without them downloading anything.
-# Run fetch_model.py before building to include it.
+# Bundle the occlusion models -- person segmentation and depth -- if they have
+# been fetched, so occlusion works for whoever receives the build without them
+# downloading anything. Run fetch_model.py before building to include them;
+# whichever are there get bundled, and each enables its own menu item.
 DATAS = []
 _models = os.path.join(os.path.abspath(SPECPATH), "models")
 if os.path.isdir(_models) and any(f.endswith(".onnx") for f in os.listdir(_models)):

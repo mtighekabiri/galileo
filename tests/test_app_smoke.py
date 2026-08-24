@@ -41,6 +41,10 @@ def qapp():
 def window(qapp):
     win = galileo_app.MainWindow()
     yield win
+    # Closing asks what to do about unsaved tracking work, and offscreen that
+    # question is a dialog nobody can answer -- the run stops there for good.
+    # Nothing here is testing the prompt, so the project is retired as saved.
+    win.mark_clean()
     win.close()
 
 
@@ -336,12 +340,94 @@ class TestScreenAndOcclusionToggles:
         overlay.overlay_bgra = logo_bgra
         overlay.tracking_history = {0: [tuple(map(float, p)) for p in truth[0]]}
         window.central_panel.occlusion_enabled = True
+        window.central_panel.obstruction_enabled = True
 
         settings = window.build_render_settings(0, 2, 1.0, str(tmp_path / "o.mp4"))
         assert settings.occlusion is True
+        assert settings.obstructions is True
         assert not hasattr(settings, "segmenter")
         for value in vars(settings).values():
             assert not isinstance(value, cv2.dnn.Net)
+
+    def test_obstructions_off_produces_no_mask(self, loaded):
+        window, path, truth = loaded
+        panel = window.central_panel
+        assert panel.obstruction_enabled is False
+        assert panel.obstruction_mask(panel.prev_frame, truth[0]) is None
+
+    def test_obstructions_without_the_model_warn_and_stay_off(self, loaded,
+                                                              monkeypatch):
+        window, path, truth = loaded
+        monkeypatch.setattr(core.DepthOcclusionSegmenter, "is_available",
+                            classmethod(lambda cls: False))
+        warned = []
+        monkeypatch.setattr(galileo_app.QMessageBox, "warning",
+                            staticmethod(lambda *a, **k: warned.append(a)))
+
+        window.toggle_obstructions(True)
+        assert warned, "no warning shown for the missing model"
+        assert window.central_panel.obstruction_enabled is False
+
+    def test_the_two_sources_are_combined(self, loaded, monkeypatch):
+        """Both kinds of occlusion have to reach the compositor, and a
+        pedestrian behind a railing is found by both at once."""
+        window, path, truth = loaded
+        panel = window.central_panel
+        height, width = panel.prev_frame.shape[:2]
+
+        person = np.zeros((height, width), np.uint8)
+        person[10:40, 10:40] = 255
+        depth = np.zeros((height, width), np.uint8)
+        depth[30:60, 30:60] = 255
+        monkeypatch.setattr(panel, "occlusion_mask", lambda f, q: person)
+        monkeypatch.setattr(panel, "obstruction_mask", lambda f, q: depth)
+
+        combined = panel.combined_occlusion(panel.prev_frame, truth[0])
+        assert np.array_equal(combined, cv2.max(person, depth))
+        assert combined[20, 20] == 255 and combined[50, 50] == 255
+
+    def test_either_source_alone_still_reaches_the_compositor(self, loaded,
+                                                             monkeypatch):
+        window, path, truth = loaded
+        panel = window.central_panel
+        only = np.zeros(panel.prev_frame.shape[:2], np.uint8)
+        only[5:15, 5:15] = 255
+
+        monkeypatch.setattr(panel, "occlusion_mask", lambda f, q: None)
+        monkeypatch.setattr(panel, "obstruction_mask", lambda f, q: only)
+        assert panel.combined_occlusion(panel.prev_frame, truth[0]) is only
+
+        monkeypatch.setattr(panel, "occlusion_mask", lambda f, q: only)
+        monkeypatch.setattr(panel, "obstruction_mask", lambda f, q: None)
+        assert panel.combined_occlusion(panel.prev_frame, truth[0]) is only
+
+        monkeypatch.setattr(panel, "occlusion_mask", lambda f, q: None)
+        monkeypatch.setattr(panel, "obstruction_mask", lambda f, q: None)
+        assert panel.combined_occlusion(panel.prev_frame, truth[0]) is None
+
+    def test_the_cache_notices_a_toggle_on_the_same_frame(self, loaded,
+                                                          monkeypatch):
+        """Switching a source on while paused has to redraw the frame with it.
+        The frame has not changed, so the toggles are part of the cache key."""
+        window, path, truth = loaded
+        panel = window.central_panel
+        placement = panel.tracking_overlay.placements[0]
+        placement.points = [tuple(map(float, p)) for p in truth[0]]
+
+        calls = []
+        monkeypatch.setattr(panel, "occlusion_mask",
+                            lambda f, q: calls.append("person"))
+        monkeypatch.setattr(panel, "obstruction_mask",
+                            lambda f, q: calls.append("depth"))
+
+        panel.occlusion_enabled = True
+        panel.occlusion_for_frame(panel.prev_frame, [placement])
+        panel.occlusion_for_frame(panel.prev_frame, [placement])
+        assert len(calls) == 2, "the same frame was segmented twice"
+
+        panel.obstruction_enabled = True
+        panel.occlusion_for_frame(panel.prev_frame, [placement])
+        assert "depth" in calls, "turning a source on did not recompute"
 
 
 class TestThePreviousFrameToggle:
@@ -587,3 +673,179 @@ class TestProjectRoundTrip:
         assert len(data["tracking_history"]) == 5
         assert data["curved"] is True
         assert np.any(np.array(data["curvature"]) != 0)
+
+
+class TestSteadyingTheTrackedPath:
+    """The fit that takes the wobble out has to reach the file, and the
+    preview has to be showing the same thing while it does."""
+
+    def hand_corrected(self, panel, truth):
+        """A history that is right on average and unsteady frame to frame."""
+        rng = np.random.default_rng(0)
+        placement = panel.tracking_overlay.placements[0]
+        history = {i: [tuple(map(float, p))
+                       for p in np.float32(quad) + rng.normal(0, 1.5, (4, 2))]
+                   for i, quad in enumerate(truth)}
+        placement.tracking_history = dict(history)
+        return placement, history
+
+    def test_it_is_off_until_asked_for(self, loaded):
+        window, path, truth = loaded
+        assert window.central_panel.steady_tracking is False
+
+    def test_the_toggle_carries_into_the_render(self, loaded, logo_bgra, tmp_path):
+        window, path, truth = loaded
+        overlay = window.central_panel.tracking_overlay
+        overlay.overlay_bgra = logo_bgra
+        overlay.tracking_history = {0: [tuple(map(float, p)) for p in truth[0]]}
+
+        window.toggle_steady_tracking(True)
+        settings = window.build_render_settings(0, 2, 1.0, str(tmp_path / "o.mp4"))
+        assert settings.steady_tracking is True
+        assert settings.steady_window == core.STEADY_WINDOW
+
+    def test_the_render_is_steadier_than_what_was_recorded(self, loaded,
+                                                           logo_bgra, tmp_path):
+        window, path, truth = loaded
+        panel = window.central_panel
+        panel.tracking_overlay.overlay_bgra = logo_bgra
+        placement, history = self.hand_corrected(panel, truth)
+
+        def dense(steady):
+            panel.steady_tracking = steady
+            settings = window.build_render_settings(
+                0, len(truth) - 1, 1.0, str(tmp_path / "o.mp4"))
+            worker = galileo_app.RenderWorker(settings)
+            return worker._prepare_placements(settings, [])[0].dense
+
+        def wobble(path_):
+            keys = sorted(path_)
+            quads = np.array([np.asarray(path_[k], np.float64).reshape(4, 2)
+                              for k in keys])
+            return float(np.linalg.norm(
+                quads[2:] - 2 * quads[1:-1] + quads[:-2], axis=2).mean())
+
+        raw, steadied = wobble(dense(False)), wobble(dense(True))
+        assert steadied < raw / 3, f"{raw:.2f}px only came down to {steadied:.2f}px"
+
+    def test_the_preview_shows_what_the_render_will_write(self, loaded,
+                                                          logo_bgra, tmp_path):
+        window, path, truth = loaded
+        panel = window.central_panel
+        panel.tracking_overlay.overlay_bgra = logo_bgra
+        placement, history = self.hand_corrected(panel, truth)
+
+        panel.steady_tracking = True
+        settings = window.build_render_settings(
+            0, len(truth) - 1, 1.0, str(tmp_path / "o.mp4"))
+        rendered = galileo_app.RenderWorker(settings)._prepare_placements(
+            settings, [])[0].dense
+
+        for frame in range(len(truth)):
+            panel.replay_recorded_shapes(frame)
+            shown = np.asarray(placement.points, np.float64).reshape(4, 2)
+            assert np.allclose(shown, np.asarray(rendered[frame], np.float64)
+                               .reshape(4, 2)), f"frame {frame} differs"
+
+    def test_the_recording_itself_is_never_rewritten(self, loaded):
+        """Steadying is a way of reading the history, not an edit to it, so it
+        can be turned on to see what it does and off again at no cost."""
+        window, path, truth = loaded
+        panel = window.central_panel
+        placement, history = self.hand_corrected(panel, truth)
+
+        window.toggle_steady_tracking(True)
+        for frame in range(len(truth)):
+            panel.replay_recorded_shapes(frame)
+
+        assert all(np.allclose(placement.tracking_history[i], history[i])
+                   for i in history)
+
+
+class TestCorrectionsAreKept:
+    """A shape a person placed is a correction; one the tracker placed is an
+    estimate. A pass used to overwrite the first with the second and say
+    nothing, which is what made fixing a difficult clip endless."""
+
+    def track_forward(self, panel, truth, frames):
+        panel.tracking_overlay.points = [tuple(map(float, p)) for p in truth[0]]
+        panel.tracking_mode = True
+        for _ in range(frames):
+            panel.read_frame()
+        panel.tracking_mode = False
+
+    def test_a_hand_edit_is_recorded_as_one(self, loaded):
+        window, path, truth = loaded
+        panel = window.central_panel
+        overlay = panel.tracking_overlay
+
+        overlay.points = [tuple(map(float, p)) for p in truth[0]]
+        overlay.commit_shape()
+        assert panel.get_current_frame_index() in overlay.manual_frames
+
+    def test_the_tracker_does_not_claim_frames_it_placed(self, loaded):
+        window, path, truth = loaded
+        panel = window.central_panel
+        self.track_forward(panel, truth, 5)
+
+        placement = panel.tracking_overlay.placements[0]
+        assert placement.tracking_history, "nothing was tracked at all"
+        assert not placement.manual_frames, "the tracker's own work was marked by hand"
+
+    def test_a_later_pass_keeps_the_correction(self, loaded):
+        window, path, truth = loaded
+        panel = window.central_panel
+        overlay = panel.tracking_overlay
+        placement = overlay.placements[0]
+
+        self.track_forward(panel, truth, 8)
+        panel.jump_to_frame(4)
+        overlay.points = [tuple(map(float, p))
+                          for p in np.float32(truth[4]) + [9.0, -6.0]]
+        overlay.commit_shape()
+        corrected = [tuple(p) for p in placement.tracking_history[4]]
+
+        # ...and now the whole stretch is tracked again over the top of it.
+        panel.jump_to_frame(0)
+        self.track_forward(panel, truth, 8)
+
+        assert np.allclose(placement.tracking_history[4], corrected), \
+            "the correction was overwritten by the pass it was made to fix"
+        assert any(f in placement.tracking_history for f in range(5, 8)), \
+            "the pass stopped instead of carrying on past the correction"
+
+    def test_deleting_the_shape_takes_the_correction_with_it(self, loaded):
+        window, path, truth = loaded
+        panel = window.central_panel
+        overlay = panel.tracking_overlay
+
+        overlay.points = [tuple(map(float, p)) for p in truth[0]]
+        overlay.commit_shape()
+        frame = panel.get_current_frame_index()
+        assert frame in overlay.manual_frames
+
+        panel.on_delete_shape()
+        assert frame not in overlay.manual_frames
+        assert frame not in overlay.tracking_history
+
+    def test_a_project_remembers_which_were_corrections(self, loaded):
+        window, path, truth = loaded
+        overlay = window.central_panel.tracking_overlay
+        overlay.points = [tuple(map(float, p)) for p in truth[0]]
+        overlay.commit_shape()
+        placement = overlay.placements[0]
+
+        import json
+        restored = galileo_app.Placement.from_dict(
+            json.loads(json.dumps(placement.to_dict())))
+        assert restored.manual_frames == placement.manual_frames
+
+    def test_a_project_saved_before_this_existed_still_loads(self, loaded):
+        window, path, truth = loaded
+        overlay = window.central_panel.tracking_overlay
+        overlay.points = [tuple(map(float, p)) for p in truth[0]]
+        overlay.commit_shape()
+
+        older = {k: v for k, v in overlay.placements[0].to_dict().items()
+                 if k != "manual_frames"}
+        assert galileo_app.Placement.from_dict(older).manual_frames == set()

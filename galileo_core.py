@@ -2142,6 +2142,339 @@ class PersonSegmenter:
         return mask
 
 
+def _fit_plane_robust(depth: np.ndarray, interior: np.ndarray,
+                      iterations: int = 3):
+    """Fit an affine plane to ``depth`` over ``interior``, ignoring near outliers.
+
+    Returns ``((a, b, c), scale)``, the plane in coordinates normalised to the
+    map's own size, and a robust spread of the residuals it left behind.
+
+    Neither "the biggest flat thing in the area" nor "the furthest thing in the
+    area" is on its own the surface, and each fails where the other holds. A
+    railing covering most of the billboard is the biggest population but not
+    the surface; sky through a gap above it is the furthest but not the surface
+    either. Fitting once, from any single starting guess, picks whichever of
+    those happens to dominate.
+
+    So several fits are made instead -- one seeded from each of a series of
+    overlapping depth bands through the interior, so that whatever the surface
+    is competing with, some band lands mostly on it -- and each is refined
+    against its own residuals. Every candidate is then scored by how many of
+    the interior's pixels sit on it, at a tolerance taken from the cleanest
+    candidate of the lot, and **the best-supported candidate wins**, distance
+    breaking ties between candidates that are within a tenth of each other.
+
+    Majority rather than distance, and the choice is about which way to fail.
+    The user marked this area on the surface, so the surface is what most of it
+    is; both an obstruction in front and a genuinely distant patch behind are
+    minorities within it, and taking the majority gets the surface in either
+    case. Preferring distance instead would also survive an obstruction
+    covering more than half the area -- but it mistakes sky showing through a
+    loosely marked edge for the surface, and then reports the *billboard* as
+    standing in front of the sky and masks the creative away entirely. That is
+    a far worse way to be wrong than the alternative: once an obstruction does
+    cover more than about half the area it takes the majority, its own surface
+    reads as lying behind it, nothing is marked, and the creative is painted
+    over exactly as it is with the feature switched off.
+
+    The bands are fixed rather than sampled at random: the preview may be asked
+    for any frame in any order and the renderer walks them in sequence, and
+    both have to produce the same mask for the same frame.
+
+    Everything here happens over the interior's pixels pulled out into flat
+    arrays. Half a dozen candidates refined three times each is a lot of passes
+    to make over a whole map to reach the fraction of it being fitted.
+    """
+    height, width = depth.shape[:2]
+    interior = np.asarray(interior, bool)
+    inside = depth[interior].astype(np.float32)
+    fallback = ((0.0, 0.0, float(np.median(inside)) if inside.size else 0.0), 0.0)
+    if inside.size < 3:
+        return fallback
+
+    # Normalised coordinates keep the 3x3 normal equations well conditioned
+    # whatever the map's size.
+    ys, xs = np.nonzero(interior)
+    xs = (xs / max(width - 1, 1)).astype(np.float32)
+    ys = (ys / max(height - 1, 1)).astype(np.float32)
+    ones = np.ones(inside.size, np.float32)
+
+    def fit(selected):
+        """Least squares through the selected pixels, refined against itself."""
+        coefficients = residual = None
+        scale = 0.0
+        for _ in range(max(1, iterations)):
+            if int(np.count_nonzero(selected)) < 3:
+                return None
+            design = np.stack([xs[selected], ys[selected], ones[selected]], axis=1)
+            try:
+                # Normal equations rather than lstsq: three unknowns, and this
+                # runs a handful of times per frame.
+                coefficients = np.linalg.solve(design.T @ design,
+                                               design.T @ inside[selected])
+            except np.linalg.LinAlgError:
+                return None
+
+            residual = inside - (coefficients[0] * xs + coefficients[1] * ys
+                                 + coefficients[2])
+            fitted = residual[selected]
+            scale = float(1.4826 * np.median(np.abs(fitted - np.median(fitted))))
+            if scale <= 0:
+                break
+            grown = np.abs(residual) < 2.5 * scale
+            if int(np.count_nonzero(grown)) < 3:
+                break
+            selected = grown
+        return coefficients, residual, scale
+
+    candidates = []
+    edges = np.percentile(inside, list(range(0, 101, 10)))
+    for low in range(0, 7):
+        seed = (inside >= edges[low]) & (inside <= edges[low + 4])
+        if int(np.count_nonzero(seed)) < 3:
+            continue
+        result = fit(seed)
+        if result is not None:
+            candidates.append(result)
+    if not candidates:
+        return fallback
+
+    # A tolerance common to every candidate, or each would be scored by its own
+    # yardstick and the loosest fit would win by calling everything an inlier.
+    # The cleanest candidate is the one that found real structure, so its
+    # spread is the one worth trusting.
+    tolerance = max(3.0 * min(scale for _, _, scale in candidates), 1e-6)
+    mean_x, mean_y = float(xs.mean()), float(ys.mean())
+
+    scored = []
+    for coefficients, residual, scale in candidates:
+        support = int(np.count_nonzero(np.abs(residual) <= tolerance))
+        # How far away the candidate sits, averaged over the area. Larger is
+        # nearer in these maps, so the smallest of these is the furthest.
+        depthwise = (coefficients[0] * mean_x + coefficients[1] * mean_y
+                     + coefficients[2])
+        scored.append((support, depthwise, coefficients, scale))
+
+    best = max(support for support, _, _, _ in scored)
+    eligible = [c for c in scored if c[0] >= 0.9 * best]
+    _, _, coefficients, scale = min(eligible, key=lambda c: c[1])
+    return (float(coefficients[0]), float(coefficients[1]),
+            float(coefficients[2])), float(scale)
+
+
+def plane_deviation_mask(depth: np.ndarray, quad, k: float = 5.0,
+                         floor_rel: float = 0.10,
+                         iterations: int = 3) -> np.ndarray:
+    """255 where ``depth`` reads as meaningfully nearer than the marked surface.
+
+    ``depth`` is relative inverse depth -- larger means nearer -- and ``quad``
+    is the surface's outline in its coordinates. Under a pinhole camera the
+    inverse depth of a plane is exactly affine in image coordinates, so the
+    surface should be a tilted plane in this map whatever angle it is seen
+    from; anything standing off it towards the camera is what we are after.
+
+    Two decisions carry most of the behaviour:
+
+    **One-sided.** Only pixels *nearer* than the plane are marked. Content
+    beyond the surface never is, which is what lets this run on a digital
+    screen playing its own footage: an advert of a landscape reads as receding,
+    and receding is ignored. A flat picture of something far away is not an
+    obstruction.
+
+    **The threshold is measured, not fixed.** These maps have no units -- their
+    scale and offset are arbitrary and change frame to frame -- so a constant
+    would be meaningless. A pixel has to clear both the fit's own noise
+    (``k`` times the residual spread) and a real fraction of the scene's depth
+    range (``floor_rel``), the second of which is what tells a lamppost two
+    metres in front of a screen apart from a face the network thinks is
+    leaning out of the advert.
+
+    The plane is fitted inside the quad but the test is applied everywhere, so
+    an obstruction crossing the edge stays one shape instead of being cut in
+    half at the boundary and losing its thin end to the speckle filter. Marks
+    outside the quad cost nothing: the compositor only reads the mask where the
+    creative is drawn.
+    """
+    depth = np.asarray(depth, np.float32)
+    height, width = depth.shape[:2]
+    mask = np.zeros((height, width), np.uint8)
+
+    interior = quad_to_mask(quad, width, height) > 127
+    # Too small to fit a plane to, or entirely off the map.
+    if int(np.count_nonzero(interior)) < 64:
+        return mask
+
+    coefficients, scale = _fit_plane_robust(depth, interior, iterations)
+
+    ys, xs = np.mgrid[0:height, 0:width]
+    xs = (xs / max(width - 1, 1)).astype(np.float32)
+    ys = (ys / max(height - 1, 1)).astype(np.float32)
+    residual = depth - (coefficients[0] * xs + coefficients[1] * ys
+                        + coefficients[2])
+
+    spread = float(np.percentile(depth, 95) - np.percentile(depth, 5))
+    # The epsilon is what keeps a mathematically perfect plane -- zero noise,
+    # zero spread -- from having every pixel clear a threshold of zero.
+    threshold = max(k * scale, floor_rel * spread, 1e-6)
+
+    mask[residual > threshold] = 255
+    # Open at the map's own resolution, before anything is scaled up: a railing
+    # three pixels wide here survives a 3x3 open, and would not survive a
+    # kernel grown to match a later enlargement.
+    return cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+
+
+class DepthOcclusionSegmenter:
+    """Finds whatever stands in front of the surface, by how far away it looks.
+
+    :class:`PersonSegmenter` handles the commonest obstruction and only that
+    one. Streets are full of the rest: railings along a walkway, a lamppost, a
+    sign, a passing bus. Painting the creative over those gives the shot away
+    just as badly.
+
+    Nothing about the *appearance* of an obstruction is usable here, because
+    there is no list of things to look for. What every one of them has in
+    common is geometry -- it is nearer than the surface -- so that is what is
+    measured. A network estimates relative depth for the frame, an affine plane
+    is fitted to the marked area (a plane's inverse depth is affine in image
+    coordinates), and pixels standing off it towards the camera become the
+    mask. See :func:`plane_deviation_mask`.
+
+    Depth also sidesteps the trap that catches motion-based approaches, and it
+    is the same trap the digital-screen tracking mode exists for: a screen's
+    picture moves independently of the screen. Anything keyed on "this does not
+    move with the surface" flags the advert being replaced. Depth does not care
+    what is playing -- the panel is flat either way.
+
+    Runs MiDaS v2.1 small through OpenCV's own DNN module, one 64 MB file and
+    no extra runtime, exactly like the person model. See fetch_model.py.
+    """
+
+    MODEL_FILENAME = "midas_v21_small_256.onnx"
+    #: Fixed by the exported graph. Feeding it another size is not an option.
+    INPUT_SIZE = (256, 256)
+
+    def __init__(self, model_path: str = None, k: float = 5.0,
+                 floor_rel: float = 0.10, dilate: int = 4,
+                 feather: float = 2.5, pad: float = 0.5):
+        """
+        Args:
+            model_path: the ONNX file; discovered automatically when omitted.
+            k: how many times the fit's own residual spread a pixel must stand
+                off the plane before it counts as being in front of it.
+            floor_rel: the same demand as a fraction of the scene's depth
+                range, so that a surface the network reads as almost perfectly
+                flat does not turn a sliver of noise into an obstruction.
+            dilate: grow the mask by this many pixels. One more than the person
+                model uses: a depth edge is softer than a body outline.
+            feather: blur the mask edge by this sigma, which also covers the
+                frame-to-frame wobble in the network's own boundaries.
+            pad: how far beyond the region to run the model, as a fraction of
+                the region's size. Wider than the person model's crop on
+                purpose -- the bezel, wall and street around a screen are the
+                context that tells the network the screen is flat, whatever is
+                playing on it.
+        """
+        path = model_path or find_model(self.MODEL_FILENAME)
+        if not path:
+            raise FileNotFoundError(
+                f"Could not find {self.MODEL_FILENAME}. Run fetch_model.py to "
+                "download it, or place it in a 'models' folder beside the "
+                "application.")
+        try:
+            self.net = cv2.dnn.readNetFromONNX(path)
+        except cv2.error as exc:
+            # OpenCV 5 picks an engine for itself and falls back to the 4.x one
+            # on its own, but say so explicitly rather than rely on it: this
+            # model is known to load on the classic engine.
+            if not hasattr(cv2.dnn, "ENGINE_CLASSIC"):
+                raise IOError(f"Could not load the depth model: {exc}") from exc
+            try:
+                self.net = cv2.dnn.readNetFromONNX(path, cv2.dnn.ENGINE_CLASSIC)
+            except cv2.error as retry:
+                raise IOError(f"Could not load the depth model: {retry}") from retry
+
+        self.model_path = path
+        self.k = k
+        self.floor_rel = floor_rel
+        self.dilate = dilate
+        self.feather = feather
+        self.pad = pad
+
+    @classmethod
+    def is_available(cls) -> bool:
+        """True if the model file can be found."""
+        return find_model(cls.MODEL_FILENAME) is not None
+
+    def _infer(self, patch_bgr: np.ndarray) -> np.ndarray:
+        """Relative inverse depth for one patch, at the network's own size.
+
+        The mean and standard deviation this model was trained with are baked
+        into the exported graph, so the input wanted here is plain [0, 1] RGB.
+        Subtracting them again -- which most examples of driving this model
+        through OpenCV do -- normalises it twice and quietly degrades the
+        result rather than failing outright.
+        """
+        blob = cv2.dnn.blobFromImage(
+            patch_bgr, scalefactor=1 / 255.0, size=self.INPUT_SIZE,
+            mean=(0, 0, 0), swapRB=True, crop=False)
+        self.net.setInput(blob)
+        output = np.asarray(self.net.forward(), np.float32)
+        return output.reshape(output.shape[-2], output.shape[-1])
+
+    def mask(self, frame_bgr: np.ndarray, quad=None) -> np.ndarray:
+        """A frame-sized mask, 255 where something stands in front of the quad.
+
+        Like the person segmenter, the model is run on a padded crop around
+        ``quad`` rather than the whole frame: the input is a fixed 256x256, and
+        cropping first is what keeps a railing bar more than a pixel wide by
+        the time the network sees it.
+        """
+        height, width = frame_bgr.shape[:2]
+        mask = np.zeros((height, width), np.uint8)
+
+        if quad is not None:
+            corners = as_quad(quad)
+            centre = corners.mean(axis=0)
+            grown = (corners - centre) * (1.0 + 2.0 * self.pad) + centre
+            box = quad_bounds(grown, width, height, pad=0)
+            if box is None:
+                return mask
+        else:
+            box = (0, 0, width, height)
+
+        x0, y0, x1, y1 = box
+        patch = frame_bgr[y0:y1, x0:x1]
+        patch_h, patch_w = patch.shape[:2]
+        if patch_w < 2 or patch_h < 2:
+            return mask
+
+        depth = self._infer(patch)
+        net_h, net_w = depth.shape[:2]
+
+        if quad is not None:
+            local = ((as_quad(quad) - np.float32([x0, y0]))
+                     * np.float32([net_w / patch_w, net_h / patch_h]))
+        else:
+            local = np.float32([[0, 0], [net_w, 0], [net_w, net_h], [0, net_h]])
+
+        patch_mask = plane_deviation_mask(depth, local, k=self.k,
+                                          floor_rel=self.floor_rel)
+        patch_mask = cv2.resize(patch_mask, (patch_w, patch_h),
+                                interpolation=cv2.INTER_LINEAR)
+        patch_mask = np.where(patch_mask > 127, 255, 0).astype(np.uint8)
+
+        if self.dilate > 0:
+            kernel = np.ones((self.dilate * 2 + 1,) * 2, np.uint8)
+            patch_mask = cv2.dilate(patch_mask, kernel)
+        if self.feather > 0:
+            ksize = max(3, int(self.feather * 4) | 1)
+            patch_mask = cv2.GaussianBlur(patch_mask, (ksize, ksize), self.feather)
+
+        mask[y0:y1, x0:x1] = patch_mask
+        return mask
+
+
 VIDEO_SUFFIXES = (".mp4", ".avi", ".mkv", ".mov", ".m4v", ".webm")
 
 
@@ -2280,6 +2613,170 @@ def open_reference(path: str, **kwargs):
 # --------------------------------------------------------------------------
 # Tracking history
 # --------------------------------------------------------------------------
+
+#: How many frames the fit sees at once when steadying a tracked path.
+#: Measured against a hand-corrected path over a handheld shot: 11 frames take
+#: the frame-to-frame acceleration from 4.96 px to 0.64 px while also bringing
+#: the shape *closer* to where it belongs, 1.92 px to 1.08 px, because most of
+#: what is being removed was never real movement. Wider windows keep steadying
+#: it -- 21 frames reach 0.31 px -- but start pulling the shape off a surface
+#: that is genuinely moving quickly, which is the failure worth avoiding.
+STEADY_WINDOW = 11
+
+#: A step this many times the run's typical one is a move, not a wobble.
+#: Splitting there keeps the smoother from smearing a deliberate
+#: repositioning -- or a cut -- backwards and forwards over its neighbours.
+JUMP_FACTOR = 8.0
+
+#: ...but only once it is also worth noticing in pixels. Without this, a shape
+#: sitting still on a locked-off shot has a typical step of nearly nothing, and
+#: every twitch in it counts as eight times that.
+JUMP_FLOOR = 6.0
+
+
+def _runs(keys, corners, jump_factor=JUMP_FACTOR, jump_floor=JUMP_FLOOR):
+    """Split frames into stretches that describe one continuous movement.
+
+    ``keys`` is sorted; ``corners`` holds their quads as one (n, 8) array. The
+    threshold is measured over the whole recording rather than each stretch, so
+    that asking for one frame's smoothed position and asking for every frame's
+    divide the recording exactly the same way.
+    """
+    steps = np.linalg.norm(
+        np.diff(corners, axis=0).reshape(-1, 4, 2), axis=2).mean(axis=1)
+    limit = max(jump_factor * float(np.median(steps)) if steps.size else 0.0,
+                jump_floor)
+
+    breaks = np.flatnonzero((np.diff(np.asarray(keys)) != 1) | (steps > limit))
+    return np.split(np.arange(len(keys)), breaks + 1)
+
+
+def _fit_at(corners, offset, half, degree):
+    """The polynomial fit through one frame's neighbours, read at that frame.
+
+    ``corners`` is a run as an (n, 8) array; ``offset`` indexes into it, and
+    the answer comes back in the same eight-wide, full-precision form. The
+    window is clipped to the run's ends, which is the whole of the special
+    handling the first and last few frames need -- a shorter window and, if it
+    is shorter than the polynomial, a lower order.
+    """
+    low = max(0, offset - half)
+    high = min(len(corners), offset + half + 1)
+    span = np.arange(low - offset, high - offset, dtype=np.float64)
+    order = min(degree, high - low - 1)
+    try:
+        solution, *_ = np.linalg.lstsq(np.vander(span, order + 1),
+                                       corners[low:high], rcond=None)
+    except np.linalg.LinAlgError:
+        return corners[offset]
+    # The value at this frame is the constant term: the window's frame numbers
+    # are measured from it, so every other power is zero here.
+    return solution[-1]
+
+
+def smooth_tracking(history: dict, window: int = STEADY_WINDOW, degree: int = 2,
+                    strength: float = 1.0, only: int = None) -> dict:
+    """Fit a smooth path through recorded corners, taking the wobble out.
+
+    Nothing else in the pipeline does this. The Kalman filter in
+    :func:`smooth_quad` runs live, during a tracking pass, and it only ever
+    sees the past -- so it lags, it cannot touch a frame the user corrected by
+    hand afterwards, and it is thrown away and restarted from a standstill
+    every time they do. What reaches the file is then whatever is in the
+    history, interpolated straight between the recorded frames.
+
+    That matters most for the frames a person placed. Corners set by hand carry
+    the unsteadiness of the hand that set them: clicking to a typical pixel and
+    a half puts about **4.3 px** of frame-to-frame acceleration into the path,
+    against **0.25 px** for even a struggling tracker and **0.007 px** for the
+    camera move being followed. The correction fixes where the shape sits and
+    ruins how it moves, which is exactly the complaint that the insert looks
+    fidgety after a lot of careful work.
+
+    So the whole recorded path is fitted here rather than filtered: around each
+    frame, a low-order polynomial is put through the corners of the frames
+    nearby and evaluated at that frame. Reading forwards as well as backwards
+    is what makes this different from the live filter -- there is no lag to
+    trade against, because the future is already known by the time anyone
+    renders.
+
+    ``degree`` 2 is what keeps it honest. A polynomial of that order can
+    already be a pan, a zoom or a steady acceleration, so real camera movement
+    passes through untouched and only what does not fit that description --
+    which is to say the noise -- is removed. A larger ``window`` smooths
+    harder; ``strength`` below 1.0 keeps part of the original, for a shape that
+    should follow something the fit refuses to believe.
+
+    Stretches are smoothed separately either side of a gap in the recording or
+    a jump too big to be a wobble, so a deliberate repositioning stays a
+    repositioning instead of being spread over the frames around it.
+
+    Pass ``only`` for a single frame's smoothed corners rather than the whole
+    clip's. That is what the preview asks for as it goes, and it is the same
+    arithmetic over the same neighbours, so the shape on screen is the shape
+    the renderer will write for that frame.
+    """
+    tracked = {int(k): as_quad(v) for k, v in history.items()
+               if v is not None and len(v) == 4}
+    if len(tracked) < 3 or strength <= 0 or window < 3:
+        return {k: v.copy() for k, v in tracked.items()}
+
+    keys = sorted(tracked)
+    all_corners = np.array([tracked[k] for k in keys], np.float64).reshape(-1, 8)
+    half = max(1, int(window) // 2)
+    smoothed = {}
+
+    for run in _runs(keys, all_corners):
+        if only is not None and not (keys[run[0]] <= only <= keys[run[-1]]):
+            continue
+        # Too short to say anything about the shape of the movement; a fit
+        # through this few points would follow the noise it is meant to remove.
+        if len(run) <= degree + 1:
+            for i in run:
+                smoothed[keys[i]] = tracked[keys[i]].copy()
+            continue
+
+        length = len(run)
+        corners = all_corners[run[0]:run[-1] + 1]
+
+        if only is not None:
+            # One frame's smoothed position depends on nothing outside its own
+            # window, so the preview can ask for the frame on screen without
+            # fitting the whole clip -- and gets the number the render will use,
+            # because it is the same fit over the same neighbours.
+            offset = only - keys[run[0]]
+            fitted = _fit_at(corners, offset, half, degree)
+            blended = corners[offset] + strength * (fitted - corners[offset])
+            smoothed[only] = blended.reshape(4, 2).astype(np.float32)
+            continue
+
+        fitted = corners.copy()
+
+        # Every frame with a full window either side is fitted over the same
+        # relative frame numbers, so the fit is one fixed set of weights over
+        # its neighbours rather than a fresh solve apiece -- the difference
+        # between a clip's worth of tiny least-squares problems and a single
+        # pass. Only the frames near each end, whose windows are cut short by
+        # the end, need their own.
+        if length >= 2 * half + 1:
+            span = np.arange(-half, half + 1, dtype=np.float64)
+            weights = np.linalg.pinv(np.vander(span, degree + 1))[-1]
+            windows = np.lib.stride_tricks.sliding_window_view(
+                corners, 2 * half + 1, axis=0)
+            fitted[half:length - half] = windows @ weights
+
+        for offset in list(range(min(half, length))) + \
+                list(range(max(half, length - half), length)):
+            fitted[offset] = _fit_at(corners, offset, half, degree)
+
+        blended = corners + strength * (fitted - corners)
+        for offset, i in enumerate(run):
+            smoothed[keys[i]] = blended[offset].reshape(4, 2).astype(np.float32)
+
+    if only is not None:
+        return {only: smoothed[only]} if only in smoothed else {}
+    return smoothed
+
 
 def interpolate_tracking(history: dict, start: int = None, end: int = None) -> dict:
     """Fill gaps between tracked frames by interpolating the corners.
