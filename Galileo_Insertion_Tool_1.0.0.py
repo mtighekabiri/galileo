@@ -3141,6 +3141,16 @@ class CentralPanel(QWidget):
         self.timestamp_label.setStyleSheet("color: white; font-size: 14px; padding: 3px;")
         self.timestamp_label.setAlignment(Qt.AlignCenter)
 
+        # None of the transport takes the keyboard. Clicking a button used to
+        # move focus onto it, and the overlay only gets the arrow keys, 1-5 and
+        # T/R/B/L while it holds focus -- so stepping a frame silently stopped
+        # the drawing tools responding, and the only way back was toggling Draw
+        # off and on, which re-focuses the overlay as a side effect. These are
+        # tools, not fields: there is nothing to type into them.
+        for button in (self.rewind_btn, self.play_pause_btn, self.forward_btn,
+                       self.copy_btn, self.del_btn):
+            button.setFocusPolicy(Qt.NoFocus)
+
         # Arrange the main controls
         controls_layout = QHBoxLayout()
         controls_layout.addWidget(self.rewind_btn)
@@ -3280,6 +3290,7 @@ class CentralPanel(QWidget):
             if new_frame_index != current_frame_index:
                 self.cap.set(cv2.CAP_PROP_POS_FRAMES, new_frame_index)
                 self.read_frame()
+            self.restore_drawing_focus()
 
     def on_forward(self):
         if self.cap and self.cap.isOpened():
@@ -3291,8 +3302,7 @@ class CentralPanel(QWidget):
                                   self.current_frame_index + 1)
             if new_frame_index != self.current_frame_index:
                 self.read_frame()
-                if self.tracking_mode:
-                    self.tracking_overlay.setFocus()
+                self.restore_drawing_focus()
 
     def jump_to_frame(self, frame_index):
         if not self.cap or not self.cap.isOpened():
@@ -3327,9 +3337,10 @@ class CentralPanel(QWidget):
 
         self.tracking_overlay.update()
 
-        # (Optional) Set focus if you need it.
-        if self.tracking_mode:
-            self.tracking_overlay.setFocus()
+        # Unconditionally where it matters: tracking_mode was set False a few
+        # lines above, so testing it here could never be true and the keyboard
+        # never came back after a jump.
+        self.restore_drawing_focus()
 
     def toggle_play_pause(self):
         self.playing = not self.playing
@@ -3347,6 +3358,19 @@ class CentralPanel(QWidget):
 
         if self.tracking_mode:
             self.tracking_overlay.setFocus()
+
+    def restore_drawing_focus(self):
+        """Give the keyboard back to the overlay if the drawing tools are live.
+
+        Whether *Draw* is on is ``tracking_enabled`` on the overlay, which is
+        not the same thing as ``tracking_mode``: that one is the tracking
+        switch, and stepping backwards deliberately turns it off. Testing it
+        here meant the keys stayed dead after a step back, and after every step
+        forward that followed one.
+        """
+        overlay = self.tracking_overlay
+        if getattr(overlay, "tracking_enabled", False):
+            overlay.setFocus()
 
     def disable_auto_tracking(self):
         """Turns off the tracking mode and updates the UI switch."""

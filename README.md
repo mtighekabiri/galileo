@@ -66,7 +66,8 @@ macOS, `~/.local/share/Galileo` on Linux). Set the environment variable
 | `1`–`4` | Select the corresponding corner |
 | `5` | Select the whole shape |
 | `T` / `R` / `B` / `L` | Select that edge's bend handles; press again for the second |
-| Arrow keys | Nudge the selection by 1 px |
+| Arrow keys | Nudge the selection by 1 px (Shift for 10, Ctrl for 0.25) |
+| Transport buttons | Stepping or scrubbing leaves the drawing keys live |
 | `D` / `C` | Delete this frame's shape / copy it from the previous frame (also the *Delete* and *Copy* buttons) |
 | Tracking switch | Enable/disable tracking during playback |
 | Magnifier switch | Show/hide the magnifier (it also appears while dragging) |

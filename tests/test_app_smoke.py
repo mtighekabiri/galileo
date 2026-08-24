@@ -19,6 +19,8 @@ from conftest import make_texture, quad_path, render_clip, write_video
 
 pytest.importorskip("PyQt5.QtWidgets")
 
+from PyQt5.QtCore import Qt
+from PyQt5.QtTest import QTest
 from PyQt5.QtWidgets import QApplication
 
 import importlib.util
@@ -909,3 +911,68 @@ class TestObstructionSensitivity:
             "video.mp4", "out.mp4", 0, 1, 1.0, 25.0, {},
             np.zeros((4, 2, 2), np.float32), False)
         assert settings.obstruction_sensitivity == "normal"
+
+
+class TestTheKeyboardStaysWithTheDrawingTools:
+    """Stepping a frame used to kill the drawing keys until Draw was toggled
+    off and on again.
+
+    Clicking a button moves keyboard focus onto it, and the overlay only
+    receives the arrow keys, 1-5 and T/R/B/L while it holds focus. Toggling
+    Draw appeared to fix it because turning it back on calls setFocus as a
+    side effect. Driving these through real clicks matters: calling the slots
+    directly never moves focus, so it passes either way and proves nothing.
+    """
+
+    def drawing(self, window, truth):
+        panel = window.central_panel
+        panel.tracking_overlay.points = [tuple(map(float, p)) for p in truth[0]]
+        window.on_draw_clicked(True)
+        return panel, panel.tracking_overlay
+
+    def test_the_transport_never_takes_the_keyboard(self, loaded):
+        window, path, truth = loaded
+        panel = window.central_panel
+        for name in ("rewind_btn", "play_pause_btn", "forward_btn",
+                     "copy_btn", "del_btn"):
+            assert getattr(panel, name).focusPolicy() == Qt.NoFocus, name
+
+    def test_clicking_through_the_transport_leaves_drawing_live(self, loaded):
+        window, path, truth = loaded
+        window.show()
+        panel, overlay = self.drawing(window, truth)
+        assert window.focusWidget() is overlay
+
+        for button in (panel.forward_btn, panel.rewind_btn, panel.forward_btn):
+            QTest.mouseClick(button, Qt.LeftButton)
+            assert window.focusWidget() is overlay, "the keyboard was taken away"
+
+    def test_the_arrow_keys_still_nudge_after_stepping(self, loaded):
+        window, path, truth = loaded
+        window.show()
+        panel, overlay = self.drawing(window, truth)
+        QTest.mouseClick(panel.forward_btn, Qt.LeftButton)
+        QTest.mouseClick(panel.rewind_btn, Qt.LeftButton)
+
+        overlay.selected_point_index = 0
+        before = overlay.points[0]
+        QTest.keyClick(window.focusWidget(), Qt.Key_Right)
+        assert overlay.points[0] != before, "arrow keys dead after stepping"
+
+    def test_a_jump_hands_the_keyboard_back(self, loaded):
+        """jump_to_frame turns the tracking switch off and then used to ask
+        whether it was on before restoring focus, so it never did."""
+        window, path, truth = loaded
+        window.show()
+        panel, overlay = self.drawing(window, truth)
+        panel.jump_to_frame(5)
+        assert window.focusWidget() is overlay
+
+    def test_with_draw_off_the_focus_is_left_where_it_was(self, loaded):
+        window, path, truth = loaded
+        window.show()
+        panel, overlay = self.drawing(window, truth)
+        window.on_draw_clicked(False)
+        panel.slider.setFocus()
+        panel.on_forward()
+        assert window.focusWidget() is not overlay
