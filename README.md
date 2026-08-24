@@ -78,7 +78,7 @@ macOS, `~/.local/share/Galileo` on Linux). Set the environment variable
 | Options → Steady the tracked path | Take the wobble out of the tracked shape |
 | Options → Draw behind people | Let passers-by cross in front of the creative |
 | Options → Draw behind obstructions | Let railings, posts and signs stay in front of it |
-| Options → Obstruction sensitivity | How readily something counts as being in front |
+| *Behind* tool (left toolbar) | The same switch, with dials for how readily something counts as being in front |
 
 Brightness, contrast and colourise adjustments for the inserted creative are
 available from the left toolbar, and all three apply to the render as well as
@@ -149,8 +149,9 @@ Note that this segments *people* specifically. For everything else, see below.
 ## Occlusion — anything else in front
 
 A street is full of things that are not people: railings along a walkway, a
-lamppost, a sign, a passing bus. **Options → Draw behind obstructions** handles
-all of them, and it does so without being told what any of them are.
+lamppost, a sign, a passing bus. The **Behind** tool in the left toolbar — or
+**Options → Draw behind obstructions**, which is the same switch — handles all
+of them, and does so without being told what any of them are.
 
 There is no list of objects to recognise, because there could not be one. What
 every obstruction has in common is not what it looks like but where it is: in
@@ -188,7 +189,7 @@ The model is MiDaS v2.1 small (MIT licensed, about 64 MB), fetched by
 `fetch_model.py` alongside the person model and run through the same OpenCV DNN
 module, so it adds no dependency either.
 
-### Sensitivity
+### The dials
 
 A hoarding is rarely blank, and a depth network reads the photograph on it as
 the scene it depicts rather than as ink on a flat panel. Where that reading
@@ -196,9 +197,22 @@ crosses the threshold, the creative is held back and the artwork already on the
 billboard shows through. Because the reading shifts frame to frame, it does not
 look like a steady error: holes flash open and shut for a frame at a time.
 
-The threshold that separates the two is expressed as a fraction of the scene's
-own depth range, since the model's output has no units and its scale changes
-every frame. Measured on a hoarding showing a road running away, under a pan:
+The **Behind** tool in the left toolbar is the switch and its dials in one
+place — the same feature as the menu item, and the lamp on the icon follows
+whichever one you use. Every dial recomposites the frame as it moves, because
+none of them can be judged from a number: the question is always whether the
+creative is being eaten by the billboard's own picture, or something really in
+front is being painted over, and only the shot answers that.
+
+| Dial | What it does |
+| --- | --- |
+| **In front by at least** | How far off the surface something must stand to count, as a fraction of the scene's depth range. The one that matters most. |
+| **Clear of the noise by** | The same demand in multiples of how ragged the surface's own depth reads — what holds the line where the model is unsure. |
+| **Grow the edges** | Widen what is found, in pixels. Depth edges land slightly inside the real object. |
+| **Soften the edges** | Blur the mask's edge, which also hides the frame-to-frame wobble in the model's boundaries. |
+
+The first dial starts at **0.15**, which is measured rather than picked.
+On a hoarding showing a road running away, under a pan:
 
 | | how far it stands off the surface |
 | --- | --- |
@@ -206,26 +220,17 @@ every frame. Measured on a hoarding showing a road running away, under a pan:
 | a lamppost across it | 0.41 |
 | railings across it | 0.86 |
 
-The default sits at **0.15** — clear of the artwork by half as much again, and
-far below either real obstruction. At the 0.10 it started out at, the advert
-crossed the line on 7 frames in 24; at 0.15, on none. It costs a little of the
-softest depth edges (railings went from 90% covered to 88%), which is the right
-way round: a hole in the creative is far more obvious than a slightly thin edge
-on the thing in front of it.
+At the 0.10 it started out at, the advert crossed the line on 7 frames in 24;
+at 0.15, on none. It costs a little of the softest depth edges (railings went
+from 90% covered to 88%), which is the right way round: a hole in the creative
+is far more obvious than a slightly thin edge on the thing in front of it.
 
-How much depth a given piece of artwork depicts is not something the tool can
-know, so **Options → Obstruction sensitivity** offers the trade rather than
-deciding it:
-
-- **Low** — for artwork with strong depth in it, or anamorphic "3D" content
-  designed to defeat exactly this cue. Fewest false holes; the faintest
-  obstructions are missed.
-- **Normal** — the measured balance above.
-- **High** — the old behaviour. Finds the faintest obstructions, and is
-  likeliest to mistake the billboard's own picture for one.
-
-If you see the original creative flashing through, turn it down; if something
-genuinely in front is being painted over, turn it up.
+**If the original creative flashes through, raise the first dial.** If
+something genuinely in front is being painted over, lower it. Around 0.28 is
+clean even on artwork with strong depth in it; below 0.10 is for faint
+obstructions on plain artwork. *Restore Defaults* puts every dial back to the
+measured setting, and *Cancel* puts back whatever you started the session with
+— the dials change the preview as they move, so cancel has real work to do.
 
 ### Where it stops
 
@@ -813,6 +818,7 @@ file, and the algorithms can be tested without a display.
 | `galileo_core.DepthOcclusionSegmenter` | Finds anything else in front of the surface, by depth |
 | `galileo_core.Region` | Four corners plus per-edge curvature |
 | `galileo_core.composite_region` | Alpha-correct perspective/curved warp and blend |
+| `galileo_core.DepthSettings` | The dials behind *Draw behind obstructions* |
 | `galileo_core.smooth_tracking` | Fits a smooth path through the recorded corners |
 | `galileo_core.interpolate_tracking` | Fills the gaps between tracked frames |
 | `galileo_core.remux_audio` | Copies the source audio onto a finished render |

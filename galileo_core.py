@@ -2279,10 +2279,73 @@ def _fit_plane_robust(depth: np.ndarray, interior: np.ndarray,
 #: far more obvious than a slightly thin edge on the thing in front of it.
 DEPTH_FLOOR = 0.15
 
-#: What *Obstruction sensitivity* offers, since how far a network is fooled
-#: depends on what the billboard happens to be showing. Higher finds more and
-#: invents more; lower is for artwork with strong depth in it.
-DEPTH_SENSITIVITY = {"low": 0.28, "normal": DEPTH_FLOOR, "high": 0.10}
+class DepthSettings:
+    """The dials behind *Draw behind obstructions*.
+
+    Kept as an object rather than loose numbers so that the preview and the
+    renderer are demonstrably working from the same ones -- the same reason
+    :class:`galileo_blend.BlendSettings` exists. Which way to lean depends on
+    artwork the tool has never seen, so these are offered rather than decided.
+    """
+
+    __slots__ = ("floor_rel", "k", "dilate", "feather")
+
+    #: What each dial does, and the range worth exploring, for whatever is
+    #: putting them on screen. Ordered by how much difference they make.
+    DIALS = (
+        ("floor_rel", "In front by at least", 0.02, 0.60, 0.01,
+         "How far off the surface something must stand before it counts as\n"
+         "being in front of it, as a fraction of the scene's depth range.\n"
+         "Raise it when the billboard's own picture shows through the\n"
+         "creative; lower it when something really in front is painted over."),
+        ("k", "Clear of the noise by", 1.0, 12.0, 0.5,
+         "The same demand, in multiples of how ragged the surface's own depth\n"
+         "reads. This is what holds the line on a surface the model is unsure\n"
+         "about, where the fraction above would let the raggedness through."),
+        ("dilate", "Grow the edges", 0.0, 12.0, 1.0,
+         "Widen what is found, in pixels. Depth edges land slightly inside\n"
+         "the real object, so a little of this covers the seam."),
+        ("feather", "Soften the edges", 0.0, 8.0, 0.5,
+         "Blur the mask's edge, which also hides the frame-to-frame wobble in\n"
+         "the model's own boundaries."),
+    )
+
+    def __init__(self, floor_rel: float = DEPTH_FLOOR, k: float = 5.0,
+                 dilate: float = 4.0, feather: float = 2.5):
+        self.floor_rel = float(floor_rel)
+        self.k = float(k)
+        self.dilate = float(dilate)
+        self.feather = float(feather)
+
+    def to_dict(self) -> dict:
+        return {name: float(getattr(self, name)) for name in self.__slots__}
+
+    @classmethod
+    def from_dict(cls, data) -> "DepthSettings":
+        """Rebuild from a saved project, ignoring anything that is not a dial.
+
+        Out-of-range numbers are pulled back to the range rather than refused:
+        a project saved by a later version with a wider dial should still open,
+        with the nearest setting this one can actually apply.
+        """
+        settings = cls()
+        for name, _, low, high, _, _ in cls.DIALS:
+            value = (data or {}).get(name)
+            if value is None:
+                continue
+            try:
+                setattr(settings, name, float(np.clip(float(value), low, high)))
+            except (TypeError, ValueError):
+                continue
+        return settings
+
+    def __eq__(self, other):
+        return (isinstance(other, DepthSettings)
+                and self.to_dict() == other.to_dict())
+
+    def __repr__(self):
+        return ("DepthSettings(" + ", ".join(
+            f"{name}={getattr(self, name):g}" for name in self.__slots__) + ")")
 
 
 def plane_deviation_mask(depth: np.ndarray, quad, k: float = 5.0,
@@ -2488,14 +2551,22 @@ class DepthOcclusionSegmenter:
         patch_mask = np.where(patch_mask > 127, 255, 0).astype(np.uint8)
 
         if self.dilate > 0:
-            kernel = np.ones((self.dilate * 2 + 1,) * 2, np.uint8)
-            patch_mask = cv2.dilate(patch_mask, kernel)
+            span = int(round(self.dilate)) * 2 + 1
+            patch_mask = cv2.dilate(patch_mask, np.ones((span, span), np.uint8))
         if self.feather > 0:
             ksize = max(3, int(self.feather * 4) | 1)
             patch_mask = cv2.GaussianBlur(patch_mask, (ksize, ksize), self.feather)
 
         mask[y0:y1, x0:x1] = patch_mask
         return mask
+
+    @classmethod
+    def from_settings(cls, settings: "DepthSettings" = None, **kwargs):
+        """Build one from a :class:`DepthSettings`, which is what the dials
+        and the render both hand over."""
+        settings = settings or DepthSettings()
+        return cls(k=settings.k, floor_rel=settings.floor_rel,
+                   dilate=settings.dilate, feather=settings.feather, **kwargs)
 
 
 VIDEO_SUFFIXES = (".mp4", ".avi", ".mkv", ".mov", ".m4v", ".webm")

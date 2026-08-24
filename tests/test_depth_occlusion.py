@@ -362,19 +362,52 @@ class TestThePictureAlreadyOnTheBillboard:
     def test_the_default_sits_between_the_two(self):
         assert 0.13 < core.DEPTH_FLOOR < 0.41
 
-    def test_sensitivity_trades_one_against_the_other(self, interior):
+    def test_the_dial_trades_one_against_the_other(self, interior):
         """Which way to lean is not something the tool can know -- it depends
-        on artwork it has never seen -- so it is offered rather than decided."""
+        on artwork it has never seen -- so it is a dial rather than a decision.
+        Turning it up holds back less, monotonically, which is what makes it
+        usable by eye."""
         borderline = self.depicted(0.20)
-        held = {level: marked(core.plane_deviation_mask(
-                    borderline, QUAD, floor_rel=floor),
-                    np.ones((HEIGHT, WIDTH), bool), interior)
-                for level, floor in core.DEPTH_SENSITIVITY.items()}
-        assert held["low"] < held["normal"] <= held["high"]
+        held = [marked(core.plane_deviation_mask(borderline, QUAD, floor_rel=f),
+                       np.ones((HEIGHT, WIDTH), bool), interior)
+                for f in (0.05, 0.15, 0.30, 0.50)]
+        assert held == sorted(held, reverse=True), held
+        assert held[0] > 0 and held[-1] == 0
 
-    def test_every_level_names_a_real_threshold(self):
-        assert set(core.DEPTH_SENSITIVITY) == {"low", "normal", "high"}
-        assert core.DEPTH_SENSITIVITY["normal"] == core.DEPTH_FLOOR
-        assert (core.DEPTH_SENSITIVITY["high"]
-                < core.DEPTH_SENSITIVITY["normal"]
-                < core.DEPTH_SENSITIVITY["low"])
+
+class TestTheDials:
+    """What the sliders are allowed to be, since a project saved by another
+    version has to open with settings this one can actually apply."""
+
+    def test_the_defaults_are_the_measured_ones(self):
+        assert core.DepthSettings().floor_rel == core.DEPTH_FLOOR
+
+    def test_every_dial_has_a_range_that_contains_its_default(self):
+        fresh = core.DepthSettings()
+        for name, title, low, high, step, hint in core.DepthSettings.DIALS:
+            value = getattr(fresh, name)
+            assert low <= value <= high, f"{name} starts outside its own range"
+            assert step > 0 and high > low, name
+            assert title and hint, f"{name} has nothing to say for itself"
+
+    def test_it_survives_a_round_trip(self):
+        settings = core.DepthSettings(floor_rel=0.31, k=8.5, dilate=7, feather=1.0)
+        assert core.DepthSettings.from_dict(settings.to_dict()) == settings
+
+    def test_a_setting_from_beyond_the_dial_is_brought_back_to_it(self):
+        restored = core.DepthSettings.from_dict({"floor_rel": 40.0, "k": -3})
+        assert restored.floor_rel == 0.60
+        assert restored.k == 1.0
+
+    def test_rubbish_leaves_the_default_standing(self):
+        restored = core.DepthSettings.from_dict(
+            {"floor_rel": "quite a lot", "nonsense": 1})
+        assert restored.floor_rel == core.DEPTH_FLOOR
+
+    def test_the_segmenter_is_built_from_them(self):
+        settings = core.DepthSettings(floor_rel=0.4, k=9, dilate=6, feather=1.5)
+        monkey = core.DepthOcclusionSegmenter.__new__(core.DepthOcclusionSegmenter)
+        # Only the numbers are being checked, so the model file is not needed.
+        for name, value in settings.to_dict().items():
+            setattr(monkey, name, value)
+        assert monkey.floor_rel == 0.4 and monkey.k == 9
