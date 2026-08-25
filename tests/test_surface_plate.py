@@ -252,3 +252,60 @@ class TestFindingObstructions:
         frame = np.full((HEIGHT, WIDTH, 3), 100, np.uint8)
         flat = np.float32([[10, 10], [12, 10], [12, 11], [10, 11]])
         assert plate.mask(frame, flat).shape == (HEIGHT, WIDTH)
+
+
+class TestSayingWhyItCannotServe:
+    """Falling back to depth alone is the right thing to do and the wrong
+    thing to do quietly.
+
+    Every gate here is silent in the composite by design -- there is nothing
+    to interrupt anyone about mid-frame. But all four gates produce one
+    symptom at the dials, "the switch is on and the railings are still behind
+    the creative", and until this the tool could not tell them apart. The
+    cause matters because the remedies are opposites: run a tracking pass,
+    turn digital-screen mode off, or accept depth alone and reach for a dial.
+    """
+
+    def test_a_digital_screen_is_named_as_the_reason(self):
+        reason = core.plate_refusal(core.PlanarTracker.SURROUND, "clip.mp4",
+                                    history())
+        assert reason and "digital screen" in reason
+
+    def test_no_video_is_named_as_the_reason(self):
+        assert core.plate_refusal(core.PlanarTracker.INTERIOR, "", history()) \
+            == "no video is open"
+
+    def test_a_freshly_drawn_area_is_told_to_track(self):
+        """The commonest cause by far: the cue is learned from the shot, so
+        it cannot exist before the shot has been tracked. Nothing said so."""
+        reason = core.plate_refusal(core.PlanarTracker.INTERIOR, "clip.mp4",
+                                    {0: [(0, 0), (9, 0), (9, 9), (0, 9)]})
+        assert reason and "tracking pass" in reason
+        assert "1 frame;" in reason, reason
+        assert str(core.PLATE_MIN_SAMPLES) in reason
+
+    def test_a_build_that_refused_reads_differently_from_one_not_yet_run(self):
+        """A plate that has not been built yet is not a plate that was
+        refused, and a dialog that conflated them would send someone hunting
+        for artwork trouble that is not there."""
+        tracked = history()
+        not_yet = core.plate_refusal(core.PlanarTracker.INTERIOR, "clip.mp4",
+                                     tracked, None, attempted=False)
+        refused = core.plate_refusal(core.PlanarTracker.INTERIOR, "clip.mp4",
+                                     tracked, None, attempted=True)
+        assert not_yet and "not been learned" in not_yet
+        assert refused and "artwork changes" in refused
+
+    def test_a_serving_plate_has_nothing_to_report(self, clips):
+        plate = core.build_surface_plate(clips["print"], history())
+        assert plate is not None
+        assert core.plate_refusal(core.PlanarTracker.INTERIOR, clips["print"],
+                                  history(), plate, attempted=True) is None
+
+    def test_the_gate_matches_what_build_actually_refuses(self, clips):
+        """The report and the behaviour must come from the same number, or
+        the dialog will promise a cue the builder then declines to make."""
+        just_short = {i: history()[i] for i in range(core.PLATE_MIN_SAMPLES - 1)}
+        assert core.build_surface_plate(clips["print"], just_short) is None
+        assert core.plate_refusal(core.PlanarTracker.INTERIOR, clips["print"],
+                                  just_short) is not None

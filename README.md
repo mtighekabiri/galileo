@@ -224,10 +224,16 @@ front is being painted over, and only the shot answers that.
 
 | Dial | What it does |
 | --- | --- |
-| **In front by at least** | How far off the surface something must stand to count, as a fraction of the scene's depth range. The one that matters most. |
+| **In front by at least** | How far off the surface something must stand to count, as a fraction of the scene's depth range. |
 | **Clear of the noise by** | The same demand in multiples of how ragged the surface's own depth reads — what holds the line where the model is unsure. |
 | **Grow the edges** | Widen what is found, in pixels. Depth edges land slightly inside the real object. |
 | **Soften the edges** | Blur the mask's edge, which also hides the frame-to-frame wobble in the model's boundaries. |
+
+Neither of the first two is "the one that matters": the threshold is the
+larger of the two demands, and which one is in charge flips with distance.
+Measured on the drive-up, the noise term decided it at 10/30/65/85% of frame
+width and the fraction term at 18/45/105% — so a dial that did nothing at one
+distance can be the only one doing anything a second later. Move both.
 
 The first dial starts at **0.15**, which is measured rather than picked.
 On a hoarding showing a road running away, under a pan:
@@ -242,6 +248,17 @@ At the 0.10 it started out at, the advert crossed the line on 7 frames in 24;
 at 0.15, on none. It costs a little of the softest depth edges (railings went
 from 90% covered to 88%), which is the right way round: a hole in the creative
 is far more obvious than a slightly thin edge on the thing in front of it.
+
+**The dialog says which cues are actually running**, on the frame in front of
+you: which depth model answered, and for each placement whether the artwork
+cue is serving or — in a sentence — why not. This exists because four quite
+different faults produce one symptom. "I switched it on and the railings are
+still behind the creative" can mean the artwork cue has no tracking to learn
+from, that the area is in digital-screen mode, that the cue is switched off,
+or that the weaker depth model is serving; two of those are not a dial at all,
+and the dials alone gave no way to tell. The same account goes into the log at
+startup, which is what to read when someone else's machine is the one behaving
+differently.
 
 **If the original creative flashes through, raise the first dial.** If
 something genuinely in front is being painted over, lower it. Around 0.28 is
@@ -282,8 +299,10 @@ disagrees with any plate everywhere; `build_surface_plate` measures that
 disagreement and returns nothing — measured 1.5 grey levels of median
 disagreement for a printed hoarding against 23 for a screen with modest scene
 changes, cut at 8 — and a placement in *Digital screen (track surroundings)*
-mode is never tried at all. Either way those fall back to depth alone, and a
-render says so in its completion notes. The checkbox in the *Behind* dialog
+mode is never tried at all. Either way those fall back to depth alone, and
+both the dialog and a render's completion notes name the placement and the
+reason — the screen case used to be skipped silently, which read as though the
+cue had run. The checkbox in the *Behind* dialog
 turns the cue off entirely for shots where it misjudges.
 
 The plate is learned once from up to 24 tracked frames (about half a second),

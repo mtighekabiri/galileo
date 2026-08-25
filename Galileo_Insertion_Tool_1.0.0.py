@@ -101,8 +101,19 @@ def log_optional_components():
     corporate PATH that is a real stall, paid before anything is on screen --
     so the window goes up first and this runs on the first idle turn.
     """
-    logging.info("Occlusion model: %s",
+    logging.info("Person model: %s",
                  core.find_model(core.PersonSegmenter.MODEL_FILENAME)
+                 or "NOT FOUND")
+    # Both depth files, not just whether one exists: which of them serves is
+    # the largest single difference in what "Draw behind obstructions" finds
+    # -- measured on a drive-up at 38% of frame width, MiDaS held back 0% of
+    # 2-14 px railing bars where Depth Anything held back 100% -- so a report
+    # of "the railings stayed behind the creative" is unanswerable without it.
+    logging.info("Depth model (preferred): %s",
+                 core.find_model(core.DepthOcclusionSegmenter.PREFERRED_FILENAME)
+                 or "NOT FOUND")
+    logging.info("Depth model (fallback): %s",
+                 core.find_model(core.DepthOcclusionSegmenter.MODEL_FILENAME)
                  or "NOT FOUND")
     logging.info("ffmpeg: %s", core.find_binary("ffmpeg") or "NOT FOUND")
 
@@ -333,10 +344,13 @@ class ObstructionDialog(QDialog):
     """
 
     def __init__(self, settings, enabled, on_change, plate_enabled=True,
-                 parent=None):
+                 status=None, parent=None):
         super().__init__(parent)
         self.settings = settings
         self.on_change = on_change
+        # What the two cues are actually doing, asked for after every change.
+        # Optional so the dialog still stands up on its own in a test.
+        self.status = status
         self.original = settings.to_dict()
         self.original_enabled = enabled
         self.original_plate = plate_enabled
@@ -348,7 +362,7 @@ class ObstructionDialog(QDialog):
         self._preview_timer = QTimer(self)
         self._preview_timer.setSingleShot(True)
         self._preview_timer.setInterval(150)
-        self._preview_timer.timeout.connect(lambda: self.on_change())
+        self._preview_timer.timeout.connect(self._changed)
 
         self.setWindowTitle("Draw Behind Obstructions")
         self.setMinimumWidth(540)
@@ -391,7 +405,7 @@ class ObstructionDialog(QDialog):
             "Catches what the depth model cannot -- thin railings, and "
             "obstructions at mid distance -- but only where the artwork is "
             "fixed;\na screen playing its own content is detected and skipped.")
-        self.plate_box.toggled.connect(lambda _checked: self.on_change())
+        self.plate_box.toggled.connect(lambda _checked: self._changed())
         layout.addWidget(self.plate_box)
 
         self.sliders = {}
@@ -421,6 +435,16 @@ class ObstructionDialog(QDialog):
             self.value_labels[name] = value_label
             self._show_value(name)
 
+        # Which cue is doing the work, and which is not. Above the dials'
+        # own advice on purpose: a dial cannot be judged before knowing
+        # whether the thing it moves is running at all.
+        self.status_label = QLabel()
+        self.status_label.setWordWrap(True)
+        self.status_label.setStyleSheet(
+            "color: #C8C8C8; font-size: 11px; background-color: #232323;"
+            "border-radius: 6px; padding: 8px;")
+        layout.addWidget(self.status_label)
+
         measured = QLabel(
             "The measured starting point for the first dial is 0.15. On a "
             "hoarding showing a road running away, the billboard's own picture "
@@ -437,6 +461,23 @@ class ObstructionDialog(QDialog):
         buttons.button(QDialogButtonBox.RestoreDefaults).clicked.connect(self._defaults)
         layout.addWidget(buttons, alignment=Qt.AlignRight)
         self._sync_enabled()
+        self.refresh_status()
+
+    def _changed(self):
+        """Recomposite the frame behind, then say what that composite used.
+
+        In this order because the answer comes from the composite itself --
+        which depth model loaded, which artwork plates were learned -- rather
+        than from a guess made before it ran.
+        """
+        self.on_change()
+        self.refresh_status()
+
+    def refresh_status(self):
+        """Put the panel's own account of the cues on screen, if given one."""
+        if self.status is None:
+            return
+        self.status_label.setText("\n".join(self.status()))
 
     @staticmethod
     def _spec(key):
@@ -461,7 +502,7 @@ class ObstructionDialog(QDialog):
 
     def _on_enabled(self, checked):
         self._sync_enabled()
-        self.on_change()
+        self._changed()
 
     def _sync_enabled(self):
         for slider in self.sliders.values():
@@ -488,7 +529,7 @@ class ObstructionDialog(QDialog):
             setattr(self.settings, key, value)
         self.enabled_box.setChecked(self.original_enabled)
         self.plate_box.setChecked(self.original_plate)
-        self.on_change()
+        self._changed()
         self.reject()
 
 
@@ -4157,6 +4198,43 @@ class CentralPanel(QWidget):
             logging.warning("Artwork comparison failed on this frame: %s", exc)
             return None
 
+    def occlusion_status(self):
+        """What the two obstruction cues are actually doing, in plain lines.
+
+        Both cues fall silent rather than complain when they cannot serve,
+        which is right for the composite and wrong for the person at the
+        dials: a depth model that cannot see thin bars and an artwork cue
+        refused for want of a tracking pass produce the identical symptom --
+        the switch is on and the railings are still behind the creative --
+        and nothing distinguished them. Read by the dialog on every change,
+        so it reports the frame that is actually on screen.
+
+        Cheap on purpose: it reads the segmenter and plate the last composite
+        already built and never triggers a pass of its own, so it can be
+        called on every dial move without doubling what a drag costs.
+        """
+        if not self.obstruction_enabled:
+            return ["Switched off -- nothing in front of the surface is found."]
+
+        model = getattr(self.depth_segmenter, "model_name", None)
+        lines = ["Depth: " + core.DepthOcclusionSegmenter.describe(model)]
+
+        if not self.plate_enabled:
+            lines.append("Artwork: switched off below.")
+            return lines
+
+        for placement in self.tracking_overlay.placements:
+            reason = core.plate_refusal(
+                placement.feature_source,
+                getattr(self, "current_video_path", ""),
+                placement.tracking_history,
+                placement.surface_plate,
+                attempted=placement.plate_fingerprint is not None)
+            lines.append(f"Artwork on {placement.name}: "
+                         + ("serving" if reason is None
+                            else "not serving -- " + reason))
+        return lines
+
     def occlusion_mask(self, frame, quad):
         """A mask of people in front of the surface, or None if switched off."""
         if not self.occlusion_enabled or frame is None:
@@ -5187,15 +5265,21 @@ class RenderWorker(QObject):
 
             if settings.obstructions and settings.plate_enabled:
                 for placement in placements:
-                    if placement.feature_source == core.PlanarTracker.SURROUND:
-                        continue
-                    placement.plate = core.build_surface_plate(
-                        settings.base_video_path, placement.history)
-                    if placement.plate is None:
+                    # Screens are skipped without building -- their picture is
+                    # not fixed to the panel -- but skipped is not the same as
+                    # silent: the note says which placements the depth model
+                    # is carrying alone, whichever gate put them there.
+                    if placement.feature_source != core.PlanarTracker.SURROUND:
+                        placement.plate = core.build_surface_plate(
+                            settings.base_video_path, placement.history)
+                    reason = core.plate_refusal(
+                        placement.feature_source, settings.base_video_path,
+                        placement.history, placement.plate, attempted=True)
+                    if reason is not None:
                         caveats.append(
                             f"the artwork of {placement.name} could not serve "
-                            "as an occlusion reference, so obstructions there "
-                            "rely on the depth model alone")
+                            f"as an occlusion reference ({reason}), so "
+                            "obstructions there rely on the depth model alone")
 
             frame_counter = 0
 
@@ -6318,7 +6402,8 @@ class MainWindow(QMainWindow):
 
         dialog = ObstructionDialog(panel.depth_settings, panel.obstruction_enabled,
                                    self._preview_obstructions,
-                                   plate_enabled=panel.plate_enabled, parent=self)
+                                   plate_enabled=panel.plate_enabled,
+                                   status=panel.occlusion_status, parent=self)
         before = panel.obstruction_enabled
         before_plate = panel.plate_enabled
         accepted = dialog.exec_() == QDialog.Accepted
