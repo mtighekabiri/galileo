@@ -2564,6 +2564,46 @@ class DepthOcclusionSegmenter:
         return (find_model(cls.PREFERRED_FILENAME) is not None
                 or find_model(cls.MODEL_FILENAME) is not None)
 
+    #: What the model that answered can and cannot see, in the words the
+    #: dialog and the log both use. Which model serves is the single largest
+    #: difference in what this feature finds -- re-measured on the written
+    #: drive-up at the sample distances the plate tests use, 2-14 px railing
+    #: bars were held back on 91-100% of their pixels by Depth Anything and
+    #: 0-7% by MiDaS (0% at 38% of frame width, where a panel commonly sits)
+    #: -- and until now nothing on screen or in the log said which one had
+    #: answered. That gap is the whole reason "I switched it on and the
+    #: railings stayed behind the creative" was unanswerable.
+    MODEL_NOTES = {
+        "depth-anything-v2-small":
+            "Depth Anything V2 -- finds railing bars of 2-14 px "
+            "(measured 91-100% of them across a drive-up).",
+        "midas-v21-small":
+            "MiDaS v2.1 (fallback) -- close to blind to railing bars of "
+            "2-14 px: measured 0-7% of them across a drive-up, against "
+            "91-100% for Depth Anything. Fetch depth_anything_v2_small.onnx "
+            "(fetch_model.py) and use OpenCV 5 for the model that sees them.",
+    }
+
+    @classmethod
+    def describe(cls, model_name=None) -> str:
+        """One line on which depth model is doing the work, and what it costs.
+
+        With no ``model_name`` this reports from the files on disk instead of
+        from a loaded net, which is what the dialog needs before anything has
+        been composited. It says "expected" there rather than naming a model
+        outright: the preferred file being present is not proof it will load,
+        since it needs OpenCV 5's dnn engine and quietly falls back on 4.x.
+        """
+        if model_name:
+            return cls.MODEL_NOTES.get(model_name, model_name)
+        if find_model(cls.PREFERRED_FILENAME):
+            return ("Depth Anything V2 expected (needs OpenCV 5; falls back "
+                    "to MiDaS if it will not load).")
+        if find_model(cls.MODEL_FILENAME):
+            return cls.MODEL_NOTES["midas-v21-small"]
+        return ("No depth model is present -- nothing can be found by depth. "
+                "Run fetch_model.py.")
+
     #: What Depth Anything expects OUTSIDE the graph. The two models disagree
     #: here in exactly the way that bites silently: MiDaS bakes its ImageNet
     #: normalisation into the export and wants plain [0, 1] RGB, Depth
@@ -2666,6 +2706,13 @@ PLATE_SAMPLES = 24
 
 #: The plate's width in pixels. Height follows the marked area's own aspect.
 PLATE_WIDTH = 480
+
+#: The fewest tracked frames a plate can be learned from. Below this there is
+#: no median worth taking -- two frames cannot outvote an obstruction sitting
+#: still across both. This is the gate a freshly drawn area falls at: the cue
+#: is learned from the shot, so it cannot exist before the shot has been
+#: tracked, and :func:`plate_refusal` is what says so out loud.
+PLATE_MIN_SAMPLES = 3
 
 #: Median grey-level disagreement between the sampled frames and the finished
 #: plate, above which the artwork is not usable as a reference. A printed
@@ -2854,7 +2901,7 @@ def build_surface_plate(video_path: str, history: dict,
     """
     tracked = {int(k): as_quad(v) for k, v in (history or {}).items()
                if v is not None and len(v) == 4}
-    if len(tracked) < 3:
+    if len(tracked) < PLATE_MIN_SAMPLES:
         return None
     keys = sorted(tracked)
     picks = sorted(set(np.linspace(0, len(keys) - 1,
@@ -2911,6 +2958,52 @@ def build_surface_plate(video_path: str, history: dict,
                     disagreement)
         return None
     return SurfacePlate(plate)
+
+
+def plate_refusal(feature_source, video_path, history, plate=None,
+                  attempted: bool = False):
+    """Why the artwork cue is not serving this placement, or None if it is.
+
+    Every gate in :meth:`SurfacePlate.mask`'s callers is silent by design --
+    falling back to depth alone is the correct behaviour and there is nothing
+    to interrupt anyone about mid-composite. Silent to the *machine*, though,
+    is not the same as silent to the person moving the dials: "I switched it
+    on and nothing changed" has four quite different causes here, and the
+    tool could not previously tell them apart. This turns each into a
+    sentence, and both the preview's dialog and the render's completion notes
+    read it, so the two cannot describe the same footage differently.
+
+    Ordered by which gate actually stops the cue first, which is also the
+    order they are cheapest to test in -- the last one is the only one that
+    needs a plate to have been built.
+
+    Args:
+        feature_source: the placement's tracking mode.
+        video_path: the base clip; the plate is learned from the file, not
+            from whatever frame happens to be on screen.
+        history: the placement's tracked corners, by frame.
+        plate: the plate already learned, if any.
+        attempted: whether a build has actually been tried yet. Without this
+            a placement whose plate simply has not been built yet would be
+            reported as refused artwork, which is a different diagnosis.
+    """
+    if feature_source == PlanarTracker.SURROUND:
+        return ("the area is marked as a digital screen, whose picture is "
+                "not fixed to the panel")
+    if not video_path:
+        return "no video is open"
+    tracked = len([quad for quad in (history or {}).values()
+                   if quad is not None and len(quad) == 4])
+    if tracked < PLATE_MIN_SAMPLES:
+        return (f"tracked on {tracked} frame"
+                f"{'' if tracked == 1 else 's'}; the artwork is learned from "
+                f"at least {PLATE_MIN_SAMPLES}, so run a tracking pass")
+    if plate is None and attempted:
+        return ("the artwork changes through the shot, so it cannot be a "
+                "reference")
+    if plate is None:
+        return "the artwork has not been learned from the shot yet"
+    return None
 
 
 VIDEO_SUFFIXES = (".mp4", ".avi", ".mkv", ".mov", ".m4v", ".webm")

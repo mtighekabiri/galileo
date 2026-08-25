@@ -575,3 +575,48 @@ class TestWhichDepthModelServes:
                          if m["filename"] ==
                          core.DepthOcclusionSegmenter.PREFERRED_FILENAME)
         assert preferred["expected_bytes"] == 99060839
+
+
+class TestSayingWhichModelServed:
+    """Which model answered is the largest single difference in what this
+    feature finds -- measured on the drive-up at 38% of frame width, MiDaS
+    held back 0% of 2-14 px railing bars and Depth Anything 100% -- and until
+    now the tool named it nowhere: not on screen, not in the log written for
+    exactly this kind of report. The fallback is silent by design, which is
+    right, and unnamed, which is not.
+    """
+
+    def test_the_fallback_is_named_as_a_fallback(self):
+        note = core.DepthOcclusionSegmenter.describe("midas-v21-small")
+        assert "MiDaS" in note and "fallback" in note
+        assert "fetch_model.py" in note, "no way out is offered"
+
+    def test_the_preferred_model_is_named(self):
+        note = core.DepthOcclusionSegmenter.describe("depth-anything-v2-small")
+        assert "Depth Anything" in note
+
+    def test_the_two_are_told_apart(self):
+        assert (core.DepthOcclusionSegmenter.describe("midas-v21-small")
+                != core.DepthOcclusionSegmenter.describe("depth-anything-v2-small"))
+
+    def test_no_model_at_all_says_so(self, monkeypatch):
+        monkeypatch.setattr(core, "find_model", lambda name: None)
+        note = core.DepthOcclusionSegmenter.describe()
+        assert "No depth model" in note and "fetch_model.py" in note
+
+    def test_a_present_preferred_file_is_only_expected_not_promised(self, monkeypatch):
+        """It needs OpenCV 5's engine and falls back quietly on 4.x, so the
+        file being there is not proof it will serve. Saying otherwise would
+        send an OpenCV 4 user looking for the wrong fault."""
+        monkeypatch.setattr(
+            core, "find_model",
+            lambda name: "/tmp/x.onnx"
+            if name == core.DepthOcclusionSegmenter.PREFERRED_FILENAME else None)
+        assert "expected" in core.DepthOcclusionSegmenter.describe()
+
+    @model_available
+    def test_a_loaded_segmenter_describes_itself(self):
+        """The name the segmenter actually reports has to be one describe
+        knows, or the dialog would show a bare identifier."""
+        segmenter = core.DepthOcclusionSegmenter()
+        assert segmenter.model_name in core.DepthOcclusionSegmenter.MODEL_NOTES

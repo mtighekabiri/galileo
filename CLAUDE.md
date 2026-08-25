@@ -97,6 +97,14 @@ while the on-screen motion accelerates.
 - **Claims in comments, docstrings and the README carry measured numbers.**
   Not "this is better" but "0.57 px became 2.94 px". If a number cannot be
   produced, say what was not measured.
+- **A cue that falls back silently still has to say so at the dials.** Both
+  obstruction cues decline quietly when they cannot serve, which is right for
+  the composite and useless to the person moving dials: a depth model blind to
+  thin bars and an artwork cue with no tracking to learn from produce the same
+  symptom, and two of the four causes are not a dial at all. `core.plate_refusal`
+  and `DepthOcclusionSegmenter.describe` are the one place each is worded;
+  the dialog, the startup log and the render's completion notes all read them,
+  so none of the three can describe the same footage differently.
 - **The preview and the render call the same functions**, so what is approved
   on screen is what reaches the file. Any new setting must reach both, and the
   render takes a detached copy so a dial moved mid-render cannot change the

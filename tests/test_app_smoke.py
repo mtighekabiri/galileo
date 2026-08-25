@@ -1119,3 +1119,217 @@ class TestTheArtworkCue:
         assert dialog.is_plate_enabled() is False
         dialog._revert_and_reject()
         assert dialog.is_plate_enabled() is True, "cancel did not restore it"
+
+
+class TestSayingWhatTheCuesAreDoing:
+    """"I turned it on and the railings are still behind the creative."
+
+    Four different faults produce that one sentence -- the artwork cue has no
+    tracking to learn from, the area is in digital-screen mode, the cue is
+    switched off, or the weaker depth model is serving -- and the dialog full
+    of dials said nothing about any of them. Each has a different remedy, and
+    two of them are not a dial at all, so a dial-only dialog sends people
+    hunting in the wrong place. These pin what it now reports.
+    """
+
+    def drawn(self, window, truth):
+        """A freshly drawn area, tracked on nothing -- the screenshot case."""
+        panel = window.central_panel
+        placement = panel.tracking_overlay.placements[0]
+        placement.points = [tuple(map(float, p)) for p in truth[0]]
+        panel.obstruction_enabled = True
+        return panel, placement
+
+    def test_switched_off_says_so_rather_than_nothing(self, loaded):
+        window, path, truth = loaded
+        panel = window.central_panel
+        panel.obstruction_enabled = False
+        assert "Switched off" in "\n".join(panel.occlusion_status())
+
+    def test_a_freshly_drawn_area_is_told_it_needs_tracking(self, loaded):
+        """The cue is learned from the shot. Before a tracking pass it cannot
+        exist, and the dials cannot bring it back -- which is the one thing
+        someone reaching for the dials most needs to be told."""
+        window, path, truth = loaded
+        panel, placement = self.drawn(window, truth)
+
+        report = "\n".join(panel.occlusion_status())
+        assert "not serving" in report
+        assert "tracking pass" in report
+
+    def test_a_digital_screen_is_named(self, loaded):
+        window, path, truth = loaded
+        panel, placement = self.drawn(window, truth)
+        placement.tracking_history = {
+            i: [tuple(map(float, p)) for p in quad]
+            for i, quad in enumerate(truth)}
+        placement.feature_source = core.PlanarTracker.SURROUND
+
+        assert "digital screen" in "\n".join(panel.occlusion_status())
+
+    def test_a_serving_plate_is_reported_as_serving(self, loaded):
+        window, path, truth = loaded
+        panel, placement = self.drawn(window, truth)
+        placement.tracking_history = {
+            i: [tuple(map(float, p)) for p in quad]
+            for i, quad in enumerate(truth)}
+        panel.plate_mask(panel.prev_frame, placement)
+
+        report = "\n".join(panel.occlusion_status())
+        assert "serving" in report and "not serving" not in report
+
+    def test_the_cue_being_switched_off_is_not_reported_as_a_fault(self, loaded):
+        window, path, truth = loaded
+        panel, placement = self.drawn(window, truth)
+        panel.plate_enabled = False
+
+        report = "\n".join(panel.occlusion_status())
+        assert "switched off below" in report
+        assert "tracking pass" not in report, "off is not a failure to explain"
+
+    def test_the_depth_model_is_always_named(self, loaded):
+        window, path, truth = loaded
+        panel, placement = self.drawn(window, truth)
+        assert "Depth:" in "\n".join(panel.occlusion_status())
+
+    def test_it_costs_no_pass_of_the_model(self, loaded, monkeypatch):
+        """Read on every dial move, and a depth pass is much the most
+        expensive thing in the preview. It reports what the last composite
+        built; it must never build anything itself."""
+        window, path, truth = loaded
+        panel, placement = self.drawn(window, truth)
+        monkeypatch.setattr(core, "build_surface_plate",
+                            lambda *a, **k: pytest.fail("built a plate"))
+        monkeypatch.setattr(core.DepthOcclusionSegmenter, "from_settings",
+                            classmethod(lambda cls, *a, **k:
+                                        pytest.fail("loaded the depth model")))
+        panel.occlusion_status()
+
+
+class TestTheStatusReachesTheDialog:
+    def test_the_dialog_shows_what_it_is_given(self, loaded):
+        window, path, truth = loaded
+        dialog = galileo_app.ObstructionDialog(
+            window.central_panel.depth_settings, True, lambda: None,
+            status=lambda: ["Depth: a model", "Artwork on X: serving"])
+        assert "Artwork on X: serving" in dialog.status_label.text()
+
+    def test_moving_a_dial_refreshes_it(self, loaded):
+        """Through the widget, not by calling the slot: the status has to
+        follow the same path a drag does, after the recomposite rather than
+        before it -- the answer comes out of the composite."""
+        window, path, truth = loaded
+        seen = []
+        dialog = galileo_app.ObstructionDialog(
+            window.central_panel.depth_settings, True,
+            lambda: seen.append("composited"),
+            status=lambda: [f"asked {len(seen)}"])
+        dialog._preview_timer.setInterval(0)
+
+        dialog.sliders["floor_rel"].setValue(dialog.sliders["floor_rel"].maximum())
+        QTest.qWait(30)
+        assert seen, "the dial never recomposited"
+        assert dialog.status_label.text() == "asked 1", dialog.status_label.text()
+
+    def test_the_plate_checkbox_refreshes_it(self, loaded):
+        """Turning the artwork cue off changes which cues are running, so the
+        note has to change with it -- it is the checkbox's whole effect."""
+        window, path, truth = loaded
+        asked = []
+
+        def counting():
+            asked.append(1)
+            return [f"asked {len(asked)}"]
+
+        dialog = galileo_app.ObstructionDialog(
+            window.central_panel.depth_settings, True, lambda: None,
+            plate_enabled=True, status=counting)
+        before = len(asked)
+        dialog.plate_box.setChecked(False)
+        assert len(asked) > before, "turning the cue off never updated the note"
+
+    def test_a_dialog_without_a_status_still_works(self, loaded):
+        """The dials are testable on their own; the note is an extra."""
+        dialog = galileo_app.ObstructionDialog(
+            loaded[0].central_panel.depth_settings, True, lambda: None)
+        assert dialog.status_label.text() == ""
+
+    def test_the_tool_hands_the_dialog_the_panel_s_own_account(self, loaded,
+                                                               monkeypatch):
+        """The button, not a test-built dialog: the wiring is the point."""
+        window, path, truth = loaded
+        captured = {}
+
+        class Spy(galileo_app.ObstructionDialog):
+            def __init__(self, *args, **kwargs):
+                captured["status"] = kwargs.get("status")
+                super().__init__(*args, **kwargs)
+
+            def exec_(self):
+                return 0
+
+        monkeypatch.setattr(galileo_app, "ObstructionDialog", Spy)
+        window.central_panel.obstruction_enabled = True
+        window.on_obstructions_clicked()
+        assert captured.get("status") is not None, "the dialog got no status"
+        assert (captured["status"]()
+                == window.central_panel.occlusion_status()), \
+            "the dialog was given something other than the panel's own account"
+
+
+class TestTheRenderSaysWhichCuesItHad:
+    """The README already promised this -- "either way those fall back to
+    depth alone, and a render says so in its completion notes" -- and the
+    digital-screen half of "either way" was skipped without a word. A note
+    that only ever fires for one of two causes is worse than none: its
+    silence reads as "the artwork cue ran".
+    """
+
+    def rendered(self, window, truth, path, tmp_path, feature_source,
+                 history=None, name="out.mp4"):
+        panel = window.central_panel
+        placement = panel.tracking_overlay.placements[0]
+        placement.points = [tuple(map(float, p)) for p in truth[0]]
+        placement.tracking_history = history if history is not None else {
+            i: [tuple(map(float, p)) for p in quad]
+            for i, quad in enumerate(truth)}
+        placement.feature_source = feature_source
+        placement.overlay_bgra = np.dstack([
+            np.full((40, 60, 3), 200, np.uint8),
+            np.full((40, 60), 255, np.uint8)])
+
+        snapshot = galileo_app.PlacementSnapshot(placement, 1.0)
+        settings = galileo_app.RenderSettings(
+            path, str(tmp_path / name), 0, 1, 1.0, 25.0,
+            placement.tracking_history, np.zeros((4, 2, 2), np.float32), False,
+            placements=[snapshot], include_audio=False,
+            obstructions=True, plate_enabled=True)
+        worker = galileo_app.RenderWorker(settings)
+        statuses = []
+        worker.finished.connect(statuses.append)
+        worker.run()
+        assert statuses, "the render never finished"
+        return statuses[0]
+
+    def test_a_digital_screen_placement_is_named_in_the_notes(self, loaded,
+                                                              tmp_path):
+        window, path, truth = loaded
+        status = self.rendered(window, truth, path, tmp_path,
+                               core.PlanarTracker.SURROUND)
+        assert "artwork" in status, status
+        assert "digital screen" in status, status
+
+    def test_an_untracked_placement_is_named_too(self, loaded, tmp_path):
+        window, path, truth = loaded
+        status = self.rendered(
+            window, truth, path, tmp_path, core.PlanarTracker.INTERIOR,
+            history={0: [tuple(map(float, p)) for p in truth[0]]},
+            name="untracked.mp4")
+        assert "artwork" in status and "tracking pass" in status, status
+
+    def test_a_placement_the_cue_serves_draws_no_note(self, loaded, tmp_path):
+        """The note has to stay rare enough to mean something."""
+        window, path, truth = loaded
+        status = self.rendered(window, truth, path, tmp_path,
+                               core.PlanarTracker.INTERIOR, name="fine.mp4")
+        assert "could not serve" not in status, status
